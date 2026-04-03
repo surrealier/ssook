@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+env:
+  QT_QPA_PLATFORM: offscreen
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -13,11 +16,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: |
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
-          pyinstaller visualizer.spec
-      - run: Compress-Archive -Path dist/Visualizer -DestinationPath AIBench-AIO-Windows.zip
+      - name: Build with PyInstaller
+        run: pyinstaller visualizer.spec
+      - name: Package
+        run: Compress-Archive -Path dist/Visualizer -DestinationPath AIBench-AIO-Windows.zip
         shell: pwsh
       - uses: actions/upload-artifact@v4
         with:
@@ -25,17 +32,21 @@ jobs:
           path: AIBench-AIO-Windows.zip
 
   build-macos:
-    runs-on: macos-latest
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: |
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
-          pyinstaller visualizer_mac.spec
-      - run: cd dist && zip -r ../AIBench-AIO-macOS.zip Visualizer.app
+      - name: Build with PyInstaller
+        run: pyinstaller visualizer_mac.spec
+      - name: Package
+        run: cd dist && zip -r ../AIBench-AIO-macOS.zip Visualizer.app || zip -r ../AIBench-AIO-macOS.zip Visualizer
       - uses: actions/upload-artifact@v4
         with:
           name: macos-build
