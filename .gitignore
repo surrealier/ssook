@@ -1,0 +1,75 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+.pytest_cache/
+
+# ===== Build / Distribution =====
+build/
+dist/
+*.spec
+!visualizer.spec
+!visualizer_mac.spec
+
+# ===== IDE / Editor =====
+.claude/
+.kiro/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== Models & Large Files =====
+Models/*.onnx
+Models/*.pt
+Models/*.pth
+Models/*.engine
+Models/*.trt
+!Models/.gitkeep
+
+# ===== Data / Media =====
+Videos/*.mp4
+Videos/*.avi
+Videos/*.mkv
+!Videos/.gitkeep
+labeling/
+convert-results/
+eval_results/
+results/
+tmp/
+
+# ===== Output / Generated =====
+recordings/
+!recordings/.gitkeep
+snapshots/
+!snapshots/.gitkeep
+*.xlsx
+*.html
+!docs/**/*.html
+
+# ===== Archives =====
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# ===== Scripts / Standalone tools =====
+detect.py
+detect_onnx.py
+gen_icon.py
+run_all_versions.sh
+build.bat
+task.md
+
+# ===== Misc =====
+*.log
+*.csv
+.DS_Store
+Thumbs.db
+ep_packages/
+benchmark_results.*
+eval_report.*

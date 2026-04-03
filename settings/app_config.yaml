@@ -1,0 +1,333 @@
+batch_size: 1
+box_thickness: 2
+class_styles:
+  0:
+    color: null
+    enabled: true
+    thickness: null
+  1:
+    color: null
+    enabled: true
+    thickness: null
+  2:
+    color: null
+    enabled: true
+    thickness: null
+  3:
+    color:
+    - 255
+    - 25
+    - 71
+    enabled: true
+    thickness: null
+  4:
+    color: null
+    enabled: true
+    thickness: null
+  5:
+    color: null
+    enabled: true
+    thickness: null
+  6:
+    color: null
+    enabled: true
+    thickness: null
+  7:
+    color: null
+    enabled: true
+    thickness: null
+  8:
+    color: null
+    enabled: true
+    thickness: null
+  9:
+    color: null
+    enabled: true
+    thickness: null
+  10:
+    color: null
+    enabled: true
+    thickness: null
+  11:
+    color: null
+    enabled: true
+    thickness: null
+  12:
+    color: null
+    enabled: true
+    thickness: null
+  13:
+    color: null
+    enabled: true
+    thickness: null
+  14:
+    color: null
+    enabled: true
+    thickness: null
+  15:
+    color: null
+    enabled: true
+    thickness: null
+  16:
+    color: null
+    enabled: true
+    thickness: null
+  17:
+    color: null
+    enabled: true
+    thickness: null
+  18:
+    color: null
+    enabled: true
+    thickness: null
+  19:
+    color: null
+    enabled: true
+    thickness: null
+  20:
+    color: null
+    enabled: true
+    thickness: null
+  21:
+    color: null
+    enabled: true
+    thickness: null
+  22:
+    color: null
+    enabled: true
+    thickness: null
+  23:
+    color: null
+    enabled: true
+    thickness: null
+  24:
+    color: null
+    enabled: true
+    thickness: null
+  25:
+    color: null
+    enabled: true
+    thickness: null
+  26:
+    color: null
+    enabled: true
+    thickness: null
+  27:
+    color: null
+    enabled: true
+    thickness: null
+  28:
+    color: null
+    enabled: true
+    thickness: null
+  29:
+    color: null
+    enabled: true
+    thickness: null
+  30:
+    color: null
+    enabled: true
+    thickness: null
+  31:
+    color: null
+    enabled: true
+    thickness: null
+  32:
+    color: null
+    enabled: true
+    thickness: null
+  33:
+    color: null
+    enabled: true
+    thickness: null
+  34:
+    color: null
+    enabled: true
+    thickness: null
+  35:
+    color: null
+    enabled: true
+    thickness: null
+  36:
+    color: null
+    enabled: true
+    thickness: null
+  37:
+    color: null
+    enabled: true
+    thickness: null
+  38:
+    color: null
+    enabled: true
+    thickness: null
+  39:
+    color: null
+    enabled: true
+    thickness: null
+  40:
+    color: null
+    enabled: true
+    thickness: null
+  41:
+    color: null
+    enabled: true
+    thickness: null
+  42:
+    color: null
+    enabled: true
+    thickness: null
+  43:
+    color: null
+    enabled: true
+    thickness: null
+  44:
+    color: null
+    enabled: true
+    thickness: null
+  45:
+    color: null
+    enabled: true
+    thickness: null
+  46:
+    color: null
+    enabled: true
+    thickness: null
+  47:
+    color: null
+    enabled: true
+    thickness: null
+  48:
+    color: null
+    enabled: true
+    thickness: null
+  49:
+    color: null
+    enabled: true
+    thickness: null
+  50:
+    color: null
+    enabled: true
+    thickness: null
+  51:
+    color: null
+    enabled: true
+    thickness: null
+  52:
+    color: null
+    enabled: true
+    thickness: null
+  53:
+    color: null
+    enabled: true
+    thickness: null
+  54:
+    color: null
+    enabled: true
+    thickness: null
+  55:
+    color: null
+    enabled: true
+    thickness: null
+  56:
+    color: null
+    enabled: true
+    thickness: null
+  57:
+    color: null
+    enabled: true
+    thickness: null
+  58:
+    color: null
+    enabled: true
+    thickness: null
+  59:
+    color: null
+    enabled: true
+    thickness: null
+  60:
+    color: null
+    enabled: true
+    thickness: null
+  61:
+    color: null
+    enabled: true
+    thickness: null
+  62:
+    color: null
+    enabled: true
+    thickness: null
+  63:
+    color: null
+    enabled: true
+    thickness: null
+  64:
+    color: null
+    enabled: true
+    thickness: null
+  65:
+    color: null
+    enabled: true
+    thickness: null
+  66:
+    color: null
+    enabled: true
+    thickness: null
+  67:
+    color: null
+    enabled: true
+    thickness: null
+  68:
+    color: null
+    enabled: true
+    thickness: null
+  69:
+    color: null
+    enabled: true
+    thickness: null
+  70:
+    color: null
+    enabled: true
+    thickness: null
+  71:
+    color: null
+    enabled: true
+    thickness: null
+  72:
+    color: null
+    enabled: true
+    thickness: null
+  73:
+    color: null
+    enabled: true
+    thickness: null
+  74:
+    color: null
+    enabled: true
+    thickness: null
+  75:
+    color: null
+    enabled: true
+    thickness: null
+  76:
+    color: null
+    enabled: true
+    thickness: null
+  77:
+    color: null
+    enabled: true
+    thickness: null
+  78:
+    color: null
+    enabled: true
+    thickness: null
+  79:
+    color: null
+    enabled: true
+    thickness: null
+conf_threshold: 0.25
+label_size: 0.55
+model_type: yolo
+models_dir: Models
+show_confidence: true
+show_labels: true
+videos_dir: Videos

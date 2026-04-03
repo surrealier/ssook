@@ -1,0 +1,19 @@
+# torch, onnxruntime, CUDA는 별도 설치 (PC 환경에 맞게)
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# pip install onnxruntime-gpu
+
+# 필수
+PySide6>=6.8.0
+opencv-python>=4.10.0
+numpy>=1.26.0
+onnxruntime>=1.17.0
+psutil>=5.9.0
+PyYAML>=6.0.0
+
+# 선택 (차트/시각화)
+matplotlib>=3.8.0
+scikit-learn>=1.4.0
+openpyxl>=3.1.0
+
+# 선택 (UMAP)
+# umap-learn>=0.5.0
