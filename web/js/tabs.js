@@ -387,11 +387,11 @@ Tabs.settings = {
           <div class="card" style="padding:1.5rem;">
             <h3 class="text-heading-h3" style="margin-bottom:1rem;">테스트 모델 다운로드</h3>
             <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
-              <a href="https://github.com/ultralytics/assets/releases" target="_blank" class="btn btn-secondary btn-sm">Detection (YOLO)</a>
-              <a href="https://github.com/onnx/models/tree/main/validated/vision/classification" target="_blank" class="btn btn-secondary btn-sm">Classification</a>
-              <a href="https://github.com/onnx/models/tree/main/validated/vision/object_detection_segmentation" target="_blank" class="btn btn-secondary btn-sm">Segmentation</a>
-              <a href="https://huggingface.co/openai/clip-vit-base-patch32" target="_blank" class="btn btn-secondary btn-sm">CLIP</a>
-              <a href="https://github.com/onnx/models/tree/main/validated/vision/body_analysis" target="_blank" class="btn btn-secondary btn-sm">Embedder</a>
+              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.onnx" class="btn btn-secondary btn-sm">📥 Detection (YOLO11n)</a>
+              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-cls.onnx" class="btn btn-secondary btn-sm">📥 Classification (YOLO11n-cls)</a>
+              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-seg.onnx" class="btn btn-secondary btn-sm">📥 Segmentation (YOLO11n-seg)</a>
+              <a href="https://huggingface.co/Xenova/clip-vit-base-patch32/tree/main/onnx" target="_blank" class="btn btn-secondary btn-sm">📥 CLIP (ViT-B/32 ONNX)</a>
+              <a href="https://huggingface.co/immich-app/ViT-B-32__openai/tree/main" target="_blank" class="btn btn-secondary btn-sm">📥 Embedder (ViT-B/32 ONNX)</a>
             </div>
           </div>
           <div class="card" style="padding:1.5rem;">

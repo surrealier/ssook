@@ -352,7 +352,7 @@ Tabs['embedding-viewer'] = {
 
 /* ── Segmentation ───────────────────────────────────── */
 Tabs.segmentation = makeTab({
-  id: 'seg', heading: '<span style="display:flex;align-items:center;width:100%;">Segmentation Evaluation<a href="https://github.com/onnx/models/tree/main/validated/vision/object_detection_segmentation" target="_blank" class="btn btn-ghost btn-sm" style="margin-left:auto;">📥 테스트 모델 다운로드</a></span>',
+  id: 'seg', heading: '<span style="display:flex;align-items:center;width:100%;">Segmentation Evaluation<a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-seg.onnx" class="btn btn-ghost btn-sm" style="margin-left:auto;">📥 YOLO11n-seg ONNX</a></span>',
   needsModel: true, needsImgDir: true, needsLblDir: true,
   resultCols: ['Class','IoU','Dice','Images'],
   resultHint: 'Run evaluation to see mIoU/Dice', progress: true,
@@ -365,7 +365,7 @@ Tabs.clip = {
     return `
       <div style="max-width:640px;display:flex;flex-direction:column;gap:1.5rem;">
         <div class="card" style="padding:1.5rem;">
-          <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">CLIP Zero-Shot<a href="https://huggingface.co/openai/clip-vit-base-patch32" target="_blank" class="btn btn-ghost btn-sm" style="margin-left:auto;">📥 CLIP 모델 다운로드</a></h3>
+          <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">CLIP Zero-Shot<a href="https://huggingface.co/Xenova/clip-vit-base-patch32/tree/main/onnx" target="_blank" class="btn btn-ghost btn-sm" style="margin-left:auto;">📥 CLIP ONNX</a></h3>
           <div class="form-group">
             <label class="form-label">Image Encoder</label>
             <div style="display:flex;gap:0.5rem;">
@@ -393,7 +393,7 @@ Tabs.clip = {
 
 /* ── Embedder Eval ──────────────────────────────────── */
 Tabs.embedder = makeTab({
-  id: 'emb', heading: '<span style="display:flex;align-items:center;width:100%;">Embedder Evaluation<a href="https://github.com/onnx/models/tree/main/validated/vision/body_analysis" target="_blank" class="btn btn-ghost btn-sm" style="margin-left:auto;">📥 테스트 모델 다운로드</a></span>',
+  id: 'emb', heading: '<span style="display:flex;align-items:center;width:100%;">Embedder Evaluation<a href="https://huggingface.co/immich-app/ViT-B-32__openai/tree/main" target="_blank" class="btn btn-ghost btn-sm" style="margin-left:auto;">📥 Embedder ONNX</a></span>',
   needsModel: true, needsImgDir: true,
   fields: [['Top-K','number','emb-k','5','min="1" max="100"']],
   resultCols: ['Class','Retrieval@1','Retrieval@K','Avg Cosine'],
