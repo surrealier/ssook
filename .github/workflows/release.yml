@@ -25,12 +25,12 @@ jobs:
         run: mkdir -p Models settings
 
       - name: Build with PyInstaller
-        run: pyinstaller visualizer.spec
+        run: pyinstaller ssook.spec
 
       # ZIP portable
       - name: Package ZIP
         shell: pwsh
-        run: Compress-Archive -Path dist/Visualizer -DestinationPath Visualizer-Windows-portable.zip
+        run: Compress-Archive -Path dist/ssook -DestinationPath ssook-Windows-portable.zip
 
       # MSI installer via WiX
       - name: Install WiX Toolset
@@ -48,16 +48,16 @@ jobs:
           <?xml version="1.0" encoding="UTF-8"?>
           <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
                xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
-            <Package Name="Visualizer"
-                     Manufacturer="Visualizer"
+            <Package Name="ssook"
+                     Manufacturer="ssook"
                      Version="$version"
                      UpgradeCode="E8A3F1B2-4C5D-6E7F-8A9B-0C1D2E3F4A5B">
               <MajorUpgrade DowngradeErrorMessage="A newer version is already installed." />
               <MediaTemplate EmbedCab="yes" />
               <StandardDirectory Id="ProgramFiles6432Folder">
-                <Directory Id="INSTALLFOLDER" Name="Visualizer">
+                <Directory Id="INSTALLFOLDER" Name="ssook">
                   <Component Id="MainExe" Guid="*">
-                    <File Source="dist\Visualizer\Visualizer.exe" KeyPath="yes" />
+                    <File Source="dist\ssook\ssook.exe" KeyPath="yes" />
                   </Component>
                 </Directory>
               </StandardDirectory>
@@ -76,15 +76,15 @@ jobs:
         run: |
           wix build installer.wxs `
             -ext WixToolset.UI.wixext `
-            -bindpath dist/Visualizer `
-            -o Visualizer-Windows.msi
+            -bindpath dist/ssook `
+            -o ssook-Windows.msi
         continue-on-error: true
 
       - name: Fallback if MSI failed
-        if: ${{ !hashFiles('Visualizer-Windows.msi') }}
+        if: ${{ !hashFiles('ssook-Windows.msi') }}
         shell: pwsh
         run: |
-          if (-not (Test-Path "Visualizer-Windows.msi")) {
+          if (-not (Test-Path "ssook-Windows.msi")) {
             echo "MSI build skipped — ZIP only"
           }
 
@@ -92,8 +92,8 @@ jobs:
         with:
           name: windows-build
           path: |
-            Visualizer-Windows-portable.zip
-            Visualizer-Windows.msi
+            ssook-Windows-portable.zip
+            ssook-Windows.msi
 
   build-macos:
     runs-on: macos-latest
@@ -113,27 +113,27 @@ jobs:
         run: mkdir -p Models settings
 
       - name: Build with PyInstaller
-        run: pyinstaller visualizer_mac.spec
+        run: pyinstaller ssook_mac.spec
 
       # DMG
       - name: Create DMG
         run: |
           mkdir -p dmg_staging
-          cp -R dist/Visualizer.app dmg_staging/
+          cp -R dist/ssook.app dmg_staging/
           ln -s /Applications dmg_staging/Applications
-          hdiutil create -volname "Visualizer" -srcfolder dmg_staging \
-            -ov -format UDZO Visualizer-macOS.dmg
+          hdiutil create -volname "ssook" -srcfolder dmg_staging \
+            -ov -format UDZO ssook-macOS.dmg
 
       # ZIP fallback
       - name: Package ZIP
-        run: cd dist && zip -r ../Visualizer-macOS.zip Visualizer.app
+        run: cd dist && zip -r ../ssook-macOS.zip ssook.app
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-build
           path: |
-            Visualizer-macOS.dmg
-            Visualizer-macOS.zip
+            ssook-macOS.dmg
+            ssook-macOS.zip
 
   release:
     needs: [build-windows, build-macos]
@@ -151,9 +151,9 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/windows-build/Visualizer-Windows-portable.zip
-            artifacts/windows-build/Visualizer-Windows.msi
-            artifacts/macos-build/Visualizer-macOS.dmg
-            artifacts/macos-build/Visualizer-macOS.zip
+            artifacts/windows-build/ssook-Windows-portable.zip
+            artifacts/windows-build/ssook-Windows.msi
+            artifacts/macos-build/ssook-macOS.dmg
+            artifacts/macos-build/ssook-macOS.zip
           generate_release_notes: true
           fail_on_unmatched_files: false

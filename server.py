@@ -1,5 +1,5 @@
 """
-Visualizer Web Server — FastAPI backend serving the web UI
+ssook Web Server — FastAPI backend serving the web UI
 and exposing core/ functionality as REST API.
 """
 import os
@@ -62,7 +62,7 @@ def _draw_label(frame, text, x1, y1, color, font_scale, font_thick, show_bg):
         txt_color = color
     cv2.putText(frame, text, (x1 + 1, ty - baseline), cv2.FONT_HERSHEY_SIMPLEX, font_scale, txt_color, font_thick, cv2.LINE_AA)
 
-app = FastAPI(title="Visualizer", version="1.0.0")
+app = FastAPI(title="ssook", version="1.1.0")
 
 # ── Static files ────────────────────────────────────────
 WEB_DIR = ROOT / "web"
@@ -1866,7 +1866,7 @@ async def system_full_info():
 def main():
     import uvicorn
     port = int(os.environ.get("PORT", 8765))
-    print(f"\n  Visualizer running at http://localhost:{port}\n")
+    print(f"\n  ssook running at http://localhost:{port}\n")
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
 
 

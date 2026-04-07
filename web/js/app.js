@@ -26,8 +26,8 @@ const App = {
 
     let html = `
       <div class="sidebar-header">
-        <img src="/assets/icon.svg" width="24" height="24" alt="AIO" style="border-radius:4px;">
-        <h1>AIO</h1>
+        <img src="/assets/icon.svg" width="24" height="24" alt="ssook" style="border-radius:4px;">
+        <h1>ssook</h1>
       </div>`;
 
     for (const [secKey, items] of this._nav) {
@@ -79,7 +79,7 @@ const App = {
     const toggle = document.getElementById('dark-toggle');
     if (toggle) toggle.addEventListener('change', () => {
       document.documentElement.classList.toggle('dark', toggle.checked);
-      localStorage.setItem('visualizer-dark', toggle.checked);
+      localStorage.setItem('ssook-dark', toggle.checked);
       this.renderSidebar(); // re-render for icon swap
     });
 
@@ -89,7 +89,7 @@ const App = {
   },
 
   initDarkMode() {
-    const saved = localStorage.getItem('visualizer-dark');
+    const saved = localStorage.getItem('ssook-dark');
     if (saved === 'true' || (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
       document.documentElement.classList.add('dark');
     }

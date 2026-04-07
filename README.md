@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="assets/icon.png" width="120" alt="Visualizer Logo" />
+<img src="assets/icon.png" width="120" alt="ssook Logo" />
 
-# Visualizer
+# ssook
 
 **All-in-one desktop toolkit for AI model inference, evaluation, analysis & data management**
 
@@ -78,8 +78,8 @@ Just run — no Python needed.
 Requires Python **3.10+**.
 
 ```bash
-git clone https://github.com/your-org/visualizer.git
-cd visualizer
+git clone https://github.com/surrealier/ssook.git
+cd ssook
 
 pip install -r requirements-web.txt
 
@@ -170,6 +170,6 @@ python -m pytest tests/ -v
 
 <div align="center">
 
-[⬆ Back to Top](#visualizer)
+[⬆ Back to Top](#ssook)
 
 </div>

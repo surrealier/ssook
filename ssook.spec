@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for Visualizer (Web UI)
-# Build: pyinstaller visualizer.spec
+# PyInstaller spec for ssook (Web UI)
+# Build: pyinstaller ssook.spec
 
 block_cipher = None
 
@@ -45,7 +45,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Visualizer',
+    name='ssook',
     debug=False,
     strip=False,
     upx=True,
@@ -61,5 +61,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=['onnxruntime_providers_*.dll', 'onnxruntime_providers_shared.dll'],
-    name='Visualizer',
+    name='ssook',
 )

@@ -1,5 +1,5 @@
 """
-Visualizer Desktop Launcher
+ssook Desktop Launcher
 
 Starts the FastAPI server and opens the UI.
 Supports two modes:
@@ -30,7 +30,7 @@ def _set_windows_icon():
     try:
         import ctypes
         # Set AppUserModelID so Windows groups this as its own app with custom icon
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Visualizer.App')
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('ssook.App')
         # Set console window icon
         ico = str(ROOT / "assets" / "icon.ico")
         if os.path.exists(ico):
@@ -55,7 +55,7 @@ def start_server(port: int):
     import logging
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s",
-                        filename="visualizer.log", filemode="a")
+                        filename="ssook.log", filemode="a")
     # Also log to stderr
     logging.getLogger().addHandler(logging.StreamHandler())
     try:
@@ -80,7 +80,7 @@ def wait_for_server(port: int, timeout: float = 10.0):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualizer Desktop Launcher")
+    parser = argparse.ArgumentParser(description="ssook Desktop Launcher")
     parser.add_argument("--browser", action="store_true", help="Force browser mode")
     parser.add_argument("--port", type=int, default=8765, help="Server port")
     args = parser.parse_args()
@@ -93,7 +93,7 @@ def main():
     server_thread = threading.Thread(target=start_server, args=(args.port,), daemon=True)
     server_thread.start()
 
-    print(f"Starting Visualizer at {url} ...")
+    print(f"Starting ssook at {url} ...")
     if not wait_for_server(args.port):
         print("ERROR: Server failed to start")
         sys.exit(1)
@@ -105,7 +105,7 @@ def main():
             print("Opening native window...")
             ico = str(ROOT / "assets" / ("icon.ico" if sys.platform == "win32" else "icon.png"))
             webview.create_window(
-                "AIO",
+                "ssook",
                 url,
                 width=1400,
                 height=900,

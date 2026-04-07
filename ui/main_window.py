@@ -51,7 +51,7 @@ from ui import theme
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("YOLO Visualizer")
+        self.setWindowTitle("ssook")
         self.resize(1280, 720)
 
         self._config = AppConfig()

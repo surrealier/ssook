@@ -1,4 +1,4 @@
-/* API client for Visualizer backend */
+/* API client for ssook backend */
 const API = {
   base: '',
 

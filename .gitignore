@@ -11,8 +11,8 @@ __pycache__/
 build/
 dist/
 *.spec
-!visualizer.spec
-!visualizer_mac.spec
+!ssook.spec
+!ssook_mac.spec
 
 # ===== IDE / Editor =====
 .claude/

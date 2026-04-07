@@ -1,6 +1,6 @@
-/* i18n — Internationalization for Visualizer Web UI */
+/* i18n — Internationalization for ssook Web UI */
 const I18n = {
-  _lang: localStorage.getItem('visualizer-lang') || (navigator.language.startsWith('ko') ? 'ko' : 'en'),
+  _lang: localStorage.getItem('ssook-lang') || (navigator.language.startsWith('ko') ? 'ko' : 'en'),
   _strings: {
     // Sidebar sections
     'sec.inference':   { en: 'Inference',   ko: '추론' },
@@ -134,7 +134,7 @@ const I18n = {
 
   setLang(lang) {
     this._lang = lang;
-    localStorage.setItem('visualizer-lang', lang);
+    localStorage.setItem('ssook-lang', lang);
     // Re-render current view
     App.renderSidebar();
     App.switchTab(App.currentTab);

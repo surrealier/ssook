@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for Visualizer — macOS (Web UI)
-# Build: pyinstaller visualizer_mac.spec
+# PyInstaller spec for ssook — macOS (Web UI)
+# Build: pyinstaller ssook_mac.spec
 
 block_cipher = None
 
@@ -45,7 +45,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Visualizer',
+    name='ssook',
     debug=False,
     strip=False,
     upx=False,
@@ -60,17 +60,17 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name='Visualizer',
+    name='ssook',
 )
 
 app = BUNDLE(
     coll,
-    name='Visualizer.app',
+    name='ssook.app',
     icon='assets/icon.icns',
-    bundle_identifier='com.visualizer.app',
+    bundle_identifier='com.ssook.app',
     info_plist={
         'CFBundleShortVersionString': '1.1.0',
-        'CFBundleName': 'Visualizer',
+        'CFBundleName': 'ssook',
         'NSHighResolutionCapable': True,
         'NSRequiresAquaSystemAppearance': False,
     },
