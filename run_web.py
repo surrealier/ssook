@@ -60,7 +60,8 @@ def start_server(port: int):
     logging.getLogger().addHandler(logging.StreamHandler())
     try:
         from server import app
-        uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+        uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning",
+                    timeout_keep_alive=30)
     except Exception as e:
         logging.exception(f"Server crashed: {e}")
         print(f"\n[FATAL] Server error: {e}", file=sys.stderr)

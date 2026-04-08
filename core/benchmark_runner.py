@@ -37,7 +37,12 @@ _ORT_DTYPE_MAP: dict = {
 }
 
 
+_smi_available = None  # None=미확인, True/False=캐싱
+
 def _smi_query() -> "dict | None":
+    global _smi_available
+    if _smi_available is False:
+        return None
     try:
         out = subprocess.check_output(
             [
@@ -50,12 +55,14 @@ def _smi_query() -> "dict | None":
             creationflags=_CREATE_NO_WINDOW,
         )
         parts = [p.strip() for p in out.strip().split(",")]
+        _smi_available = True
         return {
             "util": int(parts[0]),
             "mem_used": int(parts[1]),
             "mem_total": int(parts[2]),
         }
     except Exception:
+        _smi_available = False
         return None
 
 

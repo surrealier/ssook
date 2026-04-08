@@ -13,6 +13,8 @@ const App = {
   ],
 
   init() {
+    Notify.mount();
+    document.getElementById('notify-btn').insertAdjacentHTML('afterbegin', Icons.bell(18));
     this.renderSidebar();
     this.initDarkMode();
     this.switchTab('viewer');
@@ -101,6 +103,10 @@ const App = {
     const tab = Tabs[name];
     if (!tab) return;
 
+    // 이전 탭 리소스 정리
+    const prev = Tabs[this.currentTab];
+    if (prev && prev.destroy) prev.destroy();
+
     // 현재 탭 DOM 캐시 저장
     const body = document.getElementById('page-body');
     if (this.currentTab && body.children.length) {
@@ -115,7 +121,9 @@ const App = {
     });
 
     // Update header
-    document.getElementById('page-title').textContent = tab.title ? I18n.t('nav.' + name) : name;
+    const titleEl = document.getElementById('page-title');
+    const titleText = tab.title ? I18n.t('nav.' + name) : name;
+    titleEl.innerHTML = titleText + ' <button class="btn btn-ghost" style="padding:0;font-size:14px;min-width:20px;height:20px;line-height:20px;vertical-align:middle;margin-left:0.25rem;" onclick="showHelp(\'' + name + '\')">❓</button>';
 
     // 캐시된 HTML이 있으면 복원, 없으면 새로 렌더
     if (tab._cachedHTML) {
@@ -132,8 +140,15 @@ const App = {
     }
   },
 
-  setStatus(text) {
+  setStatus(text, errorDetail) {
     document.getElementById('status-text').textContent = text;
+    if (!text) return;
+    const lower = text.toLowerCase();
+    if (lower.startsWith('error:') || lower.startsWith('오류:')) {
+      Notify.error(text, errorDetail);
+    } else if (/\bcomplete$|\bsaved|저장[  ]?완료|완료$/.test(lower)) {
+      Notify.success(text);
+    }
   },
 
   async loadSystemInfo() {

@@ -60,6 +60,7 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=['onnxruntime_providers_*.dll', 'onnxruntime_providers_shared.dll'],
+    upx_exclude=['onnxruntime_providers_*.dll', 'onnxruntime_providers_shared.dll',
+                 'cv2*.dll', 'opencv*.dll', 'libopenblas*.dll'],
     name='ssook',
 )

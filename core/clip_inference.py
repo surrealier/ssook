@@ -12,16 +12,34 @@ class CLIPModel:
         self.img_session = ort.InferenceSession(image_encoder_path)
         self.txt_session = ort.InferenceSession(text_encoder_path) if text_encoder_path else None
         self._img_input = self.img_session.get_inputs()[0]
-        self._img_size = (self._img_input.shape[2], self._img_input.shape[3])  # (H, W)
-        self._img_bs = self._img_input.shape[0]
-        self._img_bs = int(self._img_bs) if isinstance(self._img_bs, int) and self._img_bs > 0 else 1
+        # 입력 shape 자동 감지: [B,C,H,W] 또는 [B,H,W,C] 또는 동적
+        shape = self._img_input.shape
+        try:
+            if len(shape) == 4 and isinstance(shape[2], int) and isinstance(shape[3], int):
+                self._img_size = (shape[2], shape[3])  # NCHW
+            elif len(shape) == 4 and isinstance(shape[1], int) and isinstance(shape[2], int):
+                self._img_size = (shape[1], shape[2])  # NHWC
+            else:
+                self._img_size = (224, 224)  # 기본값
+        except (IndexError, TypeError):
+            self._img_size = (224, 224)
+        self._img_bs = shape[0] if isinstance(shape[0], int) and shape[0] > 0 else 1
 
     def encode_image(self, frame: np.ndarray) -> np.ndarray:
         """BGR frame → normalized embedding vector"""
         tensor = self._preprocess_image(frame)
         if self._img_bs > 1:
             tensor = np.repeat(tensor, self._img_bs, axis=0)
-        out = self.img_session.run(None, {self._img_input.name: tensor})
+        # 모든 입력 피드 구성
+        feed = {}
+        for inp in self.img_session.get_inputs():
+            if inp.name == self._img_input.name:
+                feed[inp.name] = tensor
+            else:
+                shape = [s if isinstance(s, int) and s > 0 else tensor.shape[0] if i == 0 else 1
+                         for i, s in enumerate(inp.shape)]
+                feed[inp.name] = np.zeros(shape, dtype=np.float32 if "float" in (inp.type or "") else np.int64)
+        out = self.img_session.run(None, feed)
         emb = out[0][0].flatten().astype(np.float32)
         return emb / (np.linalg.norm(emb) + 1e-9)
 
@@ -29,12 +47,28 @@ class CLIPModel:
         """토큰 배열 → normalized embedding vector"""
         if self.txt_session is None:
             raise RuntimeError("텍스트 인코더가 없습니다.")
-        inp = self.txt_session.get_inputs()[0]
-        bs = inp.shape[0]
+        inputs = self.txt_session.get_inputs()
+        # 배치 크기 맞추기
+        bs = inputs[0].shape[0]
         bs = int(bs) if isinstance(bs, int) and bs > 0 else 1
         if bs > 1 and tokens.shape[0] < bs:
             tokens = np.repeat(tokens, bs, axis=0)[:bs]
-        out = self.txt_session.run(None, {inp.name: tokens})
+        # 모든 입력 피드 구성
+        feed = {}
+        for inp in inputs:
+            name = inp.name
+            if name == "input_ids":
+                feed[name] = tokens
+            elif name == "attention_mask":
+                feed[name] = np.ones_like(tokens, dtype=np.int64)
+            elif name == "position_ids":
+                feed[name] = np.arange(tokens.shape[1], dtype=np.int64)[np.newaxis].repeat(tokens.shape[0], axis=0)
+            else:
+                # 알 수 없는 입력은 shape에 맞는 zeros
+                shape = [s if isinstance(s, int) and s > 0 else tokens.shape[0] if i == 0 else 1
+                         for i, s in enumerate(inp.shape)]
+                feed[name] = np.zeros(shape, dtype=np.float32 if "float" in (inp.type or "") else np.int64)
+        out = self.txt_session.run(None, feed)
         emb = out[0][0].flatten().astype(np.float32)
         return emb / (np.linalg.norm(emb) + 1e-9)
 

@@ -26,8 +26,9 @@ class ModelInfo:
     custom_type_name: str = ""           # custom 모델 타입 이름 (model_type=="custom" 시)
 
 
-# 지원 모델 타입 목록 (최대 10종)
+# 지원 모델 타입 목록
 MODEL_TYPES = {
+    # Detection (9)
     "yolo":      "YOLO (v5/v7/v8/v9/v11/v12)",
     "darknet":   "CenterNet (Darknet)",
     "detr":      "DETR / RT-DETR / RF-DETR",
@@ -37,6 +38,30 @@ MODEL_TYPES = {
     "gold_yolo": "Gold-YOLO",
     "yolox":     "YOLOX",
     "efficientdet": "EfficientDet",
+    # Classification (5)
+    "cls_resnet":      "ResNet (Classification)",
+    "cls_efficientnet":"EfficientNet (Classification)",
+    "cls_mobilenet":   "MobileNet (Classification)",
+    "cls_vit":         "ViT (Classification)",
+    "cls_custom":      "Custom Classification",
+    # Segmentation (5)
+    "seg_yolo":    "YOLO-Seg (v8/v11)",
+    "seg_unet":    "U-Net",
+    "seg_deeplabv3":"DeepLabV3",
+    "seg_fcn":     "FCN",
+    "seg_custom":  "Custom Segmentation",
+    # CLIP (5)
+    "clip_vit_b32": "CLIP ViT-B/32",
+    "clip_vit_b16": "CLIP ViT-B/16",
+    "clip_vit_l14": "CLIP ViT-L/14",
+    "clip_rn50":    "CLIP ResNet-50",
+    "clip_custom":  "Custom CLIP",
+    # Embedder (5)
+    "emb_vit":         "ViT Embedder",
+    "emb_resnet":      "ResNet Embedder",
+    "emb_efficientnet":"EfficientNet Embedder",
+    "emb_dino":        "DINOv2 Embedder",
+    "emb_custom":      "Custom Embedder",
 }
 
 
@@ -59,8 +84,16 @@ def _build_providers() -> list:
 
 def _create_session(path: str, session_options=None) -> ort.InferenceSession:
     if session_options is None:
+        import os
         session_options = ort.SessionOptions()
         session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_options.enable_mem_pattern = True
+        session_options.enable_cpu_mem_arena = True
+        # 노트북 환경 최적화: 물리 코어 수 기반 스레드 제한
+        phys_cores = os.cpu_count() or 4
+        intra = max(2, phys_cores // 2)
+        session_options.intra_op_num_threads = intra
+        session_options.inter_op_num_threads = max(1, intra // 2)
     return ort.InferenceSession(path, sess_options=session_options, providers=_build_providers())
 
 
@@ -95,12 +128,24 @@ def _get_names_from_pt(path: str) -> dict:
     return {}
 
 
-def _detect_task_type(session: ort.InferenceSession) -> str:
-    """출력 텐서 shape으로 detection/classification 자동 감지"""
+def _detect_task_type(session: ort.InferenceSession, model_type: str = "yolo") -> str:
+    """출력 텐서 shape으로 detection/classification/segmentation 자동 감지"""
+    # 모델 타입 접두사로 강제 지정
+    if model_type.startswith("cls_"):
+        return "classification"
+    if model_type.startswith("seg_"):
+        return "segmentation"
+    if model_type.startswith("clip_"):
+        return "embedding"
+    if model_type.startswith("emb_"):
+        return "embedding"
     shape = session.get_outputs()[0].shape
     # Classification: (1, N) — 2차원, N은 클래스 수
     if len(shape) == 2:
         return "classification"
+    # Segmentation: (1, C, H, W) — 4차원, C>1
+    if len(shape) == 4:
+        return "segmentation"
     # Detection: (1, X, Y) — 3차원
     return "detection"
 
@@ -187,15 +232,40 @@ def _load_onnx(path: str, model_type: str = "yolo", session_options=None) -> Mod
     names = _get_names_from_onnx(session)
     if model_type == "darknet" and all(v.startswith("class_") for v in names.values()):
         names = _DARKNET_DEFAULT_NAMES
-    input_size = _get_input_size(session)
-    task_type = _detect_task_type(session)
+
+    inputs = session.get_inputs()
+
+    # CLIP/Embedder: 다중 입력 모델 — 이미지 입력(4D) 찾기
+    img_input = inputs[0]
+    if model_type.startswith(("clip_", "emb_")):
+        for inp in inputs:
+            if len(inp.shape) == 4:  # (B, C, H, W) or (B, H, W, C)
+                img_input = inp
+                break
+            if "pixel" in inp.name.lower() or "image" in inp.name.lower():
+                img_input = inp
+                break
+
+    input_name = img_input.name
+    # input_size from the image input
+    shape = img_input.shape
+    try:
+        h = int(shape[2]) if len(shape) >= 4 and isinstance(shape[2], int) and shape[2] > 0 else 640
+        w = int(shape[3]) if len(shape) >= 4 and isinstance(shape[3], int) and shape[3] > 0 else 640
+        input_size = (h, w)
+    except Exception:
+        input_size = (640, 640)
+
+    if not model_type.startswith(("clip_", "emb_")):
+        input_size = _get_input_size(session)
+
+    task_type = _detect_task_type(session, model_type)
     layout = _detect_layout(session, model_type) if task_type == "detection" else "v8"
-    input_name = session.get_inputs()[0].name
     # 배치 크기 감지
-    batch_dim = session.get_inputs()[0].shape[0]
+    batch_dim = img_input.shape[0]
     batch_size = int(batch_dim) if isinstance(batch_dim, int) and batch_dim > 0 else 1
     print(f"[ModelLoader] ONNX loaded: {os.path.basename(path)}")
-    print(f"  input={input_size}, task={task_type}, layout={layout}, type={model_type}, batch={batch_size}, classes={len(names)}")
+    print(f"  input={input_size}, input_name={input_name}, task={task_type}, layout={layout}, type={model_type}, batch={batch_size}, classes={len(names)}")
     return ModelInfo(
         path=path,
         format="onnx",

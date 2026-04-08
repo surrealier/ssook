@@ -7,9 +7,11 @@ import sys
 import platform
 import asyncio
 import base64
+import glob as glob_module
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -63,6 +65,9 @@ def _draw_label(frame, text, x1, y1, color, font_scale, font_thick, show_bg):
     cv2.putText(frame, text, (x1 + 1, ty - baseline), cv2.FONT_HERSHEY_SIMPLEX, font_scale, txt_color, font_thick, cv2.LINE_AA)
 
 app = FastAPI(title="ssook", version="1.1.0")
+
+# 백그라운드 작업용 스레드 풀 (최대 4개 동시 작업)
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ssook-bg")
 
 # ── Static files ────────────────────────────────────────
 WEB_DIR = ROOT / "web"
@@ -269,118 +274,130 @@ async def run_evaluation_async(req: EvalAsyncRequest):
         from core.inference import run_inference
         from core.evaluation import evaluate_dataset, evaluate_map50_95
 
-        _eval_state.update(progress=0, msg="Loading images...")
+        try:
+            _eval_state.update(progress=0, msg="Loading images...")
 
-        exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
-        img_files = []
-        for e in exts:
-            img_files.extend(glob.glob(os.path.join(req.img_dir, e)))
-        img_files.sort()
-        if not img_files:
-            _eval_state.update(running=False, msg="No images found")
-            return
+            exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+            img_files = []
+            for e in exts:
+                img_files.extend(glob.glob(os.path.join(req.img_dir, e)))
+            img_files.sort()
+            if not img_files:
+                _eval_state.update(running=False, msg="No images found")
+                return
 
-        # GT 로드
-        gt_data = {}
-        for fp in img_files:
-            stem = os.path.splitext(os.path.basename(fp))[0]
-            txt = os.path.join(req.label_dir, stem + ".txt")
-            boxes = []
-            if os.path.isfile(txt):
-                with open(txt) as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) >= 5:
-                            boxes.append((int(parts[0]), *map(float, parts[1:5])))
-            gt_data[stem] = boxes
-
-        total_work = len(img_files) * len(req.models)
-        _eval_state["total"] = total_work
-        done = 0
-
-        for entry in req.models:
-            model_path = entry if isinstance(entry, str) else entry.get("path", "")
-            model_type = "yolo" if isinstance(entry, str) else entry.get("model_type", "yolo")
-            name = os.path.basename(model_path)
-            _eval_state["model_name"] = name
-
-            try:
-                mi = _load_model(model_path, model_type=model_type)
-            except Exception as exc:
-                _eval_state["results"].append({"name": name, "error": str(exc)})
-                done += len(img_files)
-                _eval_state["progress"] = done
-                continue
-
-            # per-model class mapping
-            pm = (req.per_model_mappings or {}).get(name, {})
-            # convert string keys to int
-            mapping = {int(k): int(v) for k, v in pm.items()} if pm else {}
-            mapped_only = req.mapped_only
-
-            # GT 필터링 (매핑된 클래스만)
-            if mapping and mapped_only:
-                allowed_gt = set(mapping.values())
-                gt_eval = {s: [b for b in boxes if b[0] in allowed_gt]
-                           for s, boxes in gt_data.items()}
-            else:
-                gt_eval = gt_data
-
-            pred_data = {}
+            # GT 로드
+            gt_data = {}
             for fp in img_files:
-                frame = cv2.imread(fp)
-                if frame is None:
-                    done += 1
-                    continue
-                h, w = frame.shape[:2]
-                res = run_inference(mi, frame, req.conf)
                 stem = os.path.splitext(os.path.basename(fp))[0]
+                txt = os.path.join(req.label_dir, stem + ".txt")
                 boxes = []
-                for box, score, cid in zip(res.boxes, res.scores, res.class_ids):
-                    cid = int(cid)
-                    # 클래스 리매핑
-                    if mapping:
-                        if cid in mapping:
-                            cid = mapping[cid]
-                        elif mapped_only:
-                            continue
-                    x1, y1, x2, y2 = box
-                    cx = ((x1+x2)/2)/w; cy = ((y1+y2)/2)/h
-                    bw = (x2-x1)/w; bh = (y2-y1)/h
-                    boxes.append((cid, cx, cy, bw, bh, float(score)))
-                pred_data[stem] = boxes
-                done += 1
-                _eval_state["progress"] = done
-                _eval_state["msg"] = f"{name}: {done}/{total_work}"
+                if os.path.isfile(txt):
+                    with open(txt) as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) >= 5:
+                                boxes.append((int(parts[0]), *map(float, parts[1:5])))
+                gt_data[stem] = boxes
 
-            res50 = evaluate_dataset(gt_eval, pred_data, 0.5)
-            map5095 = evaluate_map50_95(gt_eval, pred_data)
-            ov = res50.get("__overall__", {})
-            # per-class detail (JSON serializable)
-            detail = {}
-            for cid, v in res50.items():
-                if cid == "__overall__":
+            total_work = len(img_files) * len(req.models)
+            _eval_state["total"] = total_work
+            done = 0
+
+            # 이미지 캐시: 첫 번째 모델 평가 시 로드, 이후 모델에서 재사용
+            _img_cache = {}
+
+            for entry in req.models:
+                model_path = entry if isinstance(entry, str) else entry.get("path", "")
+                model_type = "yolo" if isinstance(entry, str) else entry.get("model_type", "yolo")
+                name = os.path.basename(model_path)
+                _eval_state["model_name"] = name
+
+                try:
+                    mi = _load_model(model_path, model_type=model_type)
+                except Exception as exc:
+                    _eval_state["results"].append({"name": name, "error": str(exc)})
+                    done += len(img_files)
+                    _eval_state["progress"] = done
                     continue
-                detail[str(cid)] = {
-                    "ap": round(v.get("ap", 0), 6),
-                    "precision": round(v.get("precision", 0), 6),
-                    "recall": round(v.get("recall", 0), 6),
-                    "f1": round(v.get("f1", 0), 6),
-                    "tp": v.get("tp", 0), "fp": v.get("fp", 0), "fn": v.get("fn", 0),
-                }
-            _eval_state["results"].append({
-                "name": name,
-                "map50": round(ov.get("ap", 0) * 100, 4),
-                "map5095": round(map5095 * 100, 4),
-                "precision": round(ov.get("precision", 0) * 100, 4),
-                "recall": round(ov.get("recall", 0) * 100, 4),
-                "f1": round(ov.get("f1", 0) * 100, 4),
-                "detail": detail,
-            })
 
-        _eval_state.update(running=False, msg="Complete")
+                # per-model class mapping
+                pm = (req.per_model_mappings or {}).get(name, {})
+                # convert string keys to int
+                mapping = {int(k): int(v) for k, v in pm.items()} if pm else {}
+                mapped_only = req.mapped_only
 
-    threading.Thread(target=_run, daemon=True).start()
+                # GT 필터링 (매핑된 클래스만)
+                if mapping and mapped_only:
+                    allowed_gt = set(mapping.values())
+                    gt_eval = {s: [b for b in boxes if b[0] in allowed_gt]
+                               for s, boxes in gt_data.items()}
+                else:
+                    gt_eval = gt_data
+
+                pred_data = {}
+                for fp in img_files:
+                    if fp in _img_cache:
+                        frame = _img_cache[fp]
+                    else:
+                        frame = cv2.imread(fp)
+                        if frame is not None:
+                            _img_cache[fp] = frame
+                    if frame is None:
+                        done += 1
+                        continue
+                    h, w = frame.shape[:2]
+                    res = run_inference(mi, frame, req.conf)
+                    stem = os.path.splitext(os.path.basename(fp))[0]
+                    boxes = []
+                    for box, score, cid in zip(res.boxes, res.scores, res.class_ids):
+                        cid = int(cid)
+                        # 클래스 리매핑
+                        if mapping:
+                            if cid in mapping:
+                                cid = mapping[cid]
+                            elif mapped_only:
+                                continue
+                        x1, y1, x2, y2 = box
+                        cx = ((x1+x2)/2)/w; cy = ((y1+y2)/2)/h
+                        bw = (x2-x1)/w; bh = (y2-y1)/h
+                        boxes.append((cid, cx, cy, bw, bh, float(score)))
+                    pred_data[stem] = boxes
+                    done += 1
+                    _eval_state["progress"] = done
+                    _eval_state["msg"] = f"{name}: {done}/{total_work}"
+
+                res50 = evaluate_dataset(gt_eval, pred_data, 0.5)
+                map5095 = evaluate_map50_95(gt_eval, pred_data)
+                ov = res50.get("__overall__", {})
+                # per-class detail (JSON serializable)
+                detail = {}
+                for cid, v in res50.items():
+                    if cid == "__overall__":
+                        continue
+                    detail[str(cid)] = {
+                        "ap": round(v.get("ap", 0), 6),
+                        "precision": round(v.get("precision", 0), 6),
+                        "recall": round(v.get("recall", 0), 6),
+                        "f1": round(v.get("f1", 0), 6),
+                        "tp": v.get("tp", 0), "fp": v.get("fp", 0), "fn": v.get("fn", 0),
+                    }
+                _eval_state["results"].append({
+                    "name": name,
+                    "map50": round(ov.get("ap", 0) * 100, 4),
+                    "map5095": round(map5095 * 100, 4),
+                    "precision": round(ov.get("precision", 0) * 100, 4),
+                    "recall": round(ov.get("recall", 0) * 100, 4),
+                    "f1": round(ov.get("f1", 0) * 100, 4),
+                    "detail": detail,
+                })
+
+            _img_cache.clear()
+            _eval_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _eval_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
     return {"ok": True}
 
 
@@ -403,6 +420,10 @@ class ModelLoadRequest(BaseModel):
 
 @app.post("/api/model/load")
 async def load_model(req: ModelLoadRequest):
+    return await asyncio.get_event_loop().run_in_executor(_executor, _load_model_sync, req)
+
+
+def _load_model_sync(req: ModelLoadRequest):
     global _loaded_model, _loaded_model_meta
     try:
         from core.model_loader import load_model as _load
@@ -515,31 +536,34 @@ _loaded_model_meta = None  # dict for JSON response
 # ── Auto-load default model on startup (#11) ────────────
 @app.on_event("startup")
 async def _auto_load_default_model():
-    global _loaded_model, _loaded_model_meta
-    try:
-        from core.app_config import AppConfig
-        from core.model_loader import load_model as _load
-        cfg = AppConfig()
-        p = cfg.default_model_path
-        if p and os.path.isfile(p):
-            model_type = cfg.model_type
-            if model_type.startswith("custom:"):
-                model_type = "custom"
-            info = _load(p, model_type=model_type)
-            _loaded_model = info
-            inp = info.session.get_inputs()[0]
-            out = info.session.get_outputs()[0]
-            _loaded_model_meta = {
-                "ok": True, "name": os.path.basename(p),
-                "input_shape": str(inp.shape), "output_shape": str(out.shape),
-                "input_size": list(info.input_size), "num_classes": len(info.names or {}),
-                "names": info.names or {}, "task": info.task_type or "",
-                "layout": info.output_layout or "", "model_type": info.model_type or "",
-                "batch_size": info.batch_size,
-            }
-            print(f"[Startup] Default model loaded: {os.path.basename(p)}")
-    except Exception as e:
-        print(f"[Startup] Default model load failed: {e}")
+    """기본 모델을 백그라운드에서 로드 — 서버 시작을 블로킹하지 않음"""
+    def _load_bg():
+        global _loaded_model, _loaded_model_meta
+        try:
+            from core.app_config import AppConfig
+            from core.model_loader import load_model as _load
+            cfg = AppConfig()
+            p = cfg.default_model_path
+            if p and os.path.isfile(p):
+                model_type = cfg.model_type
+                if model_type.startswith("custom:"):
+                    model_type = "custom"
+                info = _load(p, model_type=model_type)
+                _loaded_model = info
+                inp = info.session.get_inputs()[0]
+                out = info.session.get_outputs()[0]
+                _loaded_model_meta = {
+                    "ok": True, "name": os.path.basename(p),
+                    "input_shape": str(inp.shape), "output_shape": str(out.shape),
+                    "input_size": list(info.input_size), "num_classes": len(info.names or {}),
+                    "names": info.names or {}, "task": info.task_type or "",
+                    "layout": info.output_layout or "", "model_type": info.model_type or "",
+                    "batch_size": info.batch_size,
+                }
+                print(f"[Startup] Default model loaded: {os.path.basename(p)}")
+        except Exception as e:
+            print(f"[Startup] Default model load failed: {e}")
+    _executor.submit(_load_bg)
 
 
 # ── Inference API ───────────────────────────────────────
@@ -552,10 +576,14 @@ class InferRequest(BaseModel):
 @app.post("/api/infer/image")
 async def infer_image(req: InferRequest):
     """Run inference on a single image, return annotated JPEG + detections."""
+    return await asyncio.get_event_loop().run_in_executor(_executor, _infer_image_sync, req)
+
+
+def _infer_image_sync(req: InferRequest):
     global _loaded_model, _loaded_model_meta
     try:
         from core.model_loader import load_model as _load
-        from core.inference import run_inference, run_classification
+        from core.inference import run_inference, run_classification, run_segmentation, run_embedding
         from core.app_config import AppConfig
 
         cfg = AppConfig()
@@ -579,6 +607,9 @@ async def infer_image(req: InferRequest):
 
         names = _loaded_model.names or {}
 
+        if _loaded_model.task_type == "embedding":
+            return {"error": "CLIP/Embedder 모델은 뷰어에서 사용할 수 없습니다. 전용 탭을 이용하세요."}
+
         if _loaded_model.task_type == "classification":
             result = run_classification(_loaded_model, frame)
             top_k = result.top_k[:5]
@@ -597,6 +628,19 @@ async def infer_image(req: InferRequest):
                 "top_k": [{"class": names.get(c, str(c)), "score": round(s, 4)} for c, s in top_k],
                 "infer_ms": round(result.infer_ms, 2),
                 "classes": {},
+            }
+
+        if _loaded_model.task_type == "segmentation":
+            result = run_segmentation(_loaded_model, frame)
+            vis = _overlay_segmentation(frame, result.mask)
+            _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            unique_cls = [int(c) for c in np.unique(result.mask) if c > 0]
+            return {
+                "image": base64.b64encode(buf).decode(),
+                "detections": len(unique_cls),
+                "segmentation": f"{result.num_classes} classes, {len(unique_cls)} present",
+                "infer_ms": round(result.infer_ms, 2),
+                "classes": {c: names.get(c, str(c)) for c in unique_cls},
             }
 
         # Detection
@@ -635,12 +679,31 @@ async def infer_image(req: InferRequest):
 
 # ── Video streaming (MJPEG) ─────────────────────────────
 _video_sessions = {}  # session_id -> dict with state
+_SESSION_TIMEOUT = 300  # 5분 무활동 시 세션 자동 정리
+
+
+def _cleanup_stale_sessions():
+    """타임아웃된 비디오 세션 정리"""
+    now = time.time()
+    stale = [sid for sid, s in _video_sessions.items()
+             if not s.get("playing") and now - s.get("last_access", 0) > _SESSION_TIMEOUT]
+    for sid in stale:
+        sess = _video_sessions.pop(sid, None)
+        if sess:
+            try:
+                sess["cap"].release()
+            except Exception:
+                pass
+            sess["last_frame"] = None
+            sess["last_result"] = None
+            print(f"[Session] Cleaned up stale session: {sid}")
 
 
 class VideoStartRequest(BaseModel):
     model_path: str
     video_path: str
     conf: float = 0.25
+    stream_max_height: int = 0  # 0=원본, 720/480 등 지정 시 다운스케일
 
 
 @app.post("/api/viewer/start")
@@ -665,6 +728,9 @@ async def viewer_start(req: VideoStartRequest):
                     _loaded_model.names = cmt.class_names
             _loaded_model_meta = {"name": os.path.basename(req.model_path)}
 
+        if _loaded_model.task_type == "embedding":
+            return {"error": "CLIP/Embedder 모델은 뷰어에서 사용할 수 없습니다."}
+
         cap = cv2.VideoCapture(req.video_path)
         if not cap.isOpened():
             return {"error": "Cannot open video"}
@@ -682,6 +748,8 @@ async def viewer_start(req: VideoStartRequest):
             "last_frame": None, "last_result": None,
             "seek_to": None, "step_request": None,
             "video_path": req.video_path,
+            "last_access": time.time(),
+            "stream_max_height": req.stream_max_height,
         }
         return {"session_id": sid, "fps": fps,
                 "total_frames": _video_sessions[sid]["total"]}
@@ -697,11 +765,13 @@ async def viewer_stream(session_id: str):
         return {"error": "Invalid session"}
 
     def generate():
-        from core.inference import run_inference, run_classification
+        from core.inference import run_inference, run_classification, run_segmentation, run_embedding
         from core.app_config import AppConfig
         cap = sess["cap"]
         model = sess["model"]
         names = model.names or {}
+        cfg = AppConfig()  # 루프 밖에서 한 번만 참조
+        max_h = sess.get("stream_max_height", 0)
 
         try:
             while sess.get("playing", False):
@@ -739,21 +809,27 @@ async def viewer_stream(session_id: str):
 
                 sess["frame_idx"] = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
 
-                cfg = AppConfig()
-
                 if model.task_type == "classification":
                     result = run_classification(model, frame)
                     sess["last_detections"] = 0
                     sess["last_infer_ms"] = round(result.infer_ms, 2)
                     sess["last_frame"] = frame.copy()
                     sess["last_result"] = None
-                    vis = frame.copy()
+                    vis = frame
                     y = 30
                     for cid, conf in result.top_k[:5]:
                         label = f"{names.get(cid, str(cid))}: {conf:.3f}"
                         cv2.putText(vis, label, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                         y += 30
-                    _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                elif model.task_type == "segmentation":
+                    result = run_segmentation(model, frame)
+                    sess["last_detections"] = 0
+                    sess["last_infer_ms"] = round(result.infer_ms, 2)
+                    sess["last_frame"] = frame.copy()
+                    sess["last_result"] = None
+                    vis = _overlay_segmentation(frame, result.mask)
+                    _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 65])
                 else:
                     result = run_inference(model, frame, cfg.conf_threshold)
                     sess["last_detections"] = len(result.boxes)
@@ -780,13 +856,30 @@ async def viewer_stream(session_id: str):
                             parts.append(f"{score:.2f}")
                         if parts:
                             _draw_label(frame, " ".join(parts), x1, y1, color, label_size, max(1, t_val - 1), cfg.show_label_bg)
-                    _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                # 스트리밍 다운스케일 (노트북 최적화)
+                if max_h > 0 and buf is not None:
+                    out_frame = vis if model.task_type == "classification" else frame
+                    oh, ow = out_frame.shape[:2]
+                    if oh > max_h:
+                        scale = max_h / oh
+                        small = cv2.resize(out_frame, (int(ow * scale), max_h), interpolation=cv2.INTER_AREA)
+                        _, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                sess["last_display_jpeg"] = buf.tobytes()
                 yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
-                       buf.tobytes() + b'\r\n')
+                       sess["last_display_jpeg"] + b'\r\n')
 
                 elapsed = time.time() - t0
-                if elapsed < target_delay:
-                    time.sleep(target_delay - elapsed)
+                remaining = target_delay - elapsed
+                if remaining > 0:
+                    time.sleep(remaining)
+                elif remaining < -target_delay:
+                    # 추론이 2프레임 이상 지연 시 프레임 스킵
+                    extra_skip = int(-remaining / target_delay)
+                    for _ in range(extra_skip):
+                        r2, _ = cap.read()
+                        if not r2:
+                            break
         except Exception as exc:
             import traceback
             print(f"[MJPEG ERROR] {exc}")
@@ -799,9 +892,11 @@ async def viewer_stream(session_id: str):
 
 @app.get("/api/viewer/status/{session_id}")
 async def viewer_status(session_id: str):
+    _cleanup_stale_sessions()
     sess = _video_sessions.get(session_id)
     if not sess:
         return {"error": "Invalid session"}
+    sess["last_access"] = time.time()
     return {
         "playing": sess["playing"],
         "paused": sess.get("paused", False),
@@ -869,38 +964,21 @@ async def viewer_step(session_id: str, req: StepRequest):
 @app.post("/api/viewer/snapshot/{session_id}")
 async def viewer_snapshot(session_id: str):
     sess = _video_sessions.get(session_id)
-    if not sess or sess.get("last_frame") is None:
-        return {"error": "No frame available"}
+    if not sess:
+        return {"error": "No session"}
     os.makedirs("snapshots", exist_ok=True)
     from datetime import datetime
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join("snapshots", f"snapshot_{ts}.jpg")
-    frame = sess["last_frame"].copy()
-    # Draw detections on snapshot
-    result = sess.get("last_result")
-    if result is not None:
-        from core.app_config import AppConfig
-        cfg = AppConfig()
-        names = sess["model"].names or {}
-        total_cls = len(names)
-        for box, score, cid in zip(result.boxes, result.scores, result.class_ids):
-            cid_int = int(cid)
-            style = cfg.get_class_style(cid_int)
-            if not style.enabled:
-                continue
-            x1, y1, x2, y2 = map(int, box)
-            t_val = style.thickness or cfg.box_thickness
-            color = _get_color(style, cid_int, total_cls)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, t_val)
-            parts = []
-            if cfg.show_labels:
-                parts.append(names.get(cid_int, str(cid_int)))
-            if cfg.show_confidence:
-                parts.append(f"{score:.2f}")
-            if parts:
-                cv2.putText(frame, " ".join(parts), (x1, max(y1 - 6, 14)),
-                            cv2.FONT_HERSHEY_SIMPLEX, cfg.label_size, color, max(1, t_val - 1))
-    cv2.imwrite(path, frame)
+    # 디스플레이된 화면 그대로 저장
+    jpeg_data = sess.get("last_display_jpeg")
+    if jpeg_data:
+        with open(path, "wb") as f:
+            f.write(jpeg_data)
+    elif sess.get("last_frame") is not None:
+        cv2.imwrite(path, sess["last_frame"])
+    else:
+        return {"error": "No frame available"}
     return {"ok": True, "path": path}
 
 
@@ -938,6 +1016,21 @@ async def video_info(req: VideoInfoRequest):
 
 
 # ── Hardware Stats ──────────────────────────────────────
+_gpu_available = None  # None=미확인, True/False=캐싱
+
+def _check_gpu_available():
+    global _gpu_available
+    if _gpu_available is None:
+        try:
+            import subprocess, sys as _sys
+            flags = 0x08000000 if _sys.platform == "win32" else 0
+            subprocess.check_output(["nvidia-smi", "--version"],
+                                    text=True, timeout=2, creationflags=flags)
+            _gpu_available = True
+        except Exception:
+            _gpu_available = False
+    return _gpu_available
+
 @app.get("/api/system/hw")
 async def system_hw():
     import psutil
@@ -946,21 +1039,54 @@ async def system_hw():
         "cpu": round(proc.cpu_percent(interval=0), 1),
         "ram_mb": round(proc.memory_info().rss / 1024 / 1024),
     }
-    try:
-        import subprocess, sys as _sys
-        flags = 0x08000000 if _sys.platform == "win32" else 0
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
-             "--format=csv,noheader,nounits"],
-            text=True, timeout=2, creationflags=flags,
-        )
-        parts = [p.strip() for p in out.strip().split(",")]
-        info.update(gpu_name=parts[0], gpu_util=int(parts[1]),
-                    gpu_mem_used=int(parts[2]), gpu_mem_total=int(parts[3]),
-                    gpu_temp=int(parts[4]))
-    except Exception:
+    if _check_gpu_available():
+        try:
+            import subprocess, sys as _sys
+            flags = 0x08000000 if _sys.platform == "win32" else 0
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+                 "--format=csv,noheader,nounits"],
+                text=True, timeout=2, creationflags=flags,
+            )
+            parts = [p.strip() for p in out.strip().split(",")]
+            info.update(gpu_name=parts[0], gpu_util=int(parts[1]),
+                        gpu_mem_used=int(parts[2]), gpu_mem_total=int(parts[3]),
+                        gpu_temp=int(parts[4]))
+        except Exception:
+            info.update(gpu_name="N/A", gpu_util=0, gpu_mem_used=0, gpu_mem_total=0, gpu_temp=0)
+    else:
         info.update(gpu_name="N/A", gpu_util=0, gpu_mem_used=0, gpu_mem_total=0, gpu_temp=0)
+    # 메모리 자동 정리: RSS가 시스템 RAM의 50% 초과 시 캐시 정리
+    import psutil as _ps
+    total_ram = _ps.virtual_memory().total
+    if proc.memory_info().rss > total_ram * 0.5:
+        _auto_cleanup_memory()
     return info
+
+
+_MEM_CLEANUP_INTERVAL = 0  # 마지막 정리 시각
+
+def _auto_cleanup_memory():
+    """메모리 압박 시 자동 캐시 정리"""
+    global _MEM_CLEANUP_INTERVAL
+    now = time.time()
+    if now - _MEM_CLEANUP_INTERVAL < 30:  # 30초 내 중복 정리 방지
+        return
+    _MEM_CLEANUP_INTERVAL = now
+    # stale 비디오 세션 정리
+    _cleanup_stale_sessions()
+    # compare 결과 정리 (실행 중이 아닌 경우)
+    if not _compare_state.get("running"):
+        _compare_state["results"] = []
+    # embedding 이미지 정리
+    if not _embedding_state.get("running"):
+        _embedding_state["image"] = None
+    # 글로벌 팔레트 캐시 축소
+    global _palette_cache
+    _palette_cache = _palette_cache[:20] if len(_palette_cache) > 20 else _palette_cache
+    import gc
+    gc.collect()
+    print("[Memory] Auto cleanup triggered")
 
 
 # ── Benchmark API (async) ──────────────────────────────
@@ -977,6 +1103,27 @@ _compare_state = {"running": False, "progress": 0, "total": 0, "msg": "", "resul
 _error_analysis_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": {}}
 _conf_opt_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": []}
 _embedding_state = {"running": False, "msg": "", "image": None}
+
+# 모든 비동기 작업 상태 레지스트리 — 강제 중지용
+_all_states = {
+    "eval": _eval_state, "bench": _bench_state, "compare": _compare_state,
+    "error_analysis": _error_analysis_state, "conf_opt": _conf_opt_state,
+    "embedding": _embedding_state,
+}
+
+@app.post("/api/force-stop/{task_id}")
+async def force_stop(task_id: str):
+    """비동기 작업 강제 중지 — running 플래그를 False로 리셋"""
+    if task_id == "all":
+        for s in _all_states.values():
+            s["running"] = False
+        return {"ok": True, "msg": "All tasks stopped"}
+    state = _all_states.get(task_id)
+    if not state:
+        return {"error": f"Unknown task: {task_id}"}
+    state["running"] = False
+    state["msg"] = "Stopped by user"
+    return {"ok": True}
 
 
 @app.post("/api/benchmark/run")
@@ -1029,10 +1176,12 @@ async def run_benchmark(req: BenchmarkRequest):
             run_benchmark_core(configs, on_progress, on_result, on_error, lambda: False)
         except Exception as e:
             _bench_state["msg"] = f"Error: {e}"
-        _bench_state["running"] = False
-        _bench_state["msg"] = "Complete"
+        finally:
+            _bench_state["running"] = False
+            if _bench_state["msg"] != "Error":
+                _bench_state["msg"] = "Complete"
 
-    threading.Thread(target=_run, daemon=True).start()
+    _executor.submit(_run)
     return {"ok": True, "msg": "Benchmark started"}
 
 
@@ -1048,6 +1197,8 @@ async def benchmark_status():
 
 
 def _get_gpu_info():
+    if not _check_gpu_available():
+        return {"gpu_name": "N/A", "gpu_driver": "N/A", "gpu_memory_gb": 0, "pci_bus": "N/A"}
     try:
         import subprocess, sys as _sys
         flags = 0x08000000 if _sys.platform == "win32" else 0
@@ -1065,49 +1216,78 @@ def _get_gpu_info():
 
 @app.get("/api/benchmark/export-csv")
 async def benchmark_export_csv():
-    """벤치마크 결과를 CSV로 다운로드 (시스템 정보 포함)"""
+    """벤치마크 결과를 CSV로 다운로드 (시스템 정보 포함, 정리된 포맷)"""
     import io, csv, psutil
     if not _bench_state["results"]:
         return {"error": "No results"}
     buf = io.StringIO()
+    # BOM for Excel 한글 호환
+    buf.write('\ufeff')
     w = csv.writer(buf)
-    # System info header
+    # ── System Info ──
     gpu = _get_gpu_info()
     ort_ver = "N/A"
     try:
         import onnxruntime; ort_ver = onnxruntime.__version__
     except ImportError:
         pass
-    w.writerow(["OS", f"{platform.system()} {platform.release()} {platform.version()}"])
+    w.writerow(["=== System Information ==="])
+    w.writerow(["OS", f"{platform.system()} {platform.release()}"])
     w.writerow(["CPU", platform.processor()])
-    w.writerow(["RAM Total (GB)", round(psutil.virtual_memory().total / (1024**3), 1)])
+    w.writerow(["RAM (GB)", round(psutil.virtual_memory().total / (1024**3), 1)])
     w.writerow(["GPU", gpu["gpu_name"]])
     w.writerow(["Python", platform.python_version()])
     w.writerow(["ONNX Runtime", ort_ver])
     w.writerow([])
-    # Benchmark results
-    keys = list(_bench_state["results"][0].keys())
-    dw = csv.DictWriter(buf, fieldnames=keys)
-    dw.writeheader()
-    dw.writerows(_bench_state["results"])
+    # ── Benchmark Results ──
+    w.writerow(["=== Benchmark Results ==="])
+    # 정리된 헤더
+    header = ["Model", "Provider", "FPS", "Avg (ms)", "Pre (ms)", "Infer (ms)", "Post (ms)",
+              "Min (ms)", "Max (ms)", "Std (ms)", "P50 (ms)", "P95 (ms)", "P99 (ms)",
+              "CPU (%)", "RAM (MB)", "GPU (%)", "VRAM Used (MB)", "VRAM Total (MB)"]
+    field_keys = ["name", "provider", "fps", "avg", "pre_ms", "infer_ms", "post_ms",
+                  "min", "max", "std", "p50", "p95", "p99",
+                  "cpu_pct", "ram_mb", "gpu_pct", "gpu_mem_used", "gpu_mem_total"]
+    w.writerow(header)
+    for r in _bench_state["results"]:
+        if "error" in r:
+            w.writerow([r.get("error", "Error")])
+        else:
+            w.writerow([r.get(k, "") for k in field_keys])
     from fastapi.responses import Response
-    return Response(content=buf.getvalue(), media_type="text/csv",
+    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8-sig",
                     headers={"Content-Disposition": "attachment; filename=benchmark_results.csv"})
 
 
 @app.get("/api/evaluation/export-csv")
 async def evaluation_export_csv():
-    """평가 결과를 CSV로 다운로드"""
+    """평가 결과를 CSV로 다운로드 (정리된 포맷)"""
     import io, csv
     if not _eval_state["results"]:
         return {"error": "No results"}
     buf = io.StringIO()
-    keys = list(_eval_state["results"][0].keys())
-    w = csv.DictWriter(buf, fieldnames=keys)
-    w.writeheader()
-    w.writerows(_eval_state["results"])
+    buf.write('\ufeff')  # BOM for Excel 한글 호환
+    w = csv.writer(buf)
+    # ── Summary ──
+    w.writerow(["=== Evaluation Summary ==="])
+    w.writerow(["Model", "mAP@50 (%)", "mAP@50:95 (%)", "Precision (%)", "Recall (%)", "F1 (%)"])
+    for r in _eval_state["results"]:
+        w.writerow([r.get("name",""), r.get("map50",""), r.get("map5095",""),
+                     r.get("precision",""), r.get("recall",""), r.get("f1","")])
+    w.writerow([])
+    # ── Per-class Detail ──
+    for r in _eval_state["results"]:
+        detail = r.get("detail", {})
+        if not detail:
+            continue
+        w.writerow([f"=== {r.get('name','')} — Per-Class Detail ==="])
+        w.writerow(["Class ID", "AP", "Precision", "Recall", "F1", "TP", "FP", "FN"])
+        for cid, v in sorted(detail.items(), key=lambda x: int(x[0])):
+            w.writerow([cid, v.get("ap",""), v.get("precision",""), v.get("recall",""),
+                         v.get("f1",""), v.get("tp",""), v.get("fp",""), v.get("fn","")])
+        w.writerow([])
     from fastapi.responses import Response
-    return Response(content=buf.getvalue(), media_type="text/csv",
+    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8-sig",
                     headers={"Content-Disposition": "attachment; filename=evaluation_results.csv"})
 
 
@@ -1130,15 +1310,18 @@ async def system_info():
     except ImportError:
         info["torch"] = "N/A"
         info["cuda"] = "N/A"
-    try:
-        import subprocess, sys as _sys
-        flags = 0x08000000 if _sys.platform == "win32" else 0
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"],
-            text=True, timeout=2, creationflags=flags,
-        )
-        info["gpu_name"] = out.strip()
-    except Exception:
+    if _check_gpu_available():
+        try:
+            import subprocess, sys as _sys
+            flags = 0x08000000 if _sys.platform == "win32" else 0
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"],
+                text=True, timeout=2, creationflags=flags,
+            )
+            info["gpu_name"] = out.strip()
+        except Exception:
+            info["gpu_name"] = "N/A"
+    else:
         info["gpu_name"] = "N/A"
     return info
 
@@ -1312,11 +1495,14 @@ def _parse_filters(s: str):
 
 
 # ── Helper: glob images ─────────────────────────────────
-def _glob_images(img_dir):
+def _glob_images(img_dir, recursive=False):
     import glob
     files = []
     for e in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
         files.extend(glob.glob(os.path.join(img_dir, e)))
+        if recursive:
+            files.extend(glob.glob(os.path.join(img_dir, "**", e), recursive=True))
+    files = list(dict.fromkeys(files))  # deduplicate preserving order
     files.sort()
     return files
 
@@ -1340,6 +1526,27 @@ def _draw_detections(frame, result, names):
     return vis
 
 
+# Segmentation color palette (20 colors)
+_SEG_PALETTE = [
+    (128,0,0),(0,128,0),(128,128,0),(0,0,128),(128,0,128),
+    (0,128,128),(128,128,128),(64,0,0),(192,0,0),(64,128,0),
+    (192,128,0),(64,0,128),(192,0,128),(64,128,128),(192,128,128),
+    (0,64,0),(128,64,0),(0,192,0),(128,192,0),(0,64,128),
+]
+
+def _overlay_segmentation(frame, mask, alpha=0.5):
+    """Segmentation mask를 프레임에 오버레이"""
+    h, w = frame.shape[:2]
+    mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    overlay = frame.copy()
+    for cid in np.unique(mask_resized):
+        if cid == 0:
+            continue
+        color = _SEG_PALETTE[cid % len(_SEG_PALETTE)]
+        overlay[mask_resized == cid] = color
+    return cv2.addWeighted(frame, 1 - alpha, overlay, alpha, 0)
+
+
 # ── 1. Model Compare API ───────────────────────────────
 class ModelCompareRequest(BaseModel):
     model_a: str
@@ -1355,6 +1562,14 @@ async def run_model_compare(req: ModelCompareRequest):
     if _compare_state["running"]:
         return {"error": "Already running"}
     _compare_state.update(running=True, progress=0, total=0, msg="Starting...", results=[], images=[])
+
+    # 이전 비교 임시 파일 정리
+    import tempfile, shutil
+    _cmp_dir = os.path.join(tempfile.gettempdir(), "ssook_compare")
+    if os.path.isdir(_cmp_dir):
+        shutil.rmtree(_cmp_dir, ignore_errors=True)
+    os.makedirs(_cmp_dir, exist_ok=True)
+    _compare_state["_tmp_dir"] = _cmp_dir
 
     def _run():
         from core.model_loader import load_model as _load
@@ -1372,35 +1587,71 @@ async def run_model_compare(req: ModelCompareRequest):
         _compare_state["total"] = len(imgs)
         names_a = mi_a.names or {}
         names_b = mi_b.names or {}
-        for i, fp in enumerate(imgs):
-            frame = cv2.imread(fp)
-            if frame is None:
+        try:
+            for i, fp in enumerate(imgs):
+                frame = cv2.imread(fp)
+                if frame is None:
+                    _compare_state["progress"] = i + 1
+                    continue
+                res_a = run_inference(mi_a, frame, req.conf)
+                res_b = run_inference(mi_b, frame, req.conf)
+                vis_a = _draw_detections(frame, res_a, names_a)
+                vis_b = _draw_detections(frame, res_b, names_b)
+                # 이미지를 임시 파일로 저장 (메모리 대신 디스크)
+                path_a = os.path.join(_cmp_dir, f"{i}_a.jpg")
+                path_b = os.path.join(_cmp_dir, f"{i}_b.jpg")
+                cv2.imwrite(path_a, vis_a, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                cv2.imwrite(path_b, vis_b, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                _compare_state["results"].append({
+                    "image_name": os.path.basename(fp),
+                    "_path_a": path_a,
+                    "_path_b": path_b,
+                    "count_a": len(res_a.boxes),
+                    "count_b": len(res_b.boxes),
+                    "ms_a": round(res_a.infer_ms, 2),
+                    "ms_b": round(res_b.infer_ms, 2),
+                })
                 _compare_state["progress"] = i + 1
-                continue
-            res_a = run_inference(mi_a, frame, req.conf)
-            res_b = run_inference(mi_b, frame, req.conf)
-            vis_a = _draw_detections(frame, res_a, names_a)
-            vis_b = _draw_detections(frame, res_b, names_b)
-            _compare_state["results"].append({
-                "image_name": os.path.basename(fp),
-                "img_a_b64": _encode_jpeg(vis_a),
-                "img_b_b64": _encode_jpeg(vis_b),
-                "count_a": len(res_a.boxes),
-                "count_b": len(res_b.boxes),
-                "ms_a": round(res_a.infer_ms, 2),
-                "ms_b": round(res_b.infer_ms, 2),
-            })
-            _compare_state["progress"] = i + 1
-            _compare_state["msg"] = f"{i+1}/{len(imgs)}"
-        _compare_state.update(running=False, msg="Complete")
+                _compare_state["msg"] = f"{i+1}/{len(imgs)}"
+            _compare_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _compare_state.update(running=False, msg=f"Error: {e}")
 
-    threading.Thread(target=_run, daemon=True).start()
+    _executor.submit(_run)
     return {"ok": True}
 
 
 @app.get("/api/analysis/model-compare/status")
 async def model_compare_status():
-    return dict(_compare_state)
+    """상태 반환 — 이미지는 개별 요청으로 로드"""
+    state = dict(_compare_state)
+    # 내부 경로 정보 제거, 메타데이터만 반환
+    clean_results = []
+    for r in state.get("results", []):
+        clean = {k: v for k, v in r.items() if not k.startswith("_")}
+        clean_results.append(clean)
+    state["results"] = clean_results
+    return state
+
+
+@app.get("/api/analysis/model-compare/image/{index}/{side}")
+async def model_compare_image(index: int, side: str):
+    """비교 이미지를 개별 로드 (side: 'a' or 'b')"""
+    results = _compare_state.get("results", [])
+    if index < 0 or index >= len(results):
+        return {"error": "Invalid index"}
+    r = results[index]
+    key = f"_path_{side}"
+    path = r.get(key)
+    if not path or not os.path.isfile(path):
+        # fallback: 이전 방식 호환 (base64가 있으면 반환)
+        b64_key = f"img_{side}_b64"
+        if b64_key in r:
+            return {"image": r[b64_key]}
+        return {"error": "Image not found"}
+    with open(path, "rb") as f:
+        img_data = f.read()
+    return {"image": base64.b64encode(img_data).decode()}
 
 
 # ── 2. Error Analysis (FP/FN) API ──────────────────────
@@ -1433,84 +1684,87 @@ async def run_error_analysis(req: ErrorAnalysisRequest):
             return
         _error_analysis_state["total"] = len(imgs)
 
-        def _cat_size(area):
-            if area < 32*32: return "small"
-            if area < 96*96: return "medium"
-            return "large"
+        try:
+            def _cat_size(area):
+                if area < 32*32: return "small"
+                if area < 96*96: return "medium"
+                return "large"
 
-        def _cat_pos(cy):
-            if cy < 0.33: return "top"
-            if cy < 0.67: return "center"
-            return "bottom"
+            def _cat_pos(cy):
+                if cy < 0.33: return "top"
+                if cy < 0.67: return "center"
+                return "bottom"
 
-        fp_stats = {"count": 0, "small": 0, "medium": 0, "large": 0, "top": 0, "center": 0, "bottom": 0}
-        fn_stats = {"count": 0, "small": 0, "medium": 0, "large": 0, "top": 0, "center": 0, "bottom": 0}
+            fp_stats = {"count": 0, "small": 0, "medium": 0, "large": 0, "top": 0, "center": 0, "bottom": 0}
+            fn_stats = {"count": 0, "small": 0, "medium": 0, "large": 0, "top": 0, "center": 0, "bottom": 0}
 
-        for i, fp in enumerate(imgs):
-            frame = cv2.imread(fp)
-            if frame is None:
-                _error_analysis_state["progress"] = i + 1
-                continue
-            h, w = frame.shape[:2]
-            res = run_inference(mi, frame, req.conf)
-            # Load GT
-            stem = os.path.splitext(os.path.basename(fp))[0]
-            txt = os.path.join(req.label_dir, stem + ".txt")
-            gt_boxes = []
-            if os.path.isfile(txt):
-                with open(txt) as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) >= 5:
-                            cx, cy, bw, bh = map(float, parts[1:5])
-                            x1 = (cx - bw/2) * w; y1 = (cy - bh/2) * h
-                            x2 = (cx + bw/2) * w; y2 = (cy + bh/2) * h
-                            gt_boxes.append([x1, y1, x2, y2, cy])
+            for i, fp in enumerate(imgs):
+                frame = cv2.imread(fp)
+                if frame is None:
+                    _error_analysis_state["progress"] = i + 1
+                    continue
+                h, w = frame.shape[:2]
+                res = run_inference(mi, frame, req.conf)
+                # Load GT
+                stem = os.path.splitext(os.path.basename(fp))[0]
+                txt = os.path.join(req.label_dir, stem + ".txt")
+                gt_boxes = []
+                if os.path.isfile(txt):
+                    with open(txt) as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) >= 5:
+                                cx, cy, bw, bh = map(float, parts[1:5])
+                                x1 = (cx - bw/2) * w; y1 = (cy - bh/2) * h
+                                x2 = (cx + bw/2) * w; y2 = (cy + bh/2) * h
+                                gt_boxes.append([x1, y1, x2, y2, cy])
 
-            pred_boxes = list(zip(res.boxes, res.scores, res.class_ids))
-            gt_matched = [False] * len(gt_boxes)
-            pred_matched = [False] * len(pred_boxes)
+                pred_boxes = list(zip(res.boxes, res.scores, res.class_ids))
+                gt_matched = [False] * len(gt_boxes)
+                pred_matched = [False] * len(pred_boxes)
 
-            for pi, (pbox, _, _) in enumerate(pred_boxes):
-                best_iou, best_gi = 0, -1
+                for pi, (pbox, _, _) in enumerate(pred_boxes):
+                    best_iou, best_gi = 0, -1
+                    for gi, gb in enumerate(gt_boxes):
+                        if gt_matched[gi]:
+                            continue
+                        ix1 = max(pbox[0], gb[0]); iy1 = max(pbox[1], gb[1])
+                        ix2 = min(pbox[2], gb[2]); iy2 = min(pbox[3], gb[3])
+                        inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+                        a1 = (pbox[2]-pbox[0]) * (pbox[3]-pbox[1])
+                        a2 = (gb[2]-gb[0]) * (gb[3]-gb[1])
+                        iou = inter / (a1 + a2 - inter + 1e-9)
+                        if iou > best_iou:
+                            best_iou, best_gi = iou, gi
+                    if best_iou >= req.iou_threshold and best_gi >= 0:
+                        gt_matched[best_gi] = True
+                        pred_matched[pi] = True
+
+                # FP: unmatched predictions
+                for pi, (pbox, _, _) in enumerate(pred_boxes):
+                    if not pred_matched[pi]:
+                        area = (pbox[2]-pbox[0]) * (pbox[3]-pbox[1])
+                        cy = ((pbox[1]+pbox[3])/2) / h
+                        fp_stats["count"] += 1
+                        fp_stats[_cat_size(area)] += 1
+                        fp_stats[_cat_pos(cy)] += 1
+                # FN: unmatched GT
                 for gi, gb in enumerate(gt_boxes):
-                    if gt_matched[gi]:
-                        continue
-                    ix1 = max(pbox[0], gb[0]); iy1 = max(pbox[1], gb[1])
-                    ix2 = min(pbox[2], gb[2]); iy2 = min(pbox[3], gb[3])
-                    inter = max(0, ix2-ix1) * max(0, iy2-iy1)
-                    a1 = (pbox[2]-pbox[0]) * (pbox[3]-pbox[1])
-                    a2 = (gb[2]-gb[0]) * (gb[3]-gb[1])
-                    iou = inter / (a1 + a2 - inter + 1e-9)
-                    if iou > best_iou:
-                        best_iou, best_gi = iou, gi
-                if best_iou >= req.iou_threshold and best_gi >= 0:
-                    gt_matched[best_gi] = True
-                    pred_matched[pi] = True
+                    if not gt_matched[gi]:
+                        area = (gb[2]-gb[0]) * (gb[3]-gb[1])
+                        fn_stats["count"] += 1
+                        fn_stats[_cat_size(area)] += 1
+                        fn_stats[_cat_pos(gb[4])] += 1  # gb[4] is normalized cy
 
-            # FP: unmatched predictions
-            for pi, (pbox, _, _) in enumerate(pred_boxes):
-                if not pred_matched[pi]:
-                    area = (pbox[2]-pbox[0]) * (pbox[3]-pbox[1])
-                    cy = ((pbox[1]+pbox[3])/2) / h
-                    fp_stats["count"] += 1
-                    fp_stats[_cat_size(area)] += 1
-                    fp_stats[_cat_pos(cy)] += 1
-            # FN: unmatched GT
-            for gi, gb in enumerate(gt_boxes):
-                if not gt_matched[gi]:
-                    area = (gb[2]-gb[0]) * (gb[3]-gb[1])
-                    fn_stats["count"] += 1
-                    fn_stats[_cat_size(area)] += 1
-                    fn_stats[_cat_pos(gb[4])] += 1  # gb[4] is normalized cy
+                _error_analysis_state["progress"] = i + 1
+                _error_analysis_state["msg"] = f"{i+1}/{len(imgs)}"
 
-            _error_analysis_state["progress"] = i + 1
-            _error_analysis_state["msg"] = f"{i+1}/{len(imgs)}"
+            _error_analysis_state["results"] = {"fp": fp_stats, "fn": fn_stats}
+            _error_analysis_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _error_analysis_state.update(running=False, msg=f"Error: {e}")
 
-        _error_analysis_state["results"] = {"fp": fp_stats, "fn": fn_stats}
-        _error_analysis_state.update(running=False, msg="Complete")
-
-    threading.Thread(target=_run, daemon=True).start()
+    _executor.submit(_run)
     return {"ok": True}
 
 
@@ -1548,86 +1802,92 @@ async def run_conf_optimizer(req: ConfOptimizerRequest):
             return
         names = mi.names or {}
 
-        # Collect all detections at low conf and all GT
-        all_preds = []  # (class_id, score, x1, y1, x2, y2, img_idx)
-        all_gt = []     # (class_id, x1, y1, x2, y2, img_idx)
-        _conf_opt_state["total"] = len(imgs)
-        _conf_opt_state["msg"] = "Running inference..."
+        try:
+            # Collect all detections at low conf and all GT
+            all_preds = []  # (class_id, score, x1, y1, x2, y2, img_idx)
+            all_gt = []     # (class_id, x1, y1, x2, y2, img_idx)
+            _conf_opt_state["total"] = len(imgs)
+            _conf_opt_state["msg"] = "Running inference..."
 
-        for idx, fp in enumerate(imgs):
-            frame = cv2.imread(fp)
-            if frame is None:
+            for idx, fp in enumerate(imgs):
+                frame = cv2.imread(fp)
+                if frame is None:
+                    _conf_opt_state["progress"] = idx + 1
+                    continue
+                h, w = frame.shape[:2]
+                res = run_inference(mi, frame, 0.01)
+                for box, score, cid in zip(res.boxes, res.scores, res.class_ids):
+                    all_preds.append((int(cid), float(score), *box, idx))
+                # Load GT
+                stem = os.path.splitext(os.path.basename(fp))[0]
+                txt = os.path.join(req.label_dir, stem + ".txt")
+                if os.path.isfile(txt):
+                    with open(txt) as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) >= 5:
+                                cid = int(parts[0])
+                                cx, cy, bw, bh = map(float, parts[1:5])
+                                x1 = (cx - bw/2) * w; y1 = (cy - bh/2) * h
+                                x2 = (cx + bw/2) * w; y2 = (cy + bh/2) * h
+                                all_gt.append((cid, x1, y1, x2, y2, idx))
                 _conf_opt_state["progress"] = idx + 1
-                continue
-            h, w = frame.shape[:2]
-            res = run_inference(mi, frame, 0.01)
-            for box, score, cid in zip(res.boxes, res.scores, res.class_ids):
-                all_preds.append((int(cid), float(score), *box, idx))
-            # Load GT
-            stem = os.path.splitext(os.path.basename(fp))[0]
-            txt = os.path.join(req.label_dir, stem + ".txt")
-            if os.path.isfile(txt):
-                with open(txt) as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) >= 5:
-                            cid = int(parts[0])
-                            cx, cy, bw, bh = map(float, parts[1:5])
-                            x1 = (cx - bw/2) * w; y1 = (cy - bh/2) * h
-                            x2 = (cx + bw/2) * w; y2 = (cy + bh/2) * h
-                            all_gt.append((cid, x1, y1, x2, y2, idx))
-            _conf_opt_state["progress"] = idx + 1
 
-        # Group by class
-        class_ids = set(g[0] for g in all_gt)
-        thresholds = np.arange(0.05, 0.951, req.step)
-        _conf_opt_state["msg"] = "Sweeping thresholds..."
-        results = []
+            # Group by class
+            class_ids = set(g[0] for g in all_gt)
+            thresholds = np.arange(0.05, 0.951, req.step)
+            _conf_opt_state["msg"] = "Sweeping thresholds..."
+            results = []
 
-        for cid in sorted(class_ids):
-            gt_cls = [(g[1], g[2], g[3], g[4], g[5]) for g in all_gt if g[0] == cid]
-            pred_cls = [(p[1], p[2], p[3], p[4], p[5], p[6]) for p in all_preds if p[0] == cid]
-            best_f1, best_t, best_p, best_r = 0, 0.25, 0, 0
+            for cid in sorted(class_ids):
+                gt_cls = [(g[1], g[2], g[3], g[4], g[5]) for g in all_gt if g[0] == cid]
+                pred_cls = [(p[1], p[2], p[3], p[4], p[5], p[6]) for p in all_preds if p[0] == cid]
+                best_f1, best_t, best_p, best_r = 0, 0.25, 0, 0
 
-            for t in thresholds:
-                filtered = [p for p in pred_cls if p[0] >= t]
-                tp = 0
-                gt_matched = set()
-                for p in sorted(filtered, key=lambda x: -x[0]):
-                    best_iou, best_gi = 0, -1
-                    for gi, g in enumerate(gt_cls):
-                        if gi in gt_matched or g[4] != p[5]:
-                            continue
-                        ix1 = max(p[1], g[0]); iy1 = max(p[2], g[1])
-                        ix2 = min(p[3], g[2]); iy2 = min(p[4], g[3])
-                        inter = max(0, ix2-ix1) * max(0, iy2-iy1)
-                        a1 = (p[3]-p[1]) * (p[4]-p[2])
-                        a2 = (g[2]-g[0]) * (g[3]-g[1])
-                        iou = inter / (a1 + a2 - inter + 1e-9)
-                        if iou > best_iou:
-                            best_iou, best_gi = iou, gi
-                    if best_iou >= 0.5 and best_gi >= 0:
-                        tp += 1
-                        gt_matched.add(best_gi)
-                prec = tp / len(filtered) if filtered else 0
-                rec = tp / len(gt_cls) if gt_cls else 0
-                f1 = 2 * prec * rec / (prec + rec + 1e-9)
-                if f1 > best_f1:
-                    best_f1, best_t, best_p, best_r = f1, float(t), prec, rec
+                pr_curve = []  # store (threshold, precision, recall, f1) for PR curve
+                for t in thresholds:
+                    filtered = [p for p in pred_cls if p[0] >= t]
+                    tp = 0
+                    gt_matched = set()
+                    for p in sorted(filtered, key=lambda x: -x[0]):
+                        best_iou, best_gi = 0, -1
+                        for gi, g in enumerate(gt_cls):
+                            if gi in gt_matched or g[4] != p[5]:
+                                continue
+                            ix1 = max(p[1], g[0]); iy1 = max(p[2], g[1])
+                            ix2 = min(p[3], g[2]); iy2 = min(p[4], g[3])
+                            inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+                            a1 = (p[3]-p[1]) * (p[4]-p[2])
+                            a2 = (g[2]-g[0]) * (g[3]-g[1])
+                            iou = inter / (a1 + a2 - inter + 1e-9)
+                            if iou > best_iou:
+                                best_iou, best_gi = iou, gi
+                        if best_iou >= 0.5 and best_gi >= 0:
+                            tp += 1
+                            gt_matched.add(best_gi)
+                    prec = tp / len(filtered) if filtered else 0
+                    rec = tp / len(gt_cls) if gt_cls else 0
+                    f1 = 2 * prec * rec / (prec + rec + 1e-9)
+                    if f1 > best_f1:
+                        best_f1, best_t, best_p, best_r = f1, float(t), prec, rec
+                    pr_curve.append({"t": round(float(t), 3), "p": round(prec, 4), "r": round(rec, 4), "f1": round(f1, 4)})
 
-            results.append({
-                "class_id": cid,
-                "class_name": names.get(cid, str(cid)),
-                "best_threshold": round(best_t, 3),
-                "best_f1": round(best_f1, 4),
-                "precision": round(best_p, 4),
-                "recall": round(best_r, 4),
-            })
+                results.append({
+                    "class_id": cid,
+                    "class_name": names.get(cid, str(cid)),
+                    "best_threshold": round(best_t, 3),
+                    "best_f1": round(best_f1, 4),
+                    "precision": round(best_p, 4),
+                    "recall": round(best_r, 4),
+                    "pr_curve": pr_curve,
+                })
 
-        _conf_opt_state["results"] = results
-        _conf_opt_state.update(running=False, msg="Complete")
+            _conf_opt_state["results"] = results
+            _conf_opt_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _conf_opt_state.update(running=False, msg=f"Error: {e}")
 
-    threading.Thread(target=_run, daemon=True).start()
+    _executor.submit(_run)
     return {"ok": True}
 
 
@@ -1733,16 +1993,437 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
         fig.savefig(buf, format='png', dpi=120)
         plt.close(fig)
         buf.seek(0)
-        _embedding_state["image"] = base64.b64encode(buf.read()).decode()
+        # 임시 파일로 저장 (메모리 대신 디스크)
+        import tempfile
+        tmp_path = os.path.join(tempfile.gettempdir(), "ssook_embedding.png")
+        with open(tmp_path, "wb") as f:
+            f.write(buf.read())
+        _embedding_state["_image_path"] = tmp_path
+        _embedding_state["image"] = None  # 메모리에서 제거
         _embedding_state.update(running=False, msg="Complete")
 
-    threading.Thread(target=_run, daemon=True).start()
+    _executor.submit(_run)
     return {"ok": True}
 
 
 @app.get("/api/analysis/embedding-viewer/status")
 async def embedding_viewer_status():
-    return dict(_embedding_state)
+    state = dict(_embedding_state)
+    # 이미지가 임시 파일에 있으면 로드하여 반환
+    img_path = state.pop("_image_path", None)
+    if img_path and os.path.isfile(img_path) and state.get("image") is None:
+        with open(img_path, "rb") as f:
+            state["image"] = base64.b64encode(f.read()).decode()
+    return state
+
+
+    if img_path and os.path.isfile(img_path) and state.get("image") is None:
+        with open(img_path, "rb") as f:
+            state["image"] = base64.b64encode(f.read()).decode()
+    return state
+
+
+# ── CLIP Zero-Shot API ─────────────────────────────────
+class CLIPRequest(BaseModel):
+    image_encoder: str
+    text_encoder: str
+    img_dir: str
+    labels: str  # comma-separated
+
+_clip_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": []}
+_all_states["clip"] = _clip_state
+
+@app.post("/api/clip/run")
+async def run_clip(req: CLIPRequest):
+    if _clip_state["running"]:
+        return {"error": "Already running"}
+    _clip_state.update(running=True, progress=0, total=0, msg="Starting...", results=[])
+
+    def _run():
+        try:
+            from core.clip_inference import CLIPModel, simple_tokenize
+            model = CLIPModel(req.image_encoder, req.text_encoder)
+            labels = [l.strip() for l in req.labels.split(",") if l.strip()]
+            if not labels:
+                _clip_state.update(running=False, msg="No labels provided")
+                return
+            # Pre-encode text
+            text_embs = []
+            for label in labels:
+                tokens = simple_tokenize(label)
+                text_embs.append(model.encode_text(tokens))
+            imgs = _glob_images(req.img_dir)
+            if not imgs:
+                _clip_state.update(running=False, msg="No images found")
+                return
+            _clip_state["total"] = len(imgs)
+            _clip_state["msg"] = "Running CLIP inference..."
+            # Per-label correct count
+            label_correct = {l: 0 for l in labels}
+            label_total = {l: 0 for l in labels}
+            detail_log = []  # per-image detail
+            for idx, fp in enumerate(imgs):
+                frame = cv2.imread(fp)
+                if frame is None:
+                    _clip_state["progress"] = idx + 1
+                    continue
+                ranked = model.zero_shot_classify(frame, text_embs, labels)
+                # 폴더명 = GT label
+                parent = os.path.basename(os.path.dirname(fp)).lower()
+                top_label = ranked[0][0].lower() if ranked else ""
+                correct = False
+                for l in labels:
+                    if parent == l.lower():
+                        label_total[l] += 1
+                        if top_label == l.lower():
+                            label_correct[l] += 1
+                            correct = True
+                detail_log.append({
+                    "file": os.path.basename(fp),
+                    "gt": parent,
+                    "pred": ranked[0][0] if ranked else "—",
+                    "score": round(ranked[0][1], 4) if ranked else 0,
+                    "correct": correct,
+                    "top3": [(r[0], round(r[1], 4)) for r in ranked[:3]],
+                })
+                _clip_state["progress"] = idx + 1
+            # Results
+            results = []
+            total_correct = 0
+            total_count = 0
+            for l in labels:
+                tc = label_total[l]
+                cc = label_correct[l]
+                total_correct += cc
+                total_count += tc
+                acc = round(cc / tc * 100, 2) if tc > 0 else 0
+                results.append({"label": l, "total": tc, "correct": cc, "accuracy": acc})
+            overall_acc = round(total_correct / total_count * 100, 2) if total_count > 0 else 0
+            results.append({"label": "Overall", "total": total_count, "correct": total_correct, "accuracy": overall_acc})
+            _clip_state["results"] = results
+            _clip_state["detail"] = detail_log[:500]  # 최대 500개
+            _clip_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _clip_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/clip/status")
+async def clip_status():
+    return dict(_clip_state)
+
+
+# ── Embedder Evaluation API ────────────────────────────
+class EmbedderRequest(BaseModel):
+    model_path: str
+    model_type: str = "yolo"
+    img_dir: str
+    top_k: int = 5
+
+_embedder_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": [], "detail": []}
+_all_states["embedder"] = _embedder_state
+
+@app.post("/api/embedder/run")
+async def run_embedder(req: EmbedderRequest):
+    if _embedder_state["running"]:
+        return {"error": "Already running"}
+    _embedder_state.update(running=True, progress=0, total=0, msg="Starting...", results=[], detail=[])
+
+    def _run():
+        try:
+            from core.model_loader import load_model as _load
+            mi = _load(req.model_path, model_type=req.model_type)
+            # 폴더 구조: img_dir/class_name/image.jpg (없으면 단일 클래스로 처리)
+            class_dirs = [d for d in os.listdir(req.img_dir)
+                          if os.path.isdir(os.path.join(req.img_dir, d))]
+            # Collect embeddings per class
+            class_embeddings = {}  # class_name -> list of embeddings
+            all_files = []
+            if class_dirs:
+                for cls in sorted(class_dirs):
+                    cls_path = os.path.join(req.img_dir, cls)
+                    files = _glob_images(cls_path)
+                    for f in files:
+                        all_files.append((cls, f))
+            else:
+                # 폴더 구조 없음 — 루트의 이미지를 단일 클래스로
+                files = _glob_images(req.img_dir)
+                for f in files:
+                    all_files.append(("default", f))
+            if not all_files:
+                _embedder_state.update(running=False, msg="No images found")
+                return
+            _embedder_state["total"] = len(all_files)
+            _embedder_state["msg"] = "Extracting embeddings..."
+            embeddings = []  # (class_name, embedding)
+            for idx, (cls, fp) in enumerate(all_files):
+                frame = cv2.imread(fp)
+                if frame is None:
+                    _embedder_state["progress"] = idx + 1
+                    continue
+                # Use model to get embedding (last layer output, flattened)
+                from core.inference import preprocess, _padded_to_tensor, letterbox
+                padded, ratio, pad = letterbox(frame, mi.input_size)
+                tensor = _padded_to_tensor(padded, mi.input_size)
+                import numpy as np
+                if mi.batch_size > 1:
+                    tensor = np.repeat(tensor, mi.batch_size, axis=0)
+                out = mi.session.run(None, {mi.input_name: tensor})
+                emb = out[0][0].flatten().astype(np.float32)
+                emb = emb / (np.linalg.norm(emb) + 1e-9)
+                embeddings.append((cls, emb))
+                if cls not in class_embeddings:
+                    class_embeddings[cls] = []
+                class_embeddings[cls].append(emb)
+                _embedder_state["progress"] = idx + 1
+            # Compute retrieval metrics
+            import numpy as np
+            _embedder_state["msg"] = "Computing metrics..."
+            results = []
+            detail_log = []
+            all_embs_arr = np.array([e for _, e in embeddings])
+            all_labels = [c for c, _ in embeddings]
+            all_fnames = [os.path.basename(fp) for _, fp in all_files[:len(embeddings)]]
+            for cls in sorted(class_embeddings.keys()):
+                cls_embs = class_embeddings[cls]
+                n = len(cls_embs)
+                if n < 2:
+                    results.append({"class": cls, "retrieval_1": 0, "retrieval_k": 0, "avg_cosine": 0})
+                    continue
+                r1_correct = 0
+                rk_correct = 0
+                cosines = []
+                for i, emb in enumerate(cls_embs):
+                    sims = np.dot(all_embs_arr, emb)
+                    self_indices = [j for j, (c, e) in enumerate(embeddings) if c == cls and np.array_equal(e, emb)]
+                    for si in self_indices:
+                        sims[si] = -1
+                    top_indices = np.argsort(sims)[::-1][:req.top_k]
+                    top_labels = [all_labels[j] for j in top_indices]
+                    hit = top_labels[0] == cls
+                    if hit:
+                        r1_correct += 1
+                    if cls in top_labels:
+                        rk_correct += 1
+                    same_sims = [sims[j] for j, (c, _) in enumerate(embeddings) if c == cls and j not in self_indices]
+                    if same_sims:
+                        cosines.append(np.mean(same_sims))
+                    # Per-image detail (limit 200)
+                    if len(detail_log) < 200:
+                        query_idx = self_indices[0] if self_indices else -1
+                        detail_log.append({
+                            "file": all_fnames[query_idx] if query_idx >= 0 else "?",
+                            "gt": cls,
+                            "top1": top_labels[0],
+                            "top1_file": all_fnames[top_indices[0]] if top_indices[0] < len(all_fnames) else "?",
+                            "top1_sim": round(float(sims[top_indices[0]]), 4),
+                            "correct": hit,
+                            "top_k": [(all_labels[j], round(float(sims[j]), 4)) for j in top_indices[:3]],
+                        })
+                results.append({
+                    "class": cls,
+                    "retrieval_1": round(r1_correct / n * 100, 2),
+                    "retrieval_k": round(rk_correct / n * 100, 2),
+                    "avg_cosine": round(float(np.mean(cosines)) if cosines else 0, 4),
+                })
+            # Overall
+            if results:
+                avg_r1 = round(np.mean([r["retrieval_1"] for r in results]), 2)
+                avg_rk = round(np.mean([r["retrieval_k"] for r in results]), 2)
+                avg_cos = round(float(np.mean([r["avg_cosine"] for r in results])), 4)
+                results.append({"class": "Overall", "retrieval_1": avg_r1, "retrieval_k": avg_rk, "avg_cosine": avg_cos})
+            _embedder_state["results"] = results
+            _embedder_state["detail"] = detail_log
+            _embedder_state.update(running=False, msg="Complete")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            _embedder_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/embedder/status")
+async def embedder_status():
+    return dict(_embedder_state)
+
+@app.post("/api/embedder/compare")
+async def embedder_compare(req: dict):
+    """Compare embeddings of multiple selected images using the loaded embedder model."""
+    model_path = req.get("model_path", "")
+    img_paths = req.get("img_paths", [])
+    if not model_path or len(img_paths) < 2:
+        return {"error": "Need model and at least 2 images"}
+    try:
+        import onnxruntime as ort
+        session = ort.InferenceSession(model_path)
+        inp = session.get_inputs()[0]
+        h = int(inp.shape[2]) if isinstance(inp.shape[2], int) else 224
+        w = int(inp.shape[3]) if isinstance(inp.shape[3], int) else 224
+        embeddings = []
+        names = []
+        for fp in img_paths:
+            img = cv2.imread(fp)
+            if img is None:
+                continue
+            img = cv2.resize(img, (w, h))
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            tensor = np.ascontiguousarray(rgb.transpose(2, 0, 1)[np.newaxis], dtype=np.float32) / 255.0
+            out = session.run(None, {inp.name: tensor})
+            emb = out[0].flatten().astype(np.float32)
+            emb = emb / (np.linalg.norm(emb) + 1e-9)
+            embeddings.append(emb)
+            names.append(os.path.basename(fp))
+        if len(embeddings) < 2:
+            return {"error": "Could not read enough images"}
+        # Compute pairwise cosine similarity matrix
+        matrix = []
+        for i in range(len(embeddings)):
+            row = []
+            for j in range(len(embeddings)):
+                sim = float(np.dot(embeddings[i], embeddings[j]))
+                row.append(round(sim, 4))
+            matrix.append(row)
+        return {"names": names, "matrix": matrix}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Segmentation Evaluation API ─────────────────────────
+class SegmentationRequest(BaseModel):
+    model_path: str
+    img_dir: str
+    label_dir: str = ""
+
+_seg_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": [], "detail": []}
+_all_states["seg"] = _seg_state
+
+@app.post("/api/segmentation/run")
+async def run_segmentation_eval(req: SegmentationRequest):
+    if _seg_state["running"]:
+        return {"error": "Already running"}
+    _seg_state.update(running=True, progress=0, total=0, msg="Starting...", results=[], detail=[])
+
+    def _run():
+        try:
+            from core.model_loader import load_model as _load
+            mi = _load(req.model_path, model_type="yolo")
+            imgs = _glob_images(req.img_dir)
+            if not imgs:
+                _seg_state.update(running=False, msg="No images found")
+                return
+            _seg_state["total"] = len(imgs)
+            _seg_state["msg"] = "Running segmentation..."
+
+            # Per-class IoU/Dice accumulation
+            class_iou_sum = {}
+            class_dice_sum = {}
+            class_count = {}
+            detail_log = []
+
+            for idx, fp in enumerate(imgs):
+                frame = cv2.imread(fp)
+                if frame is None:
+                    _seg_state["progress"] = idx + 1
+                    continue
+                h, w = frame.shape[:2]
+
+                # Run inference
+                from core.inference import letterbox, _padded_to_tensor
+                padded, ratio, pad = letterbox(frame, mi.input_size)
+                tensor = _padded_to_tensor(padded, mi.input_size)
+                if mi.batch_size > 1:
+                    tensor = np.repeat(tensor, mi.batch_size, axis=0)
+                outputs = mi.session.run(None, {mi.input_name: tensor})
+
+                # 세그멘테이션 출력: (1, C, H, W) 또는 (1, H, W)
+                seg_out = outputs[0][0] if len(outputs[0].shape) == 4 else outputs[0]
+                if len(seg_out.shape) == 3:
+                    pred_mask = np.argmax(seg_out, axis=0)  # (H, W)
+                else:
+                    pred_mask = (seg_out > 0.5).astype(np.int32)
+
+                # Resize pred to original size
+                pred_mask = cv2.resize(pred_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+
+                # Load GT mask (PNG with class IDs as pixel values)
+                stem = os.path.splitext(os.path.basename(fp))[0]
+                gt_path = None
+                for ext in ['.png', '.bmp', '.tif']:
+                    candidate = os.path.join(req.label_dir, stem + ext)
+                    if os.path.isfile(candidate):
+                        gt_path = candidate
+                        break
+                if gt_path is None:
+                    _seg_state["progress"] = idx + 1
+                    continue
+                gt_mask = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
+                if gt_mask is None:
+                    _seg_state["progress"] = idx + 1
+                    continue
+                gt_mask = cv2.resize(gt_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+
+                # Per-class IoU/Dice
+                all_classes = set(np.unique(gt_mask)) | set(np.unique(pred_mask))
+                all_classes.discard(0)  # background
+                for c in all_classes:
+                    pred_c = (pred_mask == c)
+                    gt_c = (gt_mask == c)
+                    inter = np.logical_and(pred_c, gt_c).sum()
+                    union = np.logical_or(pred_c, gt_c).sum()
+                    iou = inter / (union + 1e-9)
+                    dice = 2 * inter / (pred_c.sum() + gt_c.sum() + 1e-9)
+                    class_iou_sum[c] = class_iou_sum.get(c, 0) + iou
+                    class_dice_sum[c] = class_dice_sum.get(c, 0) + dice
+                    class_count[c] = class_count.get(c, 0) + 1
+
+                # Per-image detail
+                img_iou = []
+                for c in all_classes:
+                    pred_c = (pred_mask == c)
+                    gt_c = (gt_mask == c)
+                    inter = np.logical_and(pred_c, gt_c).sum()
+                    union = np.logical_or(pred_c, gt_c).sum()
+                    img_iou.append(round(float(inter / (union + 1e-9)), 4))
+                mean_iou = round(sum(img_iou) / len(img_iou), 4) if img_iou else 0
+                entry = {"file": os.path.basename(fp), "iou": mean_iou, "classes": len(all_classes)}
+                # Sample overlay for first 5 images
+                if len(detail_log) < 5:
+                    vis = _overlay_segmentation(frame, pred_mask)
+                    entry["overlay"] = _encode_jpeg(vis, 60)
+                detail_log.append(entry)
+
+                _seg_state["progress"] = idx + 1
+                _seg_state["msg"] = f"{idx+1}/{len(imgs)}"
+
+            # Build results
+            names = mi.names or {}
+            results = []
+            for c in sorted(class_count.keys()):
+                n = class_count[c]
+                results.append({
+                    "class_name": names.get(c, str(c)),
+                    "iou": round(class_iou_sum[c] / n, 4),
+                    "dice": round(class_dice_sum[c] / n, 4),
+                    "images": n,
+                })
+            if results:
+                miou = round(sum(r["iou"] for r in results) / len(results), 4)
+                mdice = round(sum(r["dice"] for r in results) / len(results), 4)
+                results.append({"class_name": "Overall (mean)", "iou": miou, "dice": mdice, "images": len(imgs)})
+            _seg_state["results"] = results
+            _seg_state["detail"] = detail_log[:200]
+            _seg_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _seg_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/segmentation/status")
+async def segmentation_status():
+    return dict(_seg_state)
 
 
 # ── 5. Inference Analysis API ──────────────────────────
@@ -1860,6 +2541,902 @@ async def system_full_info():
         "onnxruntime": ort_ver,
         **gpu,
     }
+
+
+# ── Data: Explorer API ──────────────────────────────────
+_explorer_state = {"running": False, "progress": 0, "total": 0, "msg": "", "data": None}
+_all_states["explorer"] = _explorer_state
+
+@app.post("/api/data/explorer")
+async def data_explorer(req: dict):
+    img_dir = req.get("img_dir", "")
+    lbl_dir = req.get("label_dir", "")
+    if not img_dir or not os.path.isdir(img_dir):
+        return {"error": "Invalid image directory"}
+    if _explorer_state["running"]:
+        return {"error": "Already loading"}
+    _explorer_state.update(running=True, progress=0, total=0, msg="Scanning...", data=None)
+
+    def _run():
+        try:
+            imgs = _glob_images(img_dir)
+            n = len(imgs)
+            _explorer_state["total"] = n
+            class_counts = {}
+            img_class_counts = {}  # class -> set of image indices (for image-unit counting)
+            file_info = []
+            box_sizes = []  # (w, h) normalized
+            aspect_ratios = []
+            for i, fp in enumerate(imgs[:5000]):
+                _explorer_state["progress"] = i + 1
+                stem = os.path.splitext(os.path.basename(fp))[0]
+                txt = os.path.join(lbl_dir, stem + ".txt") if lbl_dir else ""
+                boxes = []
+                box_details = []
+                if txt and os.path.isfile(txt):
+                    with open(txt) as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) >= 5:
+                                cid = int(parts[0])
+                                boxes.append(cid)
+                                class_counts[cid] = class_counts.get(cid, 0) + 1
+                                if cid not in img_class_counts:
+                                    img_class_counts[cid] = set()
+                                img_class_counts[cid].add(i)
+                                bw, bh = float(parts[3]), float(parts[4])
+                                box_sizes.append({"w": bw, "h": bh})
+                                box_details.append({"cid": cid, "cx": float(parts[1]), "cy": float(parts[2]), "w": bw, "h": bh})
+                # aspect ratio
+                try:
+                    im = cv2.imread(fp)
+                    if im is not None:
+                        h_, w_ = im.shape[:2]
+                        aspect_ratios.append(round(w_ / max(h_, 1), 2))
+                except:
+                    pass
+                file_info.append({"name": os.path.basename(fp), "path": fp, "boxes": len(boxes),
+                                  "classes": list(set(boxes)), "box_details": box_details})
+            img_class_count_dict = {k: len(v) for k, v in img_class_counts.items()}
+            _explorer_state["data"] = {
+                "total": n, "shown": len(file_info), "files": file_info,
+                "class_counts": class_counts, "img_class_counts": img_class_count_dict,
+                "box_sizes": box_sizes, "aspect_ratios": aspect_ratios
+            }
+            _explorer_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _explorer_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/data/explorer/status")
+async def explorer_status():
+    s = dict(_explorer_state)
+    if not s["running"] and s["data"]:
+        data = s["data"]
+        s.pop("data")
+        s.update(data)
+    elif s["running"]:
+        s.pop("data", None)
+    return s
+
+@app.post("/api/data/explorer/preview")
+async def explorer_preview(req: dict):
+    """Return base64 JPEG of image with bounding boxes overlaid."""
+    img_path = req.get("img_path", "")
+    lbl_dir = req.get("label_dir", "")
+    if not img_path or not os.path.isfile(img_path):
+        return {"error": "Image not found"}
+    img = cv2.imread(img_path)
+    if img is None:
+        return {"error": "Cannot read image"}
+    h, w = img.shape[:2]
+    stem = os.path.splitext(os.path.basename(img_path))[0]
+    txt = os.path.join(lbl_dir, stem + ".txt") if lbl_dir else ""
+    boxes = []
+    if txt and os.path.isfile(txt):
+        with open(txt) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    cid = int(parts[0])
+                    cx, cy, bw, bh = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                    x1 = int((cx - bw / 2) * w)
+                    y1 = int((cy - bh / 2) * h)
+                    x2 = int((cx + bw / 2) * w)
+                    y2 = int((cy + bh / 2) * h)
+                    boxes.append({"cid": cid, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    total_cls = max((b["cid"] for b in boxes), default=0) + 1
+    palette = _generate_palette(max(total_cls, 1))
+    for b in boxes:
+        color = palette[b["cid"] % len(palette)]
+        cv2.rectangle(img, (b["x1"], b["y1"]), (b["x2"], b["y2"]), color, 2)
+        label = str(b["cid"])
+        _draw_label(img, label, b["x1"], b["y1"], color, 0.6, 1, True)
+    return {"image": _encode_jpeg(img, 90), "width": w, "height": h, "box_count": len(boxes)}
+
+
+# ── Data: Splitter API ─────────────────────────────────
+class SplitterRequest(BaseModel):
+    img_dir: str
+    label_dir: str = ""
+    output_dir: str
+    train: float = 0.7
+    val: float = 0.2
+    test: float = 0.1
+    strategy: str = "random"  # random, stratified, similarity
+
+_splitter_state = {"running": False, "msg": "", "progress": 0, "total": 0, "results": {}}
+_all_states["splitter"] = _splitter_state
+
+@app.post("/api/data/splitter")
+async def data_splitter(req: SplitterRequest):
+    if _splitter_state["running"]:
+        return {"error": "Already running"}
+    _splitter_state.update(running=True, msg="Splitting...", progress=0, total=0, results={})
+
+    def _run():
+        try:
+            import random, shutil
+            imgs = _glob_images(req.img_dir)
+            if not imgs:
+                _splitter_state.update(running=False, msg="No images found")
+                return
+            n = len(imgs)
+            _splitter_state["total"] = n
+
+            # Normalize ratios — treat 0 as empty split
+            ratios = {"train": max(req.train, 0), "val": max(req.val, 0), "test": max(req.test, 0)}
+            total_ratio = sum(ratios.values())
+            if total_ratio <= 0:
+                _splitter_state.update(running=False, msg="Error: All ratios are 0")
+                return
+
+            if req.strategy == "stratified" and req.label_dir:
+                # Group images by class set
+                class_groups = {}
+                for fp in imgs:
+                    stem = os.path.splitext(os.path.basename(fp))[0]
+                    txt = os.path.join(req.label_dir, stem + ".txt")
+                    classes = set()
+                    if os.path.isfile(txt):
+                        with open(txt) as f:
+                            for line in f:
+                                parts = line.strip().split()
+                                if len(parts) >= 5:
+                                    classes.add(int(parts[0]))
+                    key = tuple(sorted(classes)) if classes else (-1,)
+                    class_groups.setdefault(key, []).append(fp)
+                splits = {"train": [], "val": [], "test": []}
+                for group_imgs in class_groups.values():
+                    random.shuffle(group_imgs)
+                    gn = len(group_imgs)
+                    n_train = int(gn * ratios["train"] / total_ratio)
+                    n_val = int(gn * ratios["val"] / total_ratio)
+                    splits["train"].extend(group_imgs[:n_train])
+                    splits["val"].extend(group_imgs[n_train:n_train + n_val])
+                    splits["test"].extend(group_imgs[n_train + n_val:])
+            else:
+                # Random split
+                random.shuffle(imgs)
+                n_train = int(n * ratios["train"] / total_ratio)
+                n_val = int(n * ratios["val"] / total_ratio)
+                splits = {"train": imgs[:n_train], "val": imgs[n_train:n_train + n_val], "test": imgs[n_train + n_val:]}
+
+            # Copy files with progress
+            total_files = sum(len(v) for v in splits.values())
+            _splitter_state["total"] = total_files
+            done = 0
+            for split_name, split_files in splits.items():
+                if not split_files:
+                    continue
+                img_out = os.path.join(req.output_dir, split_name, "images")
+                lbl_out = os.path.join(req.output_dir, split_name, "labels")
+                os.makedirs(img_out, exist_ok=True)
+                os.makedirs(lbl_out, exist_ok=True)
+                for fp in split_files:
+                    shutil.copy2(fp, img_out)
+                    stem = os.path.splitext(os.path.basename(fp))[0]
+                    txt = os.path.join(req.label_dir, stem + ".txt")
+                    if os.path.isfile(txt):
+                        shutil.copy2(txt, lbl_out)
+                    done += 1
+                    _splitter_state["progress"] = done
+            _splitter_state["results"] = {k: len(v) for k, v in splits.items()}
+            _splitter_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _splitter_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/data/splitter/status")
+async def splitter_status():
+    return dict(_splitter_state)
+
+
+# ── Data: Converter API ────────────────────────────────
+class ConverterRequest(BaseModel):
+    input_dir: str
+    output_dir: str
+    from_fmt: str = "YOLO"
+    to_fmt: str = "COCO JSON"
+
+_converter_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": {}}
+_all_states["converter"] = _converter_state
+
+@app.post("/api/data/converter")
+async def data_converter(req: ConverterRequest):
+    if _converter_state["running"]:
+        return {"error": "Already running"}
+    _converter_state.update(running=True, progress=0, total=0, msg="Converting...", results={})
+
+    def _run():
+        try:
+            import json as _json
+            os.makedirs(req.output_dir, exist_ok=True)
+            label_files = sorted(glob_module.glob(os.path.join(req.input_dir, "*.txt")))
+            img_files = _glob_images(req.input_dir)
+            _converter_state["total"] = len(label_files) or len(img_files)
+
+            if req.from_fmt == "YOLO" and "COCO" in req.to_fmt:
+                coco = {"images": [], "annotations": [], "categories": []}
+                ann_id = 1
+                cats_seen = set()
+                for i, txt in enumerate(label_files):
+                    stem = os.path.splitext(os.path.basename(txt))[0]
+                    # find matching image
+                    img_path = None
+                    for ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+                        candidate = os.path.join(req.input_dir, stem + ext)
+                        if os.path.isfile(candidate):
+                            img_path = candidate
+                            break
+                    w, h = 640, 640
+                    if img_path:
+                        img = cv2.imread(img_path)
+                        if img is not None:
+                            h, w = img.shape[:2]
+                    coco["images"].append({"id": i+1, "file_name": stem + (os.path.splitext(img_path)[1] if img_path else ".jpg"), "width": w, "height": h})
+                    with open(txt) as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) >= 5:
+                                cid = int(parts[0])
+                                cx, cy, bw, bh = map(float, parts[1:5])
+                                x = (cx - bw/2) * w
+                                y = (cy - bh/2) * h
+                                bw_px = bw * w
+                                bh_px = bh * h
+                                coco["annotations"].append({"id": ann_id, "image_id": i+1, "category_id": cid, "bbox": [round(x,1), round(y,1), round(bw_px,1), round(bh_px,1)], "area": round(bw_px*bh_px,1), "iscrowd": 0})
+                                ann_id += 1
+                                cats_seen.add(cid)
+                    _converter_state["progress"] = i + 1
+                for c in sorted(cats_seen):
+                    coco["categories"].append({"id": c, "name": str(c)})
+                with open(os.path.join(req.output_dir, "annotations.json"), "w") as f:
+                    _json.dump(coco, f, indent=2)
+                _converter_state["results"] = {"images": len(coco["images"]), "annotations": ann_id - 1}
+
+            elif "COCO" in req.from_fmt and req.to_fmt == "YOLO":
+                json_files = glob_module.glob(os.path.join(req.input_dir, "*.json"))
+                if not json_files:
+                    _converter_state.update(running=False, msg="No JSON files found")
+                    return
+                with open(json_files[0]) as f:
+                    coco = _json.load(f)
+                img_map = {img["id"]: img for img in coco.get("images", [])}
+                _converter_state["total"] = len(coco.get("annotations", []))
+                per_image = {}
+                for idx, ann in enumerate(coco.get("annotations", [])):
+                    iid = ann["image_id"]
+                    if iid not in per_image:
+                        per_image[iid] = []
+                    img_info = img_map.get(iid, {})
+                    w, h = img_info.get("width", 640), img_info.get("height", 640)
+                    bx, by, bw, bh = ann["bbox"]
+                    cx = (bx + bw/2) / w
+                    cy = (by + bh/2) / h
+                    nw = bw / w
+                    nh = bh / h
+                    per_image[iid].append(f"{ann['category_id']} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
+                    _converter_state["progress"] = idx + 1
+                for iid, lines in per_image.items():
+                    img_info = img_map.get(iid, {})
+                    stem = os.path.splitext(img_info.get("file_name", str(iid)))[0]
+                    with open(os.path.join(req.output_dir, stem + ".txt"), "w") as f:
+                        f.write("\n".join(lines) + "\n")
+                _converter_state["results"] = {"images": len(per_image), "labels": sum(len(v) for v in per_image.values())}
+
+            elif req.from_fmt == "YOLO" and "VOC" in req.to_fmt:
+                from xml.etree.ElementTree import Element, SubElement, tostring
+                from xml.dom.minidom import parseString
+                count = 0
+                for i, txt in enumerate(label_files):
+                    stem = os.path.splitext(os.path.basename(txt))[0]
+                    img_path = None
+                    for ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+                        candidate = os.path.join(req.input_dir, stem + ext)
+                        if os.path.isfile(candidate):
+                            img_path = candidate
+                            break
+                    w, h = 640, 640
+                    if img_path:
+                        img = cv2.imread(img_path)
+                        if img is not None:
+                            h, w = img.shape[:2]
+                    root = Element("annotation")
+                    SubElement(root, "filename").text = stem + (os.path.splitext(img_path)[1] if img_path else ".jpg")
+                    sz = SubElement(root, "size")
+                    SubElement(sz, "width").text = str(w)
+                    SubElement(sz, "height").text = str(h)
+                    SubElement(sz, "depth").text = "3"
+                    with open(txt) as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) >= 5:
+                                cid = int(parts[0])
+                                cx, cy, bw, bh = map(float, parts[1:5])
+                                obj = SubElement(root, "object")
+                                SubElement(obj, "name").text = str(cid)
+                                bnd = SubElement(obj, "bndbox")
+                                SubElement(bnd, "xmin").text = str(int((cx - bw/2) * w))
+                                SubElement(bnd, "ymin").text = str(int((cy - bh/2) * h))
+                                SubElement(bnd, "xmax").text = str(int((cx + bw/2) * w))
+                                SubElement(bnd, "ymax").text = str(int((cy + bh/2) * h))
+                                count += 1
+                    xml_str = parseString(tostring(root)).toprettyxml(indent="  ")
+                    with open(os.path.join(req.output_dir, stem + ".xml"), "w") as f:
+                        f.write(xml_str)
+                    _converter_state["progress"] = i + 1
+                _converter_state["results"] = {"files": len(label_files), "objects": count}
+            else:
+                _converter_state["results"] = {"error": f"Unsupported: {req.from_fmt} → {req.to_fmt}"}
+
+            _converter_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _converter_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/data/converter/status")
+async def converter_status():
+    return dict(_converter_state)
+
+
+# ── Data: Remapper API ─────────────────────────────────
+class RemapperRequest(BaseModel):
+    label_dir: str
+    output_dir: str
+    mapping: dict = {}  # {"old_id": "new_id"}
+    auto_reindex: bool = True
+    recursive: bool = False
+
+@app.post("/api/data/remapper")
+async def data_remapper(req: RemapperRequest):
+    try:
+        os.makedirs(req.output_dir, exist_ok=True)
+        label_files = sorted(glob_module.glob(os.path.join(req.label_dir, "*.txt")))
+        if req.recursive:
+            label_files += sorted(glob_module.glob(os.path.join(req.label_dir, "**", "*.txt"), recursive=True))
+            label_files = list(dict.fromkeys(label_files))
+        if not label_files:
+            return {"error": "No label files found"}
+        mapping = {int(k): int(v) for k, v in req.mapping.items()} if req.mapping else {}
+        count = 0
+        for txt in label_files:
+            lines = []
+            with open(txt) as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        cid = int(parts[0])
+                        if mapping:
+                            if cid in mapping:
+                                cid = mapping[cid]
+                            else:
+                                continue
+                        lines.append(f"{cid} {' '.join(parts[1:])}")
+                        count += 1
+            with open(os.path.join(req.output_dir, os.path.basename(txt)), "w") as f:
+                f.write("\n".join(lines) + "\n" if lines else "")
+        return {"ok": True, "files": len(label_files), "labels": count}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Data: Merger API ───────────────────────────────────
+class MergerRequest(BaseModel):
+    datasets: list[str]
+    output_dir: str
+    dhash_threshold: int = 10
+    recursive: bool = False
+
+_merger_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": {}}
+_all_states["merger"] = _merger_state
+
+@app.post("/api/data/merger")
+async def data_merger(req: MergerRequest):
+    if _merger_state["running"]:
+        return {"error": "Already running"}
+    _merger_state.update(running=True, progress=0, total=0, msg="Merging...", results={})
+
+    def _run():
+        try:
+            import shutil, hashlib
+            os.makedirs(os.path.join(req.output_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(req.output_dir, "labels"), exist_ok=True)
+            all_imgs = []
+            for d in req.datasets:
+                all_imgs.extend(_glob_images(d, recursive=req.recursive))
+            _merger_state["total"] = len(all_imgs)
+            seen_hashes = set()
+            copied = 0
+            dupes = 0
+            for i, fp in enumerate(all_imgs):
+                # Simple hash-based dedup
+                with open(fp, "rb") as f:
+                    h = hashlib.md5(f.read(8192)).hexdigest()
+                if h in seen_hashes:
+                    dupes += 1
+                    _merger_state["progress"] = i + 1
+                    continue
+                seen_hashes.add(h)
+                dst = os.path.join(req.output_dir, "images", os.path.basename(fp))
+                if os.path.exists(dst):
+                    name, ext = os.path.splitext(os.path.basename(fp))
+                    dst = os.path.join(req.output_dir, "images", f"{name}_{i}{ext}")
+                shutil.copy2(fp, dst)
+                # Copy label if exists
+                stem = os.path.splitext(os.path.basename(fp))[0]
+                parent = os.path.dirname(fp)
+                for lbl_dir_name in ["labels", "../labels", "."]:
+                    txt = os.path.join(parent, lbl_dir_name, stem + ".txt")
+                    if os.path.isfile(txt):
+                        shutil.copy2(txt, os.path.join(req.output_dir, "labels", os.path.basename(dst).rsplit(".", 1)[0] + ".txt"))
+                        break
+                copied += 1
+                _merger_state["progress"] = i + 1
+            _merger_state["results"] = {"total": len(all_imgs), "copied": copied, "duplicates": dupes}
+            _merger_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _merger_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/data/merger/status")
+async def merger_status():
+    return dict(_merger_state)
+
+
+# ── Data: Sampler API ──────────────────────────────────
+class SamplerRequest(BaseModel):
+    img_dir: str
+    label_dir: str = ""
+    output_dir: str
+    strategy: str = "Random"
+    target_count: int = 500
+    seed: int = 42
+    include_labels: bool = True
+    recursive: bool = False
+
+_sampler_state = {"running": False, "msg": "", "results": {}}
+_all_states["sampler"] = _sampler_state
+
+@app.post("/api/data/sampler")
+async def data_sampler(req: SamplerRequest):
+    if _sampler_state["running"]:
+        return {"error": "Already running"}
+    _sampler_state.update(running=True, msg="Sampling...", results={})
+
+    def _run():
+        try:
+            import random, shutil
+            random.seed(req.seed)
+            imgs = _glob_images(req.img_dir, recursive=req.recursive)
+            if not imgs:
+                _sampler_state.update(running=False, msg="No images found")
+                return
+            n = min(req.target_count, len(imgs))
+            selected = random.sample(imgs, n)
+            os.makedirs(os.path.join(req.output_dir, "images"), exist_ok=True)
+            if req.include_labels:
+                os.makedirs(os.path.join(req.output_dir, "labels"), exist_ok=True)
+            for fp in selected:
+                shutil.copy2(fp, os.path.join(req.output_dir, "images"))
+                if req.include_labels and req.label_dir:
+                    stem = os.path.splitext(os.path.basename(fp))[0]
+                    txt = os.path.join(req.label_dir, stem + ".txt")
+                    if os.path.isfile(txt):
+                        shutil.copy2(txt, os.path.join(req.output_dir, "labels"))
+            _sampler_state["results"] = {"total": len(imgs), "sampled": n}
+            _sampler_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _sampler_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/data/sampler/status")
+async def sampler_status():
+    return dict(_sampler_state)
+
+
+# ── Quality: Anomaly Detector API ──────────────────────
+_anomaly_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": []}
+_all_states["anomaly"] = _anomaly_state
+
+@app.post("/api/quality/anomaly")
+async def quality_anomaly(req: dict):
+    if _anomaly_state["running"]:
+        return {"error": "Already running"}
+    _anomaly_state.update(running=True, progress=0, total=0, msg="Scanning...", results=[])
+    img_dir = req.get("img_dir", "")
+    label_dir = req.get("label_dir", "")
+    recursive = req.get("recursive", False)
+
+    def _run():
+        try:
+            imgs = _glob_images(img_dir, recursive=recursive)
+            _anomaly_state["total"] = len(imgs)
+            results = []
+            for i, fp in enumerate(imgs):
+                stem = os.path.splitext(os.path.basename(fp))[0]
+                txt = os.path.join(label_dir, stem + ".txt") if label_dir else ""
+                if txt and os.path.isfile(txt):
+                    with open(txt) as f:
+                        for ln, line in enumerate(f):
+                            parts = line.strip().split()
+                            if len(parts) < 5:
+                                continue
+                            cx, cy, bw, bh = map(float, parts[1:5])
+                            issues = []
+                            # OOB check
+                            if cx - bw/2 < -0.01 or cy - bh/2 < -0.01 or cx + bw/2 > 1.01 or cy + bh/2 > 1.01:
+                                issues.append("Out-of-bounds")
+                            # Size outlier
+                            area = bw * bh
+                            if area < 0.0001:
+                                issues.append("Tiny box")
+                            elif area > 0.9:
+                                issues.append("Huge box")
+                            # Aspect ratio
+                            ar = bw / (bh + 1e-9)
+                            if ar > 20 or ar < 0.05:
+                                issues.append("Extreme aspect")
+                            if issues:
+                                results.append({"file": os.path.basename(fp), "type": ", ".join(issues),
+                                                "details": f"L{ln+1}: cls={parts[0]} cx={cx:.3f} cy={cy:.3f} w={bw:.3f} h={bh:.3f}",
+                                                "severity": "High" if "Out-of-bounds" in issues else "Medium"})
+                _anomaly_state["progress"] = i + 1
+            _anomaly_state["results"] = results[:1000]
+            _anomaly_state.update(running=False, msg=f"Complete — {len(results)} issues found")
+        except Exception as e:
+            _anomaly_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/quality/anomaly/status")
+async def anomaly_status():
+    return dict(_anomaly_state)
+
+
+# ── Quality: Image Quality Checker API ─────────────────
+_quality_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": []}
+_all_states["quality"] = _quality_state
+
+@app.post("/api/quality/image-quality")
+async def quality_check(req: dict):
+    if _quality_state["running"]:
+        return {"error": "Already running"}
+    _quality_state.update(running=True, progress=0, total=0, msg="Checking...", results=[])
+    img_dir = req.get("img_dir", "")
+    recursive = req.get("recursive", False)
+
+    def _run():
+        try:
+            imgs = _glob_images(img_dir, recursive=recursive)
+            _quality_state["total"] = len(imgs)
+            results = []
+            for i, fp in enumerate(imgs):
+                frame = cv2.imread(fp)
+                if frame is None:
+                    _quality_state["progress"] = i + 1
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                blur = round(cv2.Laplacian(gray, cv2.CV_64F).var(), 2)
+                brightness = round(float(gray.mean()), 2)
+                entropy = round(float(-np.sum(np.histogram(gray, 256, [0,256])[0]/gray.size * np.log2(np.histogram(gray, 256, [0,256])[0]/gray.size + 1e-12))), 2)
+                h, w = frame.shape[:2]
+                aspect = round(w / h, 2)
+                issues = []
+                if blur < 50:
+                    issues.append("Blurry")
+                if brightness < 40:
+                    issues.append("Dark")
+                elif brightness > 220:
+                    issues.append("Overexposed")
+                if aspect > 4 or aspect < 0.25:
+                    issues.append("Odd aspect")
+                results.append({"file": os.path.basename(fp), "blur": blur, "brightness": brightness,
+                                "entropy": entropy, "aspect": aspect, "issues": ", ".join(issues) or "OK"})
+                _quality_state["progress"] = i + 1
+            _quality_state["results"] = results[:1000]
+            _quality_state.update(running=False, msg=f"Complete — {len(results)} images checked")
+        except Exception as e:
+            _quality_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/quality/image-quality/status")
+async def quality_status():
+    return dict(_quality_state)
+
+
+# ── Quality: Near-Duplicate Detector API ───────────────
+_dup_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": []}
+_all_states["duplicate"] = _dup_state
+
+def _dhash(img, size=8):
+    resized = cv2.resize(img, (size+1, size), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY) if len(resized.shape) == 3 else resized
+    diff = gray[:, 1:] > gray[:, :-1]
+    return sum(2**i for i, v in enumerate(diff.flatten()) if v)
+
+@app.post("/api/quality/duplicate")
+async def quality_duplicate(req: dict):
+    if _dup_state["running"]:
+        return {"error": "Already running"}
+    _dup_state.update(running=True, progress=0, total=0, msg="Hashing...", results=[])
+    img_dir = req.get("img_dir", "")
+    threshold = int(req.get("threshold", 10))
+    recursive = req.get("recursive", False)
+
+    def _run():
+        try:
+            imgs = _glob_images(img_dir, recursive=recursive)
+            _dup_state["total"] = len(imgs)
+            hashes = []
+            for i, fp in enumerate(imgs):
+                frame = cv2.imread(fp)
+                if frame is not None:
+                    hashes.append((os.path.basename(fp), _dhash(frame)))
+                _dup_state["progress"] = i + 1
+            _dup_state["msg"] = "Comparing..."
+            results = []
+            group = 1
+            for i in range(len(hashes)):
+                for j in range(i+1, len(hashes)):
+                    dist = bin(hashes[i][1] ^ hashes[j][1]).count('1')
+                    if dist <= threshold:
+                        results.append({"group": group, "image_a": hashes[i][0], "image_b": hashes[j][0], "distance": dist})
+                        group += 1
+                    if len(results) >= 500:
+                        break
+                if len(results) >= 500:
+                    break
+            _dup_state["results"] = results
+            _dup_state.update(running=False, msg=f"Complete — {len(results)} pairs found")
+        except Exception as e:
+            _dup_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/quality/duplicate/status")
+async def duplicate_status():
+    return dict(_dup_state)
+
+
+# ── Quality: Leaky Split Detector API ──────────────────
+_leaky_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": []}
+_all_states["leaky"] = _leaky_state
+
+@app.post("/api/quality/leaky")
+async def quality_leaky(req: dict):
+    if _leaky_state["running"]:
+        return {"error": "Already running"}
+    _leaky_state.update(running=True, progress=0, total=0, msg="Scanning...", results=[])
+    dirs = {k: req.get(k, "") for k in ["train_dir", "val_dir", "test_dir"]}
+    threshold = int(req.get("threshold", 10))
+
+    def _run():
+        try:
+            split_hashes = {}
+            for name, d in dirs.items():
+                if not d:
+                    continue
+                imgs = _glob_images(d)
+                split_hashes[name] = {os.path.basename(fp): _dhash(cv2.imread(fp)) for fp in imgs if cv2.imread(fp) is not None}
+            _leaky_state["total"] = sum(len(v) for v in split_hashes.values())
+            results = []
+            names = list(split_hashes.keys())
+            for i in range(len(names)):
+                for j in range(i+1, len(names)):
+                    dupes = 0
+                    files = []
+                    for fa, ha in split_hashes[names[i]].items():
+                        for fb, hb in split_hashes[names[j]].items():
+                            dist = bin(ha ^ hb).count('1')
+                            if dist <= threshold:
+                                dupes += 1
+                                if len(files) < 10:
+                                    files.append(f"{fa} ↔ {fb}")
+                    results.append({"pair": f"{names[i]} ↔ {names[j]}", "duplicates": dupes, "files": "; ".join(files)})
+            _leaky_state["results"] = results
+            _leaky_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _leaky_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/quality/leaky/status")
+async def leaky_status():
+    return dict(_leaky_state)
+
+
+# ── Quality: Similarity Search API ─────────────────────
+_sim_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": [], "index": None}
+_all_states["similarity"] = _sim_state
+
+@app.post("/api/quality/similarity")
+async def quality_similarity(req: dict):
+    if _sim_state["running"]:
+        return {"error": "Already running"}
+    _sim_state.update(running=True, progress=0, total=0, msg="Building index...", results=[])
+    img_dir = req.get("img_dir", "")
+    query = req.get("query", "")
+    top_k = int(req.get("top_k", 10))
+
+    def _run():
+        try:
+            imgs = _glob_images(img_dir)
+            _sim_state["total"] = len(imgs)
+            hashes = []
+            for i, fp in enumerate(imgs):
+                frame = cv2.imread(fp)
+                if frame is not None:
+                    hashes.append((os.path.basename(fp), _dhash(frame, 16)))
+                _sim_state["progress"] = i + 1
+            if query and os.path.isfile(query):
+                q_frame = cv2.imread(query)
+                q_hash = _dhash(q_frame, 16) if q_frame is not None else 0
+                ranked = sorted(hashes, key=lambda x: bin(x[1] ^ q_hash).count('1'))
+                _sim_state["results"] = [{"rank": i+1, "image": name, "distance": bin(h ^ q_hash).count('1')} for i, (name, h) in enumerate(ranked[:top_k])]
+            else:
+                _sim_state["results"] = [{"rank": i+1, "image": name, "distance": 0} for i, (name, _) in enumerate(hashes[:top_k])]
+            _sim_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _sim_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/quality/similarity/status")
+async def similarity_status():
+    return dict(_sim_state)
+
+
+# ── Batch: Batch Inference API ─────────────────────────
+class BatchInferRequest(BaseModel):
+    model_path: str
+    img_dir: str
+    output_dir: str
+    output_format: str = "YOLO txt"
+    save_vis: bool = False
+
+_batch_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": {}}
+_all_states["batch_infer"] = _batch_state
+
+@app.post("/api/batch/run")
+async def batch_infer(req: BatchInferRequest):
+    if _batch_state["running"]:
+        return {"error": "Already running"}
+    _batch_state.update(running=True, progress=0, total=0, msg="Starting...", results={})
+
+    def _run():
+        try:
+            from core.model_loader import load_model as _load
+            from core.inference import run_inference
+            mi = _load(req.model_path, model_type="yolo")
+            imgs = _glob_images(req.img_dir)
+            if not imgs:
+                _batch_state.update(running=False, msg="No images found")
+                return
+            _batch_state["total"] = len(imgs)
+            os.makedirs(req.output_dir, exist_ok=True)
+            names = mi.names or {}
+            all_results = []
+            for i, fp in enumerate(imgs):
+                frame = cv2.imread(fp)
+                if frame is None:
+                    _batch_state["progress"] = i + 1
+                    continue
+                h, w = frame.shape[:2]
+                result = run_inference(mi, frame, 0.25)
+                stem = os.path.splitext(os.path.basename(fp))[0]
+                if "YOLO" in req.output_format:
+                    lines = []
+                    for box, score, cid in zip(result.boxes, result.scores, result.class_ids):
+                        x1, y1, x2, y2 = box
+                        cx = ((x1+x2)/2)/w; cy = ((y1+y2)/2)/h
+                        bw = (x2-x1)/w; bh = (y2-y1)/h
+                        lines.append(f"{int(cid)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f} {float(score):.4f}")
+                    with open(os.path.join(req.output_dir, stem + ".txt"), "w") as f:
+                        f.write("\n".join(lines) + "\n" if lines else "")
+                elif "JSON" in req.output_format:
+                    for box, score, cid in zip(result.boxes, result.scores, result.class_ids):
+                        all_results.append({"file": os.path.basename(fp), "class_id": int(cid),
+                                            "class_name": names.get(int(cid), str(int(cid))),
+                                            "confidence": round(float(score), 4),
+                                            "bbox": [round(float(x), 1) for x in box]})
+                elif "CSV" in req.output_format:
+                    pass  # handled below
+                if req.save_vis:
+                    vis = _draw_detections(frame, result, names)
+                    cv2.imwrite(os.path.join(req.output_dir, stem + "_vis.jpg"), vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                _batch_state["progress"] = i + 1
+                _batch_state["msg"] = f"{i+1}/{len(imgs)}"
+            if "JSON" in req.output_format:
+                import json as _json
+                with open(os.path.join(req.output_dir, "results.json"), "w") as f:
+                    _json.dump(all_results, f, indent=2)
+            _batch_state["results"] = {"images": len(imgs), "detections": sum(len(run_inference(mi, cv2.imread(fp), 0.25).boxes) for fp in [] )}
+            _batch_state["results"] = {"images": len(imgs)}
+            _batch_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _batch_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True}
+
+@app.get("/api/batch/status")
+async def batch_status():
+    return dict(_batch_state)
+
+
+# ── Batch: Augmentation Preview API ────────────────────
+@app.post("/api/batch/augmentation")
+async def batch_augmentation(req: dict):
+    try:
+        img_dir = req.get("img_dir", "")
+        aug_type = req.get("aug_type", "Flip")
+        imgs = _glob_images(img_dir)
+        if not imgs:
+            return {"error": "No images found"}
+        import random
+        fp = random.choice(imgs)
+        frame = cv2.imread(fp)
+        if frame is None:
+            return {"error": "Cannot read image"}
+        original = _encode_jpeg(frame)
+        if aug_type == "Flip":
+            aug = cv2.flip(frame, 1)
+        elif aug_type == "Rotate":
+            M = cv2.getRotationMatrix2D((frame.shape[1]//2, frame.shape[0]//2), 15, 1.0)
+            aug = cv2.warpAffine(frame, M, (frame.shape[1], frame.shape[0]))
+        elif aug_type == "Brightness":
+            aug = cv2.convertScaleAbs(frame, alpha=1.3, beta=30)
+        elif "Mosaic" in aug_type:
+            h, w = frame.shape[:2]
+            half_h, half_w = h//2, w//2
+            samples = [cv2.imread(random.choice(imgs)) for _ in range(4)]
+            samples = [cv2.resize(s, (half_w, half_h)) if s is not None else np.zeros((half_h, half_w, 3), dtype=np.uint8) for s in samples]
+            top = np.hstack([samples[0], samples[1]])
+            bot = np.hstack([samples[2], samples[3]])
+            aug = np.vstack([top, bot])
+        else:
+            aug = frame.copy()
+        augmented = _encode_jpeg(aug)
+        return {"original": original, "augmented": augmented, "file": os.path.basename(fp)}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ── Launch ──────────────────────────────────────────────

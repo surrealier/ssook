@@ -147,3 +147,173 @@ function _addOneSlot(containerId, listId, path) {
 function getSlotModels(containerId) {
   return [...document.querySelectorAll(`#${containerId} .model-slot-path`)].map(e => e.value);
 }
+
+/* ── Detail Modal ───────────────────────────────────── */
+function showDetailModal(title, html) {
+  let overlay = document.getElementById('detail-modal-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'detail-modal-overlay';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center;';
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML = `<div style="background:#1a1a1a;border-radius:12px;padding:1.5rem;max-width:700px;width:90%;max-height:80vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.5);color:#e6e6e6;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+      <h3 class="text-heading-h3">${title}</h3>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('detail-modal-overlay').remove()">✕</button>
+    </div>
+    <div>${html}</div>
+  </div>`;
+}
+
+/* ── Help Overlay (paginated inline annotations) ────── */
+/* _ANNOTATIONS: loaded from help-annotations-main.js & help-annotations-extra.js */
+const _ANNOTATIONS = (function() {
+  const m = typeof _ANNOTATIONS_MAIN !== 'undefined' ? _ANNOTATIONS_MAIN : {};
+  const e = typeof _ANNOTATIONS_EXTRA !== 'undefined' ? _ANNOTATIONS_EXTRA : {};
+  return Object.assign({}, m, e);
+})();
+
+function showHelp(tabName) {
+  const oldBg = document.getElementById('help-bg');
+  if (oldBg) { _closeHelp(); return; }
+
+  const pages = _ANNOTATIONS[tabName];
+  if (!pages || !pages.length) return;
+
+  /* inject styles once */
+  if (!document.getElementById('help-style')) {
+    const s = document.createElement('style');
+    s.id = 'help-style';
+    s.textContent = `
+      .help-hl{outline:2px solid #4a9eff!important;outline-offset:2px;border-radius:4px;position:relative;z-index:9999}
+      .help-b{position:fixed;z-index:10001;background:#1a1a1a;color:#e6e6e6;border:1px solid #4a9eff;border-radius:8px;padding:6px 10px;font-size:11px;line-height:1.5;white-space:pre-line;max-width:240px;box-shadow:0 4px 12px rgba(0,0,0,0.6);pointer-events:none}
+      .help-b::after{content:'';position:absolute;width:8px;height:8px;background:#1a1a1a;border:1px solid #4a9eff;transform:rotate(45deg)}
+      .help-b.arrow-left::after{right:-5px;top:12px;border-top:none;border-left:none}
+      .help-b.arrow-right::after{left:-5px;top:12px;border-bottom:none;border-right:none}
+      .help-b.arrow-top::after{bottom:-5px;left:16px;border-top:none;border-left:none}
+      .help-b.arrow-bottom::after{top:-5px;left:16px;border-bottom:none;border-right:none}
+      .help-nav{position:fixed;z-index:10002;display:flex;align-items:center;gap:0.75rem;
+        background:#1a1a1a;border:1px solid #4a9eff;border-radius:10px;padding:6px 14px;
+        box-shadow:0 4px 16px rgba(0,0,0,0.5);left:50%;transform:translateX(-50%);bottom:32px;user-select:none}
+      .help-nav button{background:none;border:1px solid #4a9eff;color:#e6e6e6;border-radius:6px;
+        width:30px;height:30px;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s}
+      .help-nav button:hover{background:#4a9eff33}
+      .help-nav button:disabled{opacity:0.3;cursor:default;background:none}
+      .help-nav-title{color:#e6e6e6;font-size:13px;font-weight:600;min-width:120px;text-align:center}
+      .help-nav-dots{display:flex;gap:4px}
+      .help-nav-dot{width:7px;height:7px;border-radius:50%;background:#555;transition:background .2s}
+      .help-nav-dot.active{background:#4a9eff}
+    `;
+    document.head.appendChild(s);
+  }
+
+  /* background overlay */
+  const bg = document.createElement('div');
+  bg.id = 'help-bg';
+  bg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:9997;background:rgba(0,0,0,0.25);cursor:pointer;';
+  bg.onclick = _closeHelp;
+  document.body.appendChild(bg);
+
+  /* bubble container */
+  const container = document.createElement('div');
+  container.id = 'help-bubbles';
+  container.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;z-index:10000;pointer-events:none;';
+  document.body.appendChild(container);
+
+  /* navigation bar */
+  const nav = document.createElement('div');
+  nav.className = 'help-nav'; nav.id = 'help-nav';
+  document.body.appendChild(nav);
+
+  let curPage = 0;
+
+  function renderPage(idx) {
+    curPage = idx;
+    /* clear previous highlights & bubbles */
+    document.querySelectorAll('.help-hl').forEach(e => e.classList.remove('help-hl'));
+    container.innerHTML = '';
+
+    const page = pages[idx];
+    const items = page.items || [];
+
+    /* nav bar */
+    const dots = pages.map((_, i) => `<span class="help-nav-dot${i===idx?' active':''}"></span>`).join('');
+    nav.innerHTML = `<button id="help-prev"${idx===0?' disabled':''}>◀</button>
+      <div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
+        <span class="help-nav-title">${page.page}</span>
+        <div class="help-nav-dots">${dots}</div>
+        <span style="color:#888;font-size:10px;">${idx+1} / ${pages.length}</span>
+      </div>
+      <button id="help-next"${idx===pages.length-1?' disabled':''}>▶</button>`;
+    document.getElementById('help-prev').onclick = (e) => { e.stopPropagation(); renderPage(idx - 1); };
+    document.getElementById('help-next').onclick = (e) => { e.stopPropagation(); renderPage(idx + 1); };
+
+    /* place bubbles */
+    const placed = [];
+    for (const ann of items) {
+      const el = document.querySelector(ann.sel);
+      if (!el) continue;
+      el.classList.add('help-hl');
+      const r = el.getBoundingClientRect();
+      const b = document.createElement('div');
+      b.className = 'help-b';
+      b.textContent = ann.text;
+      container.appendChild(b);
+      b.style.left = '-9999px'; b.style.top = '0';
+      const bw = b.offsetWidth, bh = b.offsetHeight;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const gap = 10;
+      const candidates = [
+        { x: r.right + gap, y: r.top, arrow: 'arrow-right' },
+        { x: r.left - bw - gap, y: r.top, arrow: 'arrow-left' },
+        { x: r.left, y: r.bottom + gap, arrow: 'arrow-bottom' },
+        { x: r.left, y: r.top - bh - gap, arrow: 'arrow-top' },
+      ];
+      let best = null;
+      for (const c of candidates) {
+        if (c.x < 4 || c.x + bw > vw - 4 || c.y < 4 || c.y + bh > vh - 4) continue;
+        const overlaps = placed.some(p => c.x < p.x + p.w && c.x + bw > p.x && c.y < p.y + p.h && c.y + bh > p.y);
+        if (!overlaps) { best = c; break; }
+      }
+      if (!best) {
+        let ny = r.top;
+        for (const p of placed) {
+          if (r.right + gap < p.x + p.w && r.right + gap + bw > p.x && ny < p.y + p.h && ny + bh > p.y) ny = p.y + p.h + 4;
+        }
+        best = { x: Math.min(r.right + gap, vw - bw - 4), y: Math.min(ny, vh - bh - 4), arrow: 'arrow-right' };
+      }
+      b.style.left = best.x + 'px';
+      b.style.top = best.y + 'px';
+      b.classList.add(best.arrow);
+      placed.push({ x: best.x, y: best.y, w: bw, h: bh });
+    }
+  }
+
+  renderPage(0);
+
+  /* keyboard navigation */
+  function _helpKey(e) {
+    if (e.key === 'ArrowRight' && curPage < pages.length - 1) renderPage(curPage + 1);
+    else if (e.key === 'ArrowLeft' && curPage > 0) renderPage(curPage - 1);
+    else if (e.key === 'Escape') _closeHelp();
+  }
+  document.addEventListener('keydown', _helpKey);
+  bg.dataset.helpKeyHandler = 'true';
+  window._helpKeyHandler = _helpKey;
+}
+
+function _closeHelp() {
+  const bg = document.getElementById('help-bg');
+  const bubbles = document.getElementById('help-bubbles');
+  const nav = document.getElementById('help-nav');
+  if (bg) bg.remove();
+  if (bubbles) bubbles.remove();
+  if (nav) nav.remove();
+  document.querySelectorAll('.help-hl').forEach(e => e.classList.remove('help-hl'));
+  if (window._helpKeyHandler) {
+    document.removeEventListener('keydown', window._helpKeyHandler);
+    window._helpKeyHandler = null;
+  }
+}

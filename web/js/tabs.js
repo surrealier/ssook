@@ -106,7 +106,25 @@ Tabs.viewer = {
         const mt = document.getElementById('v-model-type');
         if (mt && c.model_types) {
           mt.innerHTML = '';
-          for (const [key, label] of Object.entries(c.model_types)) mt.add(new Option(label, key));
+          const groups = {
+            'Detection': [], 'Classification': [], 'Segmentation': [],
+            'CLIP': [], 'Embedder': [], 'Custom': []
+          };
+          for (const [key, label] of Object.entries(c.model_types)) {
+            if (key.startsWith('cls_')) groups['Classification'].push([key, label]);
+            else if (key.startsWith('seg_')) groups['Segmentation'].push([key, label]);
+            else if (key.startsWith('clip_')) groups['CLIP'].push([key, label]);
+            else if (key.startsWith('emb_')) groups['Embedder'].push([key, label]);
+            else if (key.startsWith('custom:')) groups['Custom'].push([key, label]);
+            else groups['Detection'].push([key, label]);
+          }
+          for (const [gname, items] of Object.entries(groups)) {
+            if (!items.length) continue;
+            const og = document.createElement('optgroup');
+            og.label = gname;
+            for (const [k, l] of items) og.appendChild(new Option(l, k));
+            mt.appendChild(og);
+          }
           mt.value = c.model_type || 'yolo';
         }
         document.getElementById('v-batch-size').value = c.batch_size || 1;
@@ -132,6 +150,17 @@ Tabs.viewer = {
     this._keyHandler = (e) => this._onKey(e);
     document.addEventListener('keydown', this._keyHandler);
   },
+  destroy() {
+    // 탭 전환 시 리소스 정리 — HW 폴링 중지, MJPEG 스트림 해제, 키보드 핸들러 제거
+    if (this._hwInterval) { clearInterval(this._hwInterval); this._hwInterval = null; }
+    if (this._keyHandler) { document.removeEventListener('keydown', this._keyHandler); this._keyHandler = null; }
+    // MJPEG img src 제거 — 브라우저가 연결을 끊도록
+    const canvas = document.getElementById('viewer-canvas');
+    if (canvas) {
+      const img = canvas.querySelector('img');
+      if (img) img.src = '';
+    }
+  },
   _hwInterval: null,
   async _pollHW() {
     try {
@@ -152,6 +181,10 @@ Tabs.viewer = {
   _getConf() { return +(document.getElementById('v-conf-slider')?.value || 25) / 100; },
   async _onModelTypeChange() {
     const v = document.getElementById('v-model-type').value;
+    if (v.startsWith('clip_') || v.startsWith('emb_')) {
+      App.setStatus('CLIP/Embedder 모델은 뷰어에서 사용할 수 없습니다. 전용 탭을 이용하세요.');
+      return;
+    }
     await API.post('/api/config', { model_type: v });
   },
   async _onBatchChange() {
@@ -280,10 +313,14 @@ Tabs.viewer = {
       });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       document.getElementById('viewer-canvas').innerHTML = `<img src="data:image/jpeg;base64,${r.image}" style="max-width:100%;max-height:100%;">`;
-      document.getElementById('viewer-results').textContent = `${r.detections} detections`;
+      const resEl = document.getElementById('viewer-results');
+      if (r.classification) resEl.innerHTML = `<b>${r.classification}</b>` + (r.top_k ? '<br>' + r.top_k.map(t=>`${t.class}: ${t.score}`).join('<br>') : '');
+      else if (r.segmentation) resEl.textContent = r.segmentation;
+      else if (r.embedding) resEl.textContent = r.embedding;
+      else resEl.textContent = `${r.detections} detections`;
       document.getElementById('v-infer-stats').innerHTML = `Infer: ${r.infer_ms} ms`;
-      App.setStatus(`Inference done: ${r.detections} detections, ${r.infer_ms}ms`);
-    } catch(e) { App.setStatus('Error: ' + e.message); }
+      App.setStatus(r.classification ? `Classification: ${r.classification}` : r.segmentation ? `Segmentation: ${r.segmentation}` : r.embedding ? `Embedding: ${r.embedding}, ${r.infer_ms}ms` : `Inference done: ${r.detections} detections, ${r.infer_ms}ms`);
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
   _streamSessionId: null,
   _paused: false,
@@ -300,7 +337,7 @@ Tabs.viewer = {
       this._setControls(true);
       App.setStatus(`Playing: ${r.total_frames} frames @ ${r.fps?.toFixed(1)} FPS`);
       this._pollStatus();
-    } catch(e) { App.setStatus('Error: ' + e.message); }
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
   _setControls(playing) {
     const btn = document.getElementById('btn-play');
@@ -380,16 +417,16 @@ Tabs.settings = {
     return `
       <div style="display:flex;gap:1.5rem;align-items:flex-start;">
         <div style="max-width:480px;flex:1;display:flex;flex-direction:column;gap:1.5rem;">
-          <div class="card" style="padding:1.5rem;">
+          <div class="card" style="padding:1.5rem;" id="settings-model-section">
             <h3 class="text-heading-h3" style="margin-bottom:1rem;">모델 타입 관리</h3>
             <button class="btn btn-secondary btn-sm" onclick="Tabs.settings.openCustomTypeDialog()">모델 타입 추가…</button>
           </div>
           <div class="card" style="padding:1.5rem;">
             <h3 class="text-heading-h3" style="margin-bottom:1rem;">테스트 모델 다운로드</h3>
             <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
-              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.onnx" class="btn btn-secondary btn-sm">📥 Detection (YOLO11n)</a>
-              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-cls.onnx" class="btn btn-secondary btn-sm">📥 Classification (YOLO11n-cls)</a>
-              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-seg.onnx" class="btn btn-secondary btn-sm">📥 Segmentation (YOLO11n-seg)</a>
+              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 Detection (YOLO11n)</a>
+              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-cls.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 Classification (YOLO11n-cls)</a>
+              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-seg.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 Segmentation (YOLO11n-seg)</a>
               <a href="https://huggingface.co/Xenova/clip-vit-base-patch32/tree/main/onnx" target="_blank" class="btn btn-secondary btn-sm">📥 CLIP (ViT-B/32 ONNX)</a>
               <a href="https://huggingface.co/immich-app/ViT-B-32__openai/tree/main" target="_blank" class="btn btn-secondary btn-sm">📥 Embedder (ViT-B/32 ONNX)</a>
             </div>
@@ -456,7 +493,11 @@ Tabs.settings = {
         <td style="padding:4px 6px;"><input type="number" value="${thick}" min="0" max="10" data-cls="${id}" class="cls-thick" style="width:50px;font-size:11px;" title="0=default" onchange="Tabs.settings._onClassChange(${id})"></td>
       </tr>`;
     }
-    container.innerHTML = `<div style="max-height:400px;overflow-y:auto;">
+    container.innerHTML = `<div style="display:flex;gap:0.5rem;margin-bottom:0.5rem;">
+      <button class="btn btn-secondary btn-sm" onclick="Tabs.settings._toggleAllClasses(true)">전체 선택</button>
+      <button class="btn btn-secondary btn-sm" onclick="Tabs.settings._toggleAllClasses(false)">전체 해제</button>
+    </div>
+    <div style="max-height:400px;overflow-y:auto;">
       <table style="width:100%;font-size:12px;"><thead><tr>
         <th style="text-align:left;padding:4px 6px;">Class</th>
         <th style="padding:4px 6px;">${t('settings.enabled')}</th>
@@ -477,6 +518,23 @@ Tabs.settings = {
         color: [b, g, r], thickness: +(th?.value||0),
       });
     } catch(e) {}
+  },
+  async _toggleAllClasses(enabled) {
+    const checkboxes = document.querySelectorAll('.cls-enabled');
+    for (const cb of checkboxes) {
+      cb.checked = enabled;
+      const clsId = +cb.dataset.cls;
+      const co = document.querySelector(`.cls-color[data-cls="${clsId}"]`);
+      const th = document.querySelector(`.cls-thick[data-cls="${clsId}"]`);
+      const hex = co?.value || '#00ff00';
+      const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+      try {
+        await API.post('/api/config/class-style', {
+          class_id: clsId, enabled,
+          color: [b, g, r], thickness: +(th?.value||0),
+        });
+      } catch(e) {}
+    }
   },
   async save() {
     try {
@@ -756,7 +814,7 @@ Tabs.settings = {
       } else {
         App.setStatus('Error: ' + (r.error || ''));
       }
-    } catch(e) { App.setStatus('Error: ' + e.message); }
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
 };
 
@@ -770,7 +828,7 @@ Tabs.benchmark = {
           ${multiModelSlots('bench-slots','bench-list')}
         </div>
         <div class="card" style="padding:1.5rem;">
-          <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('bench.config')}</h3>
+          <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('bench.config')}</h3>
           <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;">
             <div class="form-group"><label class="form-label">${t('bench.iters')}</label><input type="number" class="form-input input-normal" value="500" min="10" max="5000" step="100" id="bench-iters"></div>
             <div class="form-group"><label class="form-label">${t('bench.input_size')}</label><select class="form-input input-normal" id="bench-size"><option>640</option><option>320</option><option>1280</option></select></div>
@@ -866,7 +924,7 @@ Tabs.evaluation = {
     return `
       <div style="display:flex;flex-direction:column;gap:1.5rem;">
         <div class="card" style="padding:1.5rem;">
-          <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('eval.setup')}</h3>
+          <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('eval.setup')}</h3>
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem;">
             <h3 class="text-heading-h3">${t('bench.models')}</h3>
             <button class="btn btn-secondary btn-sm" onclick="Tabs.evaluation._addModel()">${t('add_model')}</button>
@@ -997,7 +1055,7 @@ Tabs.evaluation = {
       if (r.error) { App.setStatus('Error: ' + r.error); document.getElementById('eval-run-btn').disabled = false; return; }
       this._polling = true;
       this._poll();
-    } catch(e) { App.setStatus('Error: ' + e.message); document.getElementById('eval-run-btn').disabled = false; }
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); document.getElementById('eval-run-btn').disabled = false; }
   },
   _savedMappings: {},
   _savedMappedOnly: true,
@@ -1327,13 +1385,16 @@ Tabs.analysis = {
       });
       if (r.error) { App.setStatus('Error: '+r.error); return; }
       let html = '';
-      if (r.original) html += `<div style="text-align:center;"><div class="text-label" style="margin-bottom:0.25rem;">Original</div><img src="data:image/jpeg;base64,${r.original}" style="max-width:100%;max-height:250px;"></div>`;
-      if (r.letterbox) html += `<div style="text-align:center;"><div class="text-label" style="margin-bottom:0.25rem;">Letterbox</div><img src="data:image/jpeg;base64,${r.letterbox}" style="max-width:100%;max-height:250px;"></div>`;
-      if (r.tensor_heatmap) html += `<div style="text-align:center;"><div class="text-label" style="margin-bottom:0.25rem;">Tensor Heatmap</div><img src="data:image/jpeg;base64,${r.tensor_heatmap}" style="max-width:100%;max-height:250px;"></div>`;
-      if (r.result) html += `<div style="text-align:center;"><div class="text-label" style="margin-bottom:0.25rem;">Detections</div><img src="data:image/jpeg;base64,${r.result}" style="max-width:100%;max-height:250px;"></div>`;
+      if (r.original_image) html += `<div style="text-align:center;"><div class="text-label" style="margin-bottom:0.25rem;">Original</div><img src="data:image/jpeg;base64,${r.original_image}" style="max-width:100%;max-height:250px;"></div>`;
+      if (r.letterbox_image) html += `<div style="text-align:center;"><div class="text-label" style="margin-bottom:0.25rem;">Letterbox</div><img src="data:image/jpeg;base64,${r.letterbox_image}" style="max-width:100%;max-height:250px;"></div>`;
+      if (r.detection_image) html += `<div style="text-align:center;"><div class="text-label" style="margin-bottom:0.25rem;">Detections</div><img src="data:image/jpeg;base64,${r.detection_image}" style="max-width:100%;max-height:250px;"></div>`;
       document.getElementById('ana-panels').innerHTML = html || '<span class="text-muted">No results</span>';
-      document.getElementById('ana-stats').innerHTML = `Pre: ${r.pre_ms||'—'}ms<br>Infer: ${r.infer_ms||'—'}ms<br>Post: ${r.post_ms||'—'}ms`;
-      document.getElementById('ana-dets').textContent = (r.detections||0)+' detections';
+      const tm = r.timing || {};
+      document.getElementById('ana-stats').innerHTML = `Pre: ${tm.pre_ms||'—'}ms<br>Infer: ${tm.infer_ms||'—'}ms<br>Post: ${tm.post_ms||'—'}ms<br>Total: ${tm.total_ms||'—'}ms`;
+      const dets = r.detections || [];
+      document.getElementById('ana-dets').innerHTML = Array.isArray(dets)
+        ? dets.map(d => `${d.class_name}: ${d.confidence}`).join('<br>') || 'No detections'
+        : dets + ' detections';
       App.setStatus('Inference analysis complete');
     } catch(e) { App.setStatus('Error: '+e.message); }
   }
@@ -1342,28 +1403,52 @@ Tabs.analysis = {
 /* ── Explorer ───────────────────────────────────────── */
 Tabs.explorer = {
   title: true,
+  _data: null,  // cached loaded data
+  _viewMode: 'list',  // list | chart_image | chart_box | size_dist | aspect_dist
   render() {
     return `
       <div style="display:flex;flex-direction:column;gap:1.5rem;">
         <div class="card" style="padding:1.5rem;">
-          <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:1rem;align-items:end;">
+          <div style="display:grid;grid-template-columns:1fr 1fr auto auto;gap:1rem;align-items:end;">
             ${imgDirInput('exp-img')}
             ${lblDirInput('exp-lbl')}
             <button class="btn btn-primary" style="height:36px;" onclick="Tabs.explorer.load()">${t('explorer.load')}</button>
           </div>
+          <div id="exp-pbar-wrap" style="display:none;margin-top:0.75rem;">
+            <div class="progress-track" style="height:20px;position:relative;">
+              <div class="progress-fill" id="exp-pbar" style="width:0%;height:100%;"></div>
+              <span id="exp-pbar-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span>
+            </div>
+          </div>
         </div>
         <div style="display:flex;gap:1rem;">
-          <div style="width:200px;">
+          <div style="width:220px;">
             <div class="card-flat" style="padding:1rem;">
+              <div class="text-label" style="margin-bottom:0.5rem;">${t('explorer.view_mode')}</div>
+              <select class="form-input input-normal" id="exp-view-mode" onchange="Tabs.explorer._onViewChange()" style="margin-bottom:0.75rem;">
+                <option value="list">${t('explorer.view_list')}</option>
+                <option value="chart_box">${t('explorer.view_chart_box')}</option>
+                <option value="chart_image">${t('explorer.view_chart_image')}</option>
+                <option value="size_dist">${t('explorer.view_size_dist')}</option>
+                <option value="aspect_dist">${t('explorer.view_aspect_dist')}</option>
+              </select>
               <div class="text-label" style="margin-bottom:0.5rem;">${t('explorer.filter')}</div>
               <div class="form-group" style="margin-bottom:0.5rem;">
                 <label class="form-label">Class</label>
-                <select class="form-input input-normal" id="exp-class-filter"><option value="">All</option></select>
+                <div id="exp-class-filter" style="max-height:150px;overflow-y:auto;border:1px solid var(--border-02);border-radius:4px;padding:0.25rem;"></div>
               </div>
               <div class="form-group">
-                <label class="form-label">Min boxes</label>
-                <input type="number" class="form-input input-normal" value="0" min="0" id="exp-min-boxes">
+                <label class="form-label">Boxes</label>
+                <div style="display:flex;gap:0.25rem;">
+                  <select class="form-input input-normal" id="exp-box-op" style="width:55px;min-width:55px;flex-shrink:0;">
+                    <option value=">=">&gt;=</option>
+                    <option value="=">=</option>
+                    <option value="<=">&lt;=</option>
+                  </select>
+                  <input type="number" class="form-input input-normal" value="0" min="0" id="exp-box-val" style="width:60px;min-width:0;">
+                </div>
               </div>
+              <button class="btn btn-secondary btn-sm" style="width:100%;margin-top:0.5rem;" onclick="Tabs.explorer._applyFilter()">${t('explorer.filter')}</button>
             </div>
             <div class="card-flat" style="padding:1rem;margin-top:0.75rem;">
               <div class="text-label" style="margin-bottom:0.5rem;">${t('explorer.stats')}</div>
@@ -1378,7 +1463,218 @@ Tabs.explorer = {
         </div>
       </div>`;
   },
-  async load() { App.setStatus('Loading dataset...'); }
+  async load() {
+    const img_dir = document.getElementById('exp-img')?.value || G.imgDir;
+    const label_dir = document.getElementById('exp-lbl')?.value || G.lblDir;
+    if (!img_dir) { App.setStatus('Select image directory'); return; }
+    App.setStatus('Loading dataset...');
+    const pbarWrap = document.getElementById('exp-pbar-wrap');
+    if (pbarWrap) pbarWrap.style.display = 'block';
+    try {
+      const r = await API.post('/api/data/explorer', { img_dir, label_dir });
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      this._pollLoad();
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  },
+  async _pollLoad() {
+    try {
+      const s = await API.get('/api/data/explorer/status');
+      const pbar = document.getElementById('exp-pbar');
+      const pbarText = document.getElementById('exp-pbar-text');
+      if (s.running) {
+        const pct = s.total > 0 ? Math.round(s.progress / s.total * 100) : 0;
+        if (pbar) pbar.style.width = pct + '%';
+        if (pbarText) pbarText.textContent = pct + '%';
+        setTimeout(() => this._pollLoad(), 300);
+        return;
+      }
+      if (pbar) pbar.style.width = '100%';
+      if (pbarText) pbarText.textContent = '100%';
+      if (s.files) {
+        this._data = s;
+        this._buildClassFilter(s.class_counts || {});
+        this._renderView();
+        App.setStatus(`Loaded ${s.total} images`);
+      } else {
+        App.setStatus(s.msg || 'Error');
+      }
+      setTimeout(() => {
+        const w = document.getElementById('exp-pbar-wrap');
+        if (w) w.style.display = 'none';
+      }, 1000);
+    } catch(e) {}
+  },
+  _buildClassFilter(class_counts) {
+    const container = document.getElementById('exp-class-filter');
+    if (!container) return;
+    const classes = Object.keys(class_counts).sort((a, b) => Number(a) - Number(b));
+    container.innerHTML = `<label style="display:flex;align-items:center;gap:4px;font-size:11px;padding:2px 0;cursor:pointer;">
+        <input type="checkbox" checked onchange="Tabs.explorer._toggleAll(this.checked)"> <b>All</b>
+      </label>` +
+      classes.map(c => `<label style="display:flex;align-items:center;gap:4px;font-size:11px;padding:2px 0;cursor:pointer;">
+        <input type="checkbox" checked class="exp-cls-cb" value="${c}"> ${c} (${class_counts[c]})
+      </label>`).join('');
+  },
+  _toggleAll(checked) {
+    document.querySelectorAll('.exp-cls-cb').forEach(cb => cb.checked = checked);
+  },
+  _getSelectedClasses() {
+    const cbs = document.querySelectorAll('.exp-cls-cb');
+    if (!cbs.length) return null;  // no filter
+    const selected = [...cbs].filter(cb => cb.checked).map(cb => Number(cb.value));
+    return selected;
+  },
+  _applyFilter() {
+    this._renderView();
+  },
+  _onViewChange() {
+    this._viewMode = document.getElementById('exp-view-mode')?.value || 'list';
+    this._renderView();
+  },
+  _filterFiles() {
+    if (!this._data) return [];
+    const selectedClasses = this._getSelectedClasses();
+    const op = document.getElementById('exp-box-op')?.value || '>=';
+    const val = parseInt(document.getElementById('exp-box-val')?.value || '0', 10);
+    return this._data.files.filter(f => {
+      // class filter
+      if (selectedClasses && selectedClasses.length > 0) {
+        if (f.classes.length === 0 && !selectedClasses.includes(-1)) return false;
+        if (f.classes.length > 0 && !f.classes.some(c => selectedClasses.includes(c))) return false;
+      }
+      // box filter
+      if (op === '>=' && f.boxes < val) return false;
+      if (op === '=' && f.boxes !== val) return false;
+      if (op === '<=' && f.boxes > val) return false;
+      return true;
+    });
+  },
+  _renderView() {
+    const gallery = document.getElementById('exp-gallery');
+    if (!gallery || !this._data) return;
+    const filtered = this._filterFiles();
+    const mode = this._viewMode;
+    // Update stats
+    const stats = document.getElementById('exp-stats');
+    if (stats) {
+      stats.innerHTML = `Total: ${this._data.total}<br>Shown: ${filtered.length}<br>Classes: ${Object.keys(this._data.class_counts || {}).length}`;
+    }
+    if (mode === 'list') {
+      gallery.style.display = 'grid';
+      gallery.innerHTML = filtered.map((f, i) =>
+        `<div class="card-flat" style="padding:0.5rem;font-size:11px;text-align:center;cursor:pointer;" ondblclick="Tabs.explorer._preview(${i})">
+          <div style="font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${f.name}">${f.name}</div>
+          <div class="text-secondary">${f.boxes} boxes</div>
+        </div>`).join('') || '<div class="text-secondary" style="grid-column:1/-1;text-align:center;padding:2rem;">No results</div>';
+      this._filteredFiles = filtered;
+    } else if (mode === 'chart_box' || mode === 'chart_image') {
+      gallery.style.display = 'block';
+      const counts = mode === 'chart_box' ? (this._data.class_counts || {}) : (this._data.img_class_counts || {});
+      this._renderBarChart(gallery, counts, mode === 'chart_box' ? 'Box Count per Class' : 'Image Count per Class');
+    } else if (mode === 'size_dist') {
+      gallery.style.display = 'block';
+      this._renderSizeChart(gallery);
+    } else if (mode === 'aspect_dist') {
+      gallery.style.display = 'block';
+      this._renderAspectChart(gallery);
+    }
+  },
+  _renderBarChart(container, counts, title) {
+    const entries = Object.entries(counts).sort((a, b) => Number(a[0]) - Number(b[0]));
+    if (!entries.length) { container.innerHTML = '<div class="text-secondary" style="text-align:center;padding:2rem;">No data</div>'; return; }
+    const maxVal = Math.max(...entries.map(e => e[1]));
+    const total = entries.reduce((s, e) => s + e[1], 0);
+    const colors = ['#4a9eff','#4ade80','#f59e0b','#ef4444','#a78bfa','#f472b6','#22d3ee','#fb923c','#84cc16','#e879f9'];
+    container.innerHTML = `<div class="card-flat" style="padding:1.25rem;">
+      <div class="text-label" style="margin-bottom:0.5rem;">${title}</div>
+      <div class="text-secondary" style="font-size:11px;margin-bottom:1rem;">Total: ${total} | Classes: ${entries.length}</div>
+      ${entries.map(([cls, cnt], i) => {
+        const pct = maxVal > 0 ? (cnt / maxVal * 100) : 0;
+        const color = colors[i % colors.length];
+        const ratio = total > 0 ? (cnt / total * 100).toFixed(1) : 0;
+        return `<div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:6px;">
+          <span style="min-width:60px;font-size:12px;text-align:right;font-weight:500;">Class ${cls}</span>
+          <div style="flex:1;background:var(--background-neutral-03);border-radius:4px;height:22px;overflow:hidden;position:relative;">
+            <div style="background:${color};height:100%;width:${pct}%;min-width:2px;border-radius:4px;transition:width 0.3s;"></div>
+            <span style="position:absolute;right:6px;top:0;line-height:22px;font-size:10px;color:#ccc;">${ratio}%</span>
+          </div>
+          <span style="min-width:45px;font-size:12px;font-weight:500;">${cnt}</span>
+        </div>`;
+      }).join('')}</div>`;
+  },
+  _renderSizeChart(container) {
+    const sizes = this._data.box_sizes || [];
+    if (!sizes.length) { container.innerHTML = '<div class="text-secondary" style="text-align:center;padding:2rem;">No box data</div>'; return; }
+    let s = 0, m = 0, l = 0;
+    sizes.forEach(b => {
+      const area = b.w * b.h;
+      if (area < 0.01) s++;
+      else if (area < 0.09) m++;
+      else l++;
+    });
+    const cats = [['Small (area<1%)', s, '#4a9eff'], ['Medium (1%~9%)', m, '#4ade80'], ['Large (area>9%)', l, '#f59e0b']];
+    const maxVal = Math.max(s, m, l, 1);
+    const total = s + m + l;
+    container.innerHTML = `<div class="card-flat" style="padding:1.25rem;">
+      <div class="text-label" style="margin-bottom:0.5rem;">Box Size Distribution (normalized area)</div>
+      <div class="text-secondary" style="font-size:11px;margin-bottom:1rem;">Total boxes: ${total}</div>
+      ${cats.map(([label, cnt, color]) => {
+        const pct = cnt / maxVal * 100;
+        const ratio = total > 0 ? (cnt / total * 100).toFixed(1) : 0;
+        return `<div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:6px;">
+          <span style="min-width:130px;font-size:12px;text-align:right;font-weight:500;">${label}</span>
+          <div style="flex:1;background:var(--background-neutral-03);border-radius:4px;height:22px;overflow:hidden;position:relative;">
+            <div style="background:${color};height:100%;width:${pct}%;min-width:2px;border-radius:4px;"></div>
+            <span style="position:absolute;right:6px;top:0;line-height:22px;font-size:10px;color:#ccc;">${ratio}%</span>
+          </div>
+          <span style="min-width:45px;font-size:12px;font-weight:500;">${cnt}</span>
+        </div>`;
+      }).join('')}</div>`;
+  },
+  _renderAspectChart(container) {
+    const ratios = this._data.aspect_ratios || [];
+    if (!ratios.length) { container.innerHTML = '<div class="text-secondary" style="text-align:center;padding:2rem;">No data</div>'; return; }
+    const buckets = {'Portrait (<0.5)': 0, 'Tall (0.5~0.8)': 0, 'Square (0.8~1.2)': 0, 'Wide (1.2~1.8)': 0, 'Ultra-wide (>1.8)': 0};
+    const bcolors = ['#a78bfa','#4a9eff','#4ade80','#f59e0b','#ef4444'];
+    ratios.forEach(r => {
+      if (r < 0.5) buckets['Portrait (<0.5)']++;
+      else if (r < 0.8) buckets['Tall (0.5~0.8)']++;
+      else if (r < 1.2) buckets['Square (0.8~1.2)']++;
+      else if (r < 1.8) buckets['Wide (1.2~1.8)']++;
+      else buckets['Ultra-wide (>1.8)']++;
+    });
+    const maxVal = Math.max(...Object.values(buckets), 1);
+    const total = ratios.length;
+    container.innerHTML = `<div class="card-flat" style="padding:1.25rem;">
+      <div class="text-label" style="margin-bottom:0.5rem;">Aspect Ratio Distribution (W/H)</div>
+      <div class="text-secondary" style="font-size:11px;margin-bottom:1rem;">Total images: ${total}</div>
+      ${Object.entries(buckets).map(([label, cnt], i) => {
+        const pct = cnt / maxVal * 100;
+        const ratio = total > 0 ? (cnt / total * 100).toFixed(1) : 0;
+        return `<div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:6px;">
+          <span style="min-width:130px;font-size:12px;text-align:right;font-weight:500;">${label}</span>
+          <div style="flex:1;background:var(--background-neutral-03);border-radius:4px;height:22px;overflow:hidden;position:relative;">
+            <div style="background:${bcolors[i]};height:100%;width:${pct}%;min-width:2px;border-radius:4px;"></div>
+            <span style="position:absolute;right:6px;top:0;line-height:22px;font-size:10px;color:#ccc;">${ratio}%</span>
+          </div>
+          <span style="min-width:45px;font-size:12px;font-weight:500;">${cnt}</span>
+        </div>`;
+      }).join('')}</div>`;
+  },
+  _filteredFiles: [],
+  async _preview(idx) {
+    const f = this._filteredFiles[idx];
+    if (!f) return;
+    const label_dir = document.getElementById('exp-lbl')?.value || G.lblDir;
+    try {
+      const r = await API.post('/api/data/explorer/preview', { img_path: f.path, label_dir });
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      showDetailModal(f.name, `<div style="text-align:center;">
+        <img src="data:image/jpeg;base64,${r.image}" style="max-width:100%;max-height:70vh;">
+        <div class="text-secondary" style="margin-top:0.5rem;">${r.width}×${r.height} — ${r.box_count} boxes</div>
+      </div>`);
+    } catch(e) { App.setStatus('Error: ' + e.message); }
+  }
 };
 
 /* ── Splitter ───────────────────────────────────────── */
@@ -1388,21 +1684,91 @@ Tabs.splitter = {
     return `
       <div style="max-width:640px;display:flex;flex-direction:column;gap:1.5rem;">
         <div class="card" style="padding:1.5rem;">
-          <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('splitter.input')}</h3>
+          <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('splitter.input')}</h3>
           ${imgDirInput('split-img')}
           ${lblDirInput('split-lbl')}
           ${outDirInput('split-out')}
         </div>
         <div class="card" style="padding:1.5rem;">
+          <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('splitter.strategy')}</h3>
+          <select class="form-input input-normal" id="split-strategy" style="margin-bottom:1rem;">
+            <option value="random">${t('splitter.strategy_random')}</option>
+            <option value="stratified">${t('splitter.strategy_stratified')}</option>
+          </select>
+          <div id="split-strategy-desc" class="text-secondary" style="font-size:11px;margin-bottom:1rem;">${t('splitter.strategy_random_desc')}</div>
+        </div>
+        <div class="card" style="padding:1.5rem;" id="split-ratio-section">
           <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('splitter.ratio')}</h3>
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem;">
-            <div class="form-group"><label class="form-label">${t('splitter.train')}</label><input type="number" class="form-input input-normal" value="0.7" min="0" max="1" step="0.05"></div>
-            <div class="form-group"><label class="form-label">${t('splitter.val')}</label><input type="number" class="form-input input-normal" value="0.2" min="0" max="1" step="0.05"></div>
-            <div class="form-group"><label class="form-label">${t('splitter.test')}</label><input type="number" class="form-input input-normal" value="0.1" min="0" max="1" step="0.05"></div>
+            <div class="form-group"><label class="form-label">${t('splitter.train')}</label><input type="number" class="form-input input-normal" value="0.7" min="0" max="1" step="0.05" id="split-train"></div>
+            <div class="form-group"><label class="form-label">${t('splitter.val')}</label><input type="number" class="form-input input-normal" value="0.2" min="0" max="1" step="0.05" id="split-val"></div>
+            <div class="form-group"><label class="form-label">${t('splitter.test')}</label><input type="number" class="form-input input-normal" value="0.1" min="0" max="1" step="0.05" id="split-test"></div>
           </div>
-          <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.75rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" checked> ${t('splitter.stratified')}</label>
+          <div class="text-secondary" style="font-size:11px;margin-top:0.5rem;">${t('splitter.ratio_hint')}</div>
         </div>
-        <button class="btn btn-primary" onclick="App.setStatus('Splitting...')">${t('splitter.run')}</button>
+        <div id="split-pbar-wrap" style="display:none;">
+          <div class="progress-track" style="height:20px;position:relative;">
+            <div class="progress-fill" id="split-pbar" style="width:0%;height:100%;"></div>
+            <span id="split-pbar-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span>
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="Tabs.splitter.run()">${t('splitter.run')}</button>
+        <div id="split-result" class="text-secondary"></div>
       </div>`;
+  },
+  async init() {
+    // Strategy description update
+    setTimeout(() => {
+      const sel = document.getElementById('split-strategy');
+      if (sel) sel.onchange = () => {
+        const desc = document.getElementById('split-strategy-desc');
+        if (desc) desc.textContent = t('splitter.strategy_' + sel.value + '_desc');
+      };
+    }, 100);
+  },
+  async run() {
+    const img_dir = document.getElementById('split-img')?.value || G.imgDir;
+    const label_dir = document.getElementById('split-lbl')?.value || G.lblDir;
+    const output_dir = document.getElementById('split-out')?.value;
+    if (!img_dir || !output_dir) { App.setStatus('Select directories'); return; }
+    const train = parseFloat(document.getElementById('split-train')?.value || '0.7');
+    const val = parseFloat(document.getElementById('split-val')?.value || '0.2');
+    const test = parseFloat(document.getElementById('split-test')?.value || '0.1');
+    const strategy = document.getElementById('split-strategy')?.value || 'random';
+    const pbarWrap = document.getElementById('split-pbar-wrap');
+    if (pbarWrap) pbarWrap.style.display = 'block';
+    App.setStatus('Splitting...');
+    try {
+      const r = await API.post('/api/data/splitter', { img_dir, label_dir, output_dir, train, val, test, strategy });
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      this._poll();
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  },
+  async _poll() {
+    try {
+      const s = await API.get('/api/data/splitter/status');
+      const pbar = document.getElementById('split-pbar');
+      const pbarText = document.getElementById('split-pbar-text');
+      if (s.running) {
+        const pct = s.total > 0 ? Math.round(s.progress / s.total * 100) : 0;
+        if (pbar) pbar.style.width = pct + '%';
+        if (pbarText) pbarText.textContent = pct + '%';
+        setTimeout(() => this._poll(), 500);
+        return;
+      }
+      if (pbar) pbar.style.width = '100%';
+      if (pbarText) pbarText.textContent = '100%';
+      if (s.results) {
+        const res = document.getElementById('split-result');
+        if (res) res.innerHTML = `✅ Train: ${s.results.train||0}, Val: ${s.results.val||0}, Test: ${s.results.test||0}`;
+        App.setStatus(`Split complete — Train: ${s.results.train||0}, Val: ${s.results.val||0}, Test: ${s.results.test||0}`);
+      } else {
+        App.setStatus(s.msg || 'Complete');
+      }
+      setTimeout(() => {
+        const w = document.getElementById('split-pbar-wrap');
+        if (w) w.style.display = 'none';
+      }, 2000);
+    } catch(e) {}
   }
 };

@@ -324,7 +324,7 @@ class_styles:
     color: null
     enabled: true
     thickness: null
-conf_threshold: 0.24
+conf_threshold: 0.25
 custom_model_types:
   custom_1:
     attr_roles:
@@ -365,7 +365,7 @@ custom_model_types:
     - conf_class6
     - conf_class7
     - conf_class8
-    conf_threshold: 0.96
+    conf_threshold: 0.25
     coord_format: xyxy
     dim_roles:
     - batch
@@ -376,7 +376,7 @@ custom_model_types:
     output_index: 0
 default_model_path: ''
 label_size: 0.55
-model_type: darknet
+model_type: seg_yolo
 models_dir: Models
 show_confidence: true
 show_label_bg: true

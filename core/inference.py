@@ -45,6 +45,31 @@ class ClassificationResult:
     infer_ms: float
 
 
+class PreprocessBuffer:
+    """전처리 버퍼 재사용 — 동일 input_size에 대해 배열 재할당 방지"""
+    __slots__ = ('_padded', '_rgb', '_tensor', '_size')
+
+    def __init__(self):
+        self._padded = None
+        self._rgb = None
+        self._tensor = None
+        self._size = None
+
+    def get_buffers(self, input_size: tuple):
+        nh, nw = input_size
+        if self._size == input_size and self._tensor is not None:
+            return self._padded, self._rgb, self._tensor
+        self._padded = np.empty((nh, nw, 3), dtype=np.uint8)
+        self._rgb = np.empty((nh, nw, 3), dtype=np.uint8)
+        self._tensor = np.empty((1, 3, nh, nw), dtype=np.float32)
+        self._size = input_size
+        return self._padded, self._rgb, self._tensor
+
+
+# 모듈 레벨 싱글톤 버퍼 (단일 스레드 추론용)
+_preproc_buf = PreprocessBuffer()
+
+
 def letterbox(img: np.ndarray, new_shape: tuple) -> tuple:
     """비율 유지 리사이즈 + 패딩. (padded_img, ratio, (pad_w, pad_h)) 반환"""
     h, w = img.shape[:2]
@@ -62,11 +87,17 @@ def letterbox(img: np.ndarray, new_shape: tuple) -> tuple:
 
 
 def preprocess(frame: np.ndarray, input_size: tuple) -> np.ndarray:
-    """BGR frame → NCHW float32 [0,1]"""
-    padded, _, _ = letterbox(frame, input_size)
-    rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-    tensor = np.ascontiguousarray(rgb.transpose(2, 0, 1)[np.newaxis], dtype=np.float32) / 255.0
-    return tensor
+    """BGR frame → NCHW float32 [0,1] (버퍼 재사용)"""
+    padded, ratio, pad = letterbox(frame, input_size)
+    return _padded_to_tensor(padded, input_size)
+
+
+def _padded_to_tensor(padded: np.ndarray, input_size: tuple) -> np.ndarray:
+    """letterbox 결과 → NCHW float32 [0,1] (버퍼 재사용, 내부용)"""
+    _, rgb_buf, tensor_buf = _preproc_buf.get_buffers(input_size)
+    cv2.cvtColor(padded, cv2.COLOR_BGR2RGB, dst=rgb_buf)
+    np.divide(rgb_buf.transpose(2, 0, 1), 255.0, out=tensor_buf[0])
+    return tensor_buf
 
 
 def preprocess_darknet(frame: np.ndarray, input_size: tuple) -> np.ndarray:
@@ -79,44 +110,45 @@ def preprocess_darknet(frame: np.ndarray, input_size: tuple) -> np.ndarray:
 
 
 def _nms(boxes_xyxy, scores, class_ids, iou_thres):
-    """클래스별 NMS → 최종 인덱스 반환"""
-    keep = []
-    for cid in np.unique(class_ids):
-        mask = class_ids == cid
-        idxs = np.where(mask)[0]
-        b = boxes_xyxy[mask]
-        # cv2.dnn.NMSBoxes는 [x, y, w, h] 포맷 필요 → xyxy를 xywh로 변환
-        b_xywh = np.empty_like(b)
-        b_xywh[:, 0] = b[:, 0]
-        b_xywh[:, 1] = b[:, 1]
-        b_xywh[:, 2] = b[:, 2] - b[:, 0]
-        b_xywh[:, 3] = b[:, 3] - b[:, 1]
-        s = scores[mask].tolist()
-        if len(s) == 0:
-            continue
-        nms_idx = cv2.dnn.NMSBoxes(b_xywh.tolist(), s, score_threshold=0.0, nms_threshold=iou_thres)
-        for i in nms_idx:
-            keep.append(idxs[int(i)])
-    return keep
+    """클래스별 NMS → 최종 인덱스 반환 (offset 트릭으로 단일 호출)"""
+    if len(scores) == 0:
+        return []
+    # 클래스별 offset을 적용하여 class-agnostic NMS 한 번으로 처리
+    max_coord = boxes_xyxy.max()
+    offsets = class_ids.astype(np.float32) * (max_coord + 1.0)
+    shifted = boxes_xyxy.copy()
+    shifted[:, 0] += offsets
+    shifted[:, 1] += offsets
+    shifted[:, 2] += offsets
+    shifted[:, 3] += offsets
+    # xywh 변환
+    b_xywh = np.empty_like(shifted)
+    b_xywh[:, 0] = shifted[:, 0]
+    b_xywh[:, 1] = shifted[:, 1]
+    b_xywh[:, 2] = shifted[:, 2] - shifted[:, 0]
+    b_xywh[:, 3] = shifted[:, 3] - shifted[:, 1]
+    nms_idx = cv2.dnn.NMSBoxes(b_xywh.tolist(), scores.tolist(),
+                                score_threshold=0.0, nms_threshold=iou_thres)
+    return [int(i) for i in nms_idx] if len(nms_idx) > 0 else []
 
 
 def postprocess_v8(output: np.ndarray, conf: float,
                    ratio: float, pad: tuple, orig_shape: tuple) -> DetectionResult:
     """YOLOv8/v9/v11 출력: (1, 4+N, 8400)"""
     logits = output[0]                    # (4+N, 8400)
-    logits = logits.T                     # (8400, 4+N)
-    boxes_xywh = logits[:, :4]
-    class_scores = logits[:, 4:]
-
-    max_scores = class_scores.max(axis=1)
-    class_ids = class_scores.argmax(axis=1).astype(np.int32)
+    # transpose 전에 class score max로 조기 필터링
+    class_part = logits[4:]               # (N, 8400)
+    max_scores = class_part.max(axis=0)   # (8400,)
     mask = max_scores > conf
     if not mask.any():
         return DetectionResult.empty()
 
-    boxes_xywh = boxes_xywh[mask]
-    scores = max_scores[mask]
-    class_ids = class_ids[mask]
+    # 필터링된 것만 처리
+    filtered = logits[:, mask].T          # (K, 4+N) where K << 8400
+    boxes_xywh = filtered[:, :4]
+    class_scores = filtered[:, 4:]
+    scores = class_scores.max(axis=1)
+    class_ids = class_scores.argmax(axis=1).astype(np.int32)
 
     # xywh(letterbox 공간) → xyxy(원본 공간)
     boxes_xyxy = _xywh_to_xyxy_unscale(boxes_xywh, ratio, pad, orig_shape)
@@ -452,6 +484,19 @@ def convert_darknet_to_unified(
     )
 
 
+def _make_batch_tensor(tensor: np.ndarray, bs: int, model_info: ModelInfo) -> np.ndarray:
+    """고정 배치 모델용: 단일 이미지 텐서를 배치 크기로 확장. 캐싱된 버퍼 재사용."""
+    if bs <= 1:
+        return tensor
+    cache = getattr(model_info, '_batch_buf', None)
+    if cache is not None and cache.shape[0] == bs and cache.shape[1:] == tensor.shape[1:]:
+        cache[0] = tensor[0]
+        return cache
+    buf = np.repeat(tensor, bs, axis=0)
+    model_info._batch_buf = buf
+    return buf
+
+
 def run_inference(model_info: ModelInfo, frame: np.ndarray,
                   conf: float) -> DetectionResult:
     if model_info.session is None:
@@ -463,45 +508,45 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
 
     if model_info.model_type == "darknet":
         tensor = preprocess_darknet(frame, model_info.input_size)
-        if bs > 1:
-            tensor = np.repeat(tensor, bs, axis=0)
+        tensor = _make_batch_tensor(tensor, bs, model_info)
         output = model_info.session.run(None, {model_info.input_name: tensor})
         infer_ms = (time.perf_counter() - t0) * 1000.0
         result = postprocess_darknet(output[0][:1], conf, orig_shape)
     elif model_info.model_type == "custom":
-        _, ratio, pad = letterbox(frame, model_info.input_size)
-        tensor = preprocess(frame, model_info.input_size)
-        if bs > 1:
-            tensor = np.repeat(tensor, bs, axis=0)
+        padded, ratio, pad = letterbox(frame, model_info.input_size)
+        tensor = _padded_to_tensor(padded, model_info.input_size)
+        tensor = _make_batch_tensor(tensor, bs, model_info)
         output = model_info.session.run(None, {model_info.input_name: tensor})
         infer_ms = (time.perf_counter() - t0) * 1000.0
-        from core.app_config import AppConfig
-        cmt = AppConfig().custom_model_types.get(model_info.custom_type_name)
+        # custom_model_type 정보는 ModelInfo에 캐싱된 것을 우선 사용
+        cmt = getattr(model_info, '_cached_cmt', None)
+        if cmt is None:
+            from core.app_config import AppConfig
+            cmt = AppConfig().custom_model_types.get(model_info.custom_type_name)
+            if cmt:
+                model_info._cached_cmt = cmt
         if cmt:
             result = postprocess_custom(output, cmt, conf, ratio, pad, orig_shape)
         else:
             result = DetectionResult.empty()
     elif model_info.model_type == "detr":
-        _, ratio, pad = letterbox(frame, model_info.input_size)
-        tensor = preprocess(frame, model_info.input_size)
-        if bs > 1:
-            tensor = np.repeat(tensor, bs, axis=0)
+        padded, ratio, pad = letterbox(frame, model_info.input_size)
+        tensor = _padded_to_tensor(padded, model_info.input_size)
+        tensor = _make_batch_tensor(tensor, bs, model_info)
         output = model_info.session.run(None, {model_info.input_name: tensor})
         infer_ms = (time.perf_counter() - t0) * 1000.0
         result = postprocess_detr(output, conf, ratio, pad, orig_shape)
     elif model_info.model_type == "yolo_nas":
-        _, ratio, pad = letterbox(frame, model_info.input_size)
-        tensor = preprocess(frame, model_info.input_size)
-        if bs > 1:
-            tensor = np.repeat(tensor, bs, axis=0)
+        padded, ratio, pad = letterbox(frame, model_info.input_size)
+        tensor = _padded_to_tensor(padded, model_info.input_size)
+        tensor = _make_batch_tensor(tensor, bs, model_info)
         output = model_info.session.run(None, {model_info.input_name: tensor})
         infer_ms = (time.perf_counter() - t0) * 1000.0
         result = postprocess_yolo_nas(output, conf, ratio, pad, orig_shape)
     else:
-        _, ratio, pad = letterbox(frame, model_info.input_size)
-        tensor = preprocess(frame, model_info.input_size)
-        if bs > 1:
-            tensor = np.repeat(tensor, bs, axis=0)
+        padded, ratio, pad = letterbox(frame, model_info.input_size)
+        tensor = _padded_to_tensor(padded, model_info.input_size)
+        tensor = _make_batch_tensor(tensor, bs, model_info)
         output = model_info.session.run(None, {model_info.input_name: tensor})
         infer_ms = (time.perf_counter() - t0) * 1000.0
         single_out = output[0][:1]  # 첫 번째 결과만
@@ -585,6 +630,35 @@ def _softmax(x: np.ndarray) -> np.ndarray:
     return e / e.sum()
 
 
+def _build_feed(model_info: ModelInfo, tensor: np.ndarray) -> dict:
+    """모델의 모든 입력에 대한 feed dict 구성. 이미지 텐서는 input_name에 매핑."""
+    session = model_info.session
+    inputs = session.get_inputs()
+    if len(inputs) == 1:
+        return {model_info.input_name: tensor}
+    feed = {}
+    for inp in inputs:
+        if inp.name == model_info.input_name:
+            feed[inp.name] = tensor
+        elif "mask" in inp.name.lower():
+            # attention_mask: ones
+            shape = [s if isinstance(s, int) and s > 0 else 1 for s in inp.shape]
+            feed[inp.name] = np.ones(shape, dtype=np.int64)
+        elif "id" in inp.name.lower() or "token" in inp.name.lower():
+            # input_ids / token_type_ids: zeros
+            shape = [s if isinstance(s, int) and s > 0 else 1 for s in inp.shape]
+            feed[inp.name] = np.zeros(shape, dtype=np.int64)
+        elif "position" in inp.name.lower():
+            shape = [s if isinstance(s, int) and s > 0 else 1 for s in inp.shape]
+            seq_len = shape[-1] if len(shape) >= 2 else 1
+            feed[inp.name] = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+        else:
+            shape = [s if isinstance(s, int) and s > 0 else 1 for s in inp.shape]
+            dtype = np.float32 if "float" in (inp.type or "tensor(float)") else np.int64
+            feed[inp.name] = np.zeros(shape, dtype=dtype)
+    return feed
+
+
 def run_classification(model_info: ModelInfo, frame: np.ndarray,
                        top_k: int = 5) -> ClassificationResult:
     """Classification 모델 추론"""
@@ -596,10 +670,10 @@ def run_classification(model_info: ModelInfo, frame: np.ndarray,
     tensor = preprocess_classification(frame, model_info.input_size)
     if bs > 1:
         tensor = np.repeat(tensor, bs, axis=0)
-    output = model_info.session.run(None, {model_info.input_name: tensor})
+    output = model_info.session.run(None, _build_feed(model_info, tensor))
     infer_ms = (time.perf_counter() - t0) * 1000.0
 
-    logits = output[0][0].flatten()  # 첫 번째 결과만
+    logits = output[0][0].flatten()
     probs = _softmax(logits)
     top_indices = np.argsort(probs)[::-1][:top_k]
     top_results = [(int(i), float(probs[i])) for i in top_indices]
@@ -611,3 +685,132 @@ def run_classification(model_info: ModelInfo, frame: np.ndarray,
         probabilities=probs,
         infer_ms=infer_ms,
     )
+
+
+# ── Segmentation Inference ──────────────────────────────
+@dataclass
+class SegmentationResult:
+    mask: np.ndarray        # (H, W) class index map
+    num_classes: int
+    infer_ms: float
+
+
+def run_segmentation(model_info: ModelInfo, frame: np.ndarray) -> SegmentationResult:
+    """Segmentation 모델 추론 → class mask"""
+    if model_info.session is None:
+        return SegmentationResult(np.zeros((1, 1), dtype=np.uint8), 0, 0.0)
+    t0 = time.perf_counter()
+    h_orig, w_orig = frame.shape[:2]
+
+    if model_info.model_type.startswith("seg_yolo"):
+        padded, ratio, pad = letterbox(frame, model_info.input_size)
+        tensor = _padded_to_tensor(padded, model_info.input_size)
+    else:
+        tensor = preprocess_classification(frame, model_info.input_size)
+    bs = model_info.batch_size
+    if bs > 1:
+        tensor = np.repeat(tensor, bs, axis=0)
+    output = model_info.session.run(None, _build_feed(model_info, tensor))
+    infer_ms = (time.perf_counter() - t0) * 1000.0
+
+    # YOLO-seg: output0=(1,116,8400) det+mask_coeff, output1=(1,32,160,160) protos
+    if (model_info.model_type.startswith("seg_yolo") and len(output) >= 2
+            and output[0].ndim == 3 and output[1].ndim == 4):
+        det = output[0][0]   # (116, 8400)
+        protos = output[1][0]  # (32, mh, mw)
+        nm = protos.shape[0]  # 32
+        nc = det.shape[0] - 4 - nm  # num_classes
+        # Confidence filter
+        scores_all = det[4:4+nc, :]  # (nc, 8400)
+        max_scores = scores_all.max(axis=0)  # (8400,)
+        conf = 0.25
+        keep = max_scores > conf
+        if keep.sum() == 0:
+            return SegmentationResult(np.zeros((h_orig, w_orig), dtype=np.uint8), nc, infer_ms)
+        det_keep = det[:, keep]  # (116, N)
+        scores_keep = scores_all[:, keep]  # (nc, N)
+        class_ids = scores_keep.argmax(axis=0)  # (N,)
+        # Boxes: cx,cy,w,h → x1,y1,x2,y2
+        cx, cy, bw, bh = det_keep[0], det_keep[1], det_keep[2], det_keep[3]
+        x1 = cx - bw / 2; y1 = cy - bh / 2; x2 = cx + bw / 2; y2 = cy + bh / 2
+        # NMS
+        boxes_nms = np.stack([x1, y1, bw, bh], axis=1).tolist()
+        confs_nms = max_scores[keep].tolist()
+        indices = cv2.dnn.NMSBoxes(boxes_nms, confs_nms, conf, 0.45)
+        if len(indices) == 0:
+            return SegmentationResult(np.zeros((h_orig, w_orig), dtype=np.uint8), nc, infer_ms)
+        indices = np.array(indices).flatten()
+        # Mask coefficients
+        mask_coeffs = det_keep[4+nc:, indices].T  # (N_nms, 32)
+        # Matmul with protos: (N_nms, 32) @ (32, mh*mw) → (N_nms, mh*mw)
+        mh, mw = protos.shape[1], protos.shape[2]
+        masks = (mask_coeffs @ protos.reshape(nm, -1)).reshape(-1, mh, mw)
+        # Sigmoid
+        masks = 1.0 / (1.0 + np.exp(-masks))
+        # Composite mask: assign class with highest mask score per pixel
+        ih, iw = model_info.input_size
+        composite = np.zeros((ih, iw), dtype=np.uint8)
+        for i, idx in enumerate(indices):
+            m = cv2.resize(masks[i], (iw, ih), interpolation=cv2.INTER_LINEAR)
+            cid = int(class_ids[idx]) + 1  # +1 so background=0
+            composite[m > 0.5] = cid
+        # Remove padding, scale to original
+        pad_h, pad_w = int(round(pad[1])), int(round(pad[0]))
+        unpadded = composite[pad_h:ih-pad_h if pad_h else ih, pad_w:iw-pad_w if pad_w else iw]
+        mask = cv2.resize(unpadded, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
+        return SegmentationResult(mask=mask, num_classes=nc, infer_ms=infer_ms)
+
+    # Semantic segmentation: single output (B,C,H,W)
+    logits = None
+    for o in output:
+        if o.ndim == 4:
+            _, c, oh, ow = o.shape
+            min_spatial = min(model_info.input_size) // 4
+            if c <= 256 and oh >= min_spatial and ow >= min_spatial:
+                logits = o[0]
+                break
+    if logits is None:
+        first = output[0][0] if output[0].ndim >= 3 else output[0]
+        if first.ndim == 3 and first.shape[0] <= 256:
+            logits = first
+        else:
+            return SegmentationResult(np.zeros((h_orig, w_orig), dtype=np.uint8), 0, infer_ms)
+
+    if logits.ndim == 3:
+        mask = np.argmax(logits, axis=0).astype(np.uint8)
+        mask = cv2.resize(mask, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
+        num_classes = logits.shape[0]
+    elif logits.ndim == 2:
+        mask = (logits > 0.5).astype(np.uint8)
+        mask = cv2.resize(mask, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
+        num_classes = 1
+    else:
+        mask = np.zeros((h_orig, w_orig), dtype=np.uint8)
+        num_classes = 0
+    return SegmentationResult(mask=mask, num_classes=num_classes, infer_ms=infer_ms)
+
+
+# ── Embedding Inference ─────────────────────────────────
+@dataclass
+class EmbeddingResult:
+    embedding: np.ndarray   # normalized feature vector
+    dim: int
+    infer_ms: float
+
+
+def run_embedding(model_info: ModelInfo, frame: np.ndarray) -> EmbeddingResult:
+    """Embedding 모델 추론 → normalized feature vector"""
+    if model_info.session is None:
+        return EmbeddingResult(np.zeros(1), 0, 0.0)
+    t0 = time.perf_counter()
+    tensor = preprocess_classification(frame, model_info.input_size)
+    bs = model_info.batch_size
+    if bs > 1:
+        tensor = np.repeat(tensor, bs, axis=0)
+    output = model_info.session.run(None, _build_feed(model_info, tensor))
+    infer_ms = (time.perf_counter() - t0) * 1000.0
+    emb = output[0][0].flatten().astype(np.float32)
+    norm = np.linalg.norm(emb)
+    if norm > 0:
+        emb = emb / norm
+    return EmbeddingResult(embedding=emb, dim=len(emb), infer_ms=infer_ms)
