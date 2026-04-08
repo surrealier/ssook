@@ -25,14 +25,14 @@
 | 🔬 | **Inference Analysis?** | Inspect letterbox, tensor heatmap, and detection results on a single image |
 | ⚔️ | **Model A/B Compare?** | Run two models on the same images, navigate with a slider |
 | 🎯 | **FP/FN Error Analysis?** | Auto-classify false positives & negatives by size (S/M/L) and position |
-| 📈 | **Confidence Optimizer?** | Sweep thresholds per class, find the F1-maximizing confidence |
+| 📈 | **Confidence Optimizer?** | Sweep thresholds per class, find the F1-maximizing confidence with PR curves |
 | 🗺️ | **Embedding Visualization?** | t-SNE / UMAP / PCA 2D scatter plots from any feature extractor |
 | ⚡ | **Benchmark?** | Measure FPS, latency (P50/P95/P99), CPU/GPU usage with system info export |
 | 🖼️ | **Segmentation Evaluation?** | mIoU, mDice, per-class IoU/Dice against GT masks |
 | 🔤 | **CLIP Zero-Shot?** | Load image + text encoders, evaluate zero-shot classification |
-| 🧲 | **Embedder Evaluation?** | Retrieval@1/@K, cosine similarity from folder-structured datasets |
-| 📁 | **Dataset Explorer?** | FiftyOne-style thumbnail gallery with class/size/aspect filters |
-| ✂️ | **Dataset Splitter?** | Stratified train/val/test split preserving class balance |
+| 🧲 | **Embedder Evaluation?** | Retrieval@1/@K, cosine similarity, multi-image comparison |
+| 📁 | **Dataset Explorer?** | Gallery with multi-class filter, box filter, class/size/aspect distribution charts |
+| ✂️ | **Dataset Splitter?** | Random or stratified train/val/test split with progress tracking |
 | 🔄 | **Format Converter?** | YOLO ↔ COCO JSON ↔ Pascal VOC XML batch conversion |
 | 🏷️ | **Class Remapper?** | Remap, merge, or delete class IDs in bulk |
 | 🔗 | **Dataset Merger?** | Combine datasets with dHash duplicate detection |
@@ -159,6 +159,24 @@ show_confidence: true
 ```bash
 python -m pytest tests/ -v
 ```
+
+---
+
+## 📋 Changelog
+
+### v1.2.0
+- **Explorer**: Async loading with progress bar, double-click image preview with bbox overlay, multi-class checkbox filter, box operator filter (>=, =, <=), 5 view modes (file list, class distribution by box/image, box size distribution, aspect ratio distribution)
+- **Splitter**: Strategy selection (random / stratified), custom ratio inputs, 0-ratio skip, progress bar
+- **Conf Optimizer**: Per-class PR curve visualization, F1 display fix
+- **Embedder**: Multi-image cosine similarity comparison
+- **Recursive folder support**: Remapper, Merger, Sampler, Anomaly Detector, Quality Checker, Duplicate Detector
+- **Merger**: dHash threshold description and input binding
+- **i18n**: Korean translations for new UI elements
+
+### v1.1.0
+- Web UI overhaul with analysis tabs, class mapping, model downloads
+- Benchmark system info export
+- Rebrand to ssook
 
 ---
 

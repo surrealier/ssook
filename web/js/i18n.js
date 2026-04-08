@@ -135,6 +135,44 @@ const I18n = {
     'splitter.strategy_stratified_desc': { en: 'Split while preserving class distribution balance.', ko: '클래스 분포 균형을 유지하며 분할합니다.' },
     // Generic tab
     'tab.coming_soon':     { en: 'Full implementation coming soon', ko: '전체 구현 예정' },
+    // Common UI labels (tabs-extra)
+    'common.recursive':    { en: 'Include subfolders (Recursive)', ko: '하위 폴더 포함 (Recursive)' },
+    'common.complete':     { en: 'Complete',           ko: '완료' },
+    'common.select_dirs':  { en: 'Select directories', ko: '디렉토리를 선택하세요' },
+    'common.select_model_img': { en: 'Select model and image directory', ko: '모델과 이미지 디렉토리를 선택하세요' },
+    'common.no_results':   { en: 'No results',        ko: '결과 없음' },
+    // Analysis tab labels
+    'analysis.conf_opt':   { en: 'Confidence Threshold Optimizer', ko: 'Confidence 임계값 최적화' },
+    'analysis.embedding':  { en: 'Embedding Visualization',        ko: '임베딩 시각화' },
+    'analysis.error':      { en: 'Error Analysis',    ko: '오탐/미탐 분석' },
+    'analysis.model_cmp':  { en: 'Model Compare',     ko: '모델 비교' },
+    'analysis.pr_curve':   { en: 'PR Curve',          ko: 'PR 곡선' },
+    // Data tab labels
+    'data.converter':      { en: 'Format Converter',  ko: '포맷 변환기' },
+    'data.remapper':       { en: 'Class Remapper',    ko: '클래스 매핑' },
+    'data.merger':         { en: 'Dataset Merger',     ko: '데이터셋 병합' },
+    'data.sampler':        { en: 'Smart Sampler',      ko: '스마트 샘플링' },
+    'data.merge':          { en: 'Merge',              ko: '병합' },
+    'data.apply_remap':    { en: 'Apply Remap',        ko: '매핑 적용' },
+    // Quality tab labels
+    'quality.anomaly':     { en: 'Label Anomaly Detector',  ko: '라벨 이상 탐지기' },
+    'quality.image':       { en: 'Image Quality Checker',   ko: '이미지 품질 검사기' },
+    'quality.duplicate':   { en: 'Near-Duplicate Detector', ko: '근접 중복 탐지기' },
+    'quality.leaky':       { en: 'Leaky Split Detector',    ko: '누수 분할 탐지기' },
+    'quality.similarity':  { en: 'Similarity Search',       ko: '유사 이미지 검색' },
+    // Batch
+    'batch.inference':     { en: 'Batch Inference',    ko: '일괄 추론' },
+    'batch.augmentation':  { en: 'Augmentation Preview', ko: '증강 미리보기' },
+    // Table headers
+    'th.class':       { en: 'Class',       ko: '클래스' },
+    'th.precision':   { en: 'Precision',   ko: '정밀도' },
+    'th.recall':      { en: 'Recall',      ko: '재현율' },
+    'th.threshold':   { en: 'Threshold',   ko: '임계값' },
+    'th.file':        { en: 'File',        ko: '파일' },
+    'th.type':        { en: 'Type',        ko: '유형' },
+    'th.details':     { en: 'Details',     ko: '상세' },
+    'th.severity':    { en: 'Severity',    ko: '심각도' },
+    'th.issues':      { en: 'Issues',      ko: '문제' },
   },
 
   t(key, params) {
