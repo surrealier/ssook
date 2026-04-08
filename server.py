@@ -64,7 +64,7 @@ def _draw_label(frame, text, x1, y1, color, font_scale, font_thick, show_bg):
         txt_color = color
     cv2.putText(frame, text, (x1 + 1, ty - baseline), cv2.FONT_HERSHEY_SIMPLEX, font_scale, txt_color, font_thick, cv2.LINE_AA)
 
-app = FastAPI(title="ssook", version="1.1.0")
+app = FastAPI(title="ssook", version="1.2.0")
 
 # 백그라운드 작업용 스레드 풀 (최대 4개 동시 작업)
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ssook-bg")
