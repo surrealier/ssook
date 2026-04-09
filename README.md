@@ -10,7 +10,7 @@
 [![FastAPI](https://img.shields.io/badge/backend-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![ONNX Runtime](https://img.shields.io/badge/runtime-ONNX-005CED?logo=onnx&logoColor=white)](https://onnxruntime.ai)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.2.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-1.3.1-blue)](#)
 
 </div>
 
@@ -36,13 +36,12 @@
 | 🔄 | **Format Converter?** | YOLO ↔ COCO JSON ↔ Pascal VOC XML batch conversion |
 | 🏷️ | **Class Remapper?** | Remap, merge, or delete class IDs in bulk |
 | 🔗 | **Dataset Merger?** | Combine datasets with dHash duplicate detection |
-| 📊 | **Smart Sampler?** | Random / Balanced / Stratified sampling to target count |
+| 📊 | **Smart Sampler?** | Balanced (equal per-class + diversity), Random, Stratified sampling |
 | 🛡️ | **Label Anomaly Detector?** | Find OOB boxes, size outliers, excessive overlaps |
 | 🖼️ | **Image Quality Checker?** | Detect blur, brightness issues, overexposure, abnormal aspect ratios |
 | 👯 | **Near-Duplicate Detector?** | dHash perceptual hashing with configurable threshold |
 | 🔍 | **Leaky Split Detector?** | Cross-split (train/val/test) duplicate detection |
 | 🔎 | **Similarity Search?** | Query any image → top-K most similar results |
-| 📦 | **Batch Inference?** | Folder → model → YOLO txt / JSON / CSV export |
 | 🎨 | **Augmentation Preview?** | Mosaic, flip, rotate, Albumentations — preview before applying |
 
 **All in one window. No code required.**
@@ -102,7 +101,7 @@ python run_web.py
 ## 📖 Quick Start
 
 ```
-1. Launch  →  Settings tab  →  Download test models or load your own
+1. Launch  →  Settings tab  →  Download test models & sample data
 2. Viewer tab  →  Open video/image  →  See real-time inference
 3. Evaluation tab  →  Add models, set GT labels  →  Run evaluation
 4. Analysis tab  →  Dive into FP/FN, confidence optimization, embeddings
@@ -163,6 +162,17 @@ python -m pytest tests/ -v
 ---
 
 ## 📋 Changelog
+
+### v1.3.1
+- **Sample Data**: Built-in test images (bus.jpg, zidane.jpg) and video (people.mp4)
+- **COCO128**: Dataset download link in Settings tab
+- **Bugfix**: Fix frozen exe crash (`sys.stderr=None` in PyInstaller)
+
+### v1.3.0
+- **Smart Sampler**: Balanced mode now distributes target count equally across classes with farthest-point sampling for spatial diversity
+- **Progress Bars**: All tabs unified to explorer-style progress bar (20px height, % text overlay)
+- **Remapper**: Converted to async with progress tracking
+- **Removed**: Batch Inference tab (redundant with Viewer); Augmentation moved to Data section
 
 ### v1.2.0
 - **Explorer**: Async loading with progress bar, double-click image preview with bbox overlay, multi-class checkbox filter, box operator filter (>=, =, <=), 5 view modes (file list, class distribution by box/image, box size distribution, aspect ratio distribution)
