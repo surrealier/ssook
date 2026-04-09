@@ -237,12 +237,13 @@ function showHelp(tabName) {
 
     const page = pages[idx];
     const items = page.items || [];
+    const _ht = (v) => typeof v === 'object' ? (v[I18n.getLang()] || v.en || '') : v;
 
     /* nav bar */
     const dots = pages.map((_, i) => `<span class="help-nav-dot${i===idx?' active':''}"></span>`).join('');
     nav.innerHTML = `<button id="help-prev"${idx===0?' disabled':''}>◀</button>
       <div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
-        <span class="help-nav-title">${page.page}</span>
+        <span class="help-nav-title">${_ht(page.page)}</span>
         <div class="help-nav-dots">${dots}</div>
         <span style="color:#888;font-size:10px;">${idx+1} / ${pages.length}</span>
       </div>
@@ -259,7 +260,7 @@ function showHelp(tabName) {
       const r = el.getBoundingClientRect();
       const b = document.createElement('div');
       b.className = 'help-b';
-      b.textContent = ann.text;
+      b.textContent = _ht(ann.text);
       container.appendChild(b);
       b.style.left = '-9999px'; b.style.top = '0';
       const bw = b.offsetWidth, bh = b.offsetHeight;

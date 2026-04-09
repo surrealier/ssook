@@ -390,6 +390,11 @@ const I18n = {
   setLang(lang) {
     this._lang = lang;
     localStorage.setItem('ssook-lang', lang);
+    // Invalidate all tab caches so they re-render in the new language
+    App._tabCache = {};
+    for (const key of Object.keys(Tabs)) {
+      if (Tabs[key] && Tabs[key]._cachedHTML) Tabs[key]._cachedHTML = null;
+    }
     // Re-render current view
     App.renderSidebar();
     App.switchTab(App.currentTab);
