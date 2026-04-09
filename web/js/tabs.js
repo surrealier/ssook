@@ -430,6 +430,17 @@ Tabs.settings = {
               <a href="https://huggingface.co/Xenova/clip-vit-base-patch32/tree/main/onnx" target="_blank" class="btn btn-secondary btn-sm">📥 CLIP (ViT-B/32 ONNX)</a>
               <a href="https://huggingface.co/immich-app/ViT-B-32__openai/tree/main" target="_blank" class="btn btn-secondary btn-sm">📥 Embedder (ViT-B/32 ONNX)</a>
             </div>
+            <h4 class="text-heading-h3" style="margin:1.25rem 0 0.75rem;font-size:14px;">${t('settings.test_data_dl')}</h4>
+            <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
+              <a href="https://ultralytics.com/assets/coco128.zip" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 COCO128 Dataset (YOLO format)</a>
+            </div>
+            <h4 class="text-heading-h3" style="margin:1.25rem 0 0.75rem;font-size:14px;">${t('settings.builtin_samples')}</h4>
+            <div class="text-secondary" style="font-size:12px;margin-bottom:0.5rem;">${t('settings.builtin_samples_desc')}</div>
+            <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
+              <a href="/assets/samples/bus.jpg" download class="btn btn-secondary btn-sm">🖼️ bus.jpg</a>
+              <a href="/assets/samples/zidane.jpg" download class="btn btn-secondary btn-sm">🖼️ zidane.jpg</a>
+              <a href="/assets/samples/people.mp4" download class="btn btn-secondary btn-sm">🎬 people.mp4</a>
+            </div>
           </div>
           <div class="card" style="padding:1.5rem;">
             <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('settings.display')}</h3>

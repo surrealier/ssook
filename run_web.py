@@ -22,6 +22,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+# PyInstaller frozen exe may set sys.stdout/stderr to None → patch early
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 
 def _set_windows_icon():
     """Set taskbar/titlebar icon on Windows."""
