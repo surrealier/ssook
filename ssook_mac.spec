@@ -30,7 +30,7 @@ for _ep in ['coreml', 'cpu']:
     if not os.path.isdir(_ort_dir):
         continue
     _ep_datas.append((_ort_dir, os.path.join('ep_runtimes', _ep, 'onnxruntime')))
-    print(f'[ssook_mac.spec] EP 번들: {_ep}')
+    print(f'[ssook_mac.spec] EP bundle: {_ep}')
 
 a = Analysis(
     ['run_web.py'],

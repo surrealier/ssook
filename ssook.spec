@@ -47,12 +47,12 @@ for _ep in _ep_keys:
         if os.path.isdir(_extra_dir):
             _ep_datas.append((_extra_dir, os.path.join('ep_runtimes', _ep, _extra)))
     _found.append(_ep)
-    print(f'[ssook.spec] EP 번들: {_ep} ← {_sp}')
+    print(f'[ssook.spec] EP bundle: {_ep} <- {_sp}')
 
 if not _found:
-    print('[ssook.spec] ⚠ ep_venvs에서 onnxruntime을 찾지 못함')
+    print('[ssook.spec] WARNING: no onnxruntime found in ep_venvs')
 else:
-    print(f'[ssook.spec] 총 {len(_found)}개 EP 번들: {_found}')
+    print(f'[ssook.spec] {len(_found)} EP(s) bundled: {_found}')
 
 a = Analysis(
     ['run_web.py'],
