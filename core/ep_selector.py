@@ -1,11 +1,9 @@
 """
-EP 런타임 선택기.
+EP runtime selector.
 
-exe 실행 초기에 호출되어 환경(GPU)을 감지하고,
-ep_runtimes/{key}/ 를 sys.path 선두에 삽입하여
-적절한 onnxruntime 변종이 import되도록 한다.
-
-반드시 onnxruntime을 import하기 전에 호출해야 한다.
+Called at startup before onnxruntime is imported.
+Detects hardware, selects the best EP, and inserts its path into sys.path.
+Records fallback reasons for UI display.
 """
 import os
 import platform
@@ -13,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-# exe: _MEIPASS/ep_runtimes/  |  소스: ep_venvs의 site-packages
+# exe: _MEIPASS/ep_runtimes/  |  source: ep_venvs
 if getattr(sys, "frozen", False):
     _BASE = Path(sys._MEIPASS) / "ep_runtimes"
     _MODE = "frozen"
@@ -24,11 +22,30 @@ else:
     _BASE = _ep_runtimes if _ep_runtimes.is_dir() else _ep_venvs
     _MODE = "source"
 
-# 플랫폼별 우선순위
 _PRIORITY = {
     "Windows": ["cuda", "directml", "openvino", "cpu"],
     "Linux":   ["cuda", "openvino", "cpu"],
     "Darwin":  ["coreml", "cpu"],
+}
+
+_EP_LABELS = {
+    "cuda": "CUDA (NVIDIA GPU)",
+    "directml": "DirectML (Windows GPU)",
+    "openvino": "OpenVINO (Intel)",
+    "coreml": "CoreML (Apple Silicon)",
+    "cpu": "CPU",
+}
+
+# --- selection result (populated by select_and_activate) ---
+ep_result: dict = {
+    "selected": None,
+    "provider": None,
+    "available_eps": [],
+    "bundled_eps": [],
+    "skipped": [],       # [{ep, reason, fix}]
+    "fallback": False,
+    "fallback_reason": None,
+    "fallback_fix": None,
 }
 
 
@@ -45,7 +62,6 @@ def _has_nvidia_gpu() -> bool:
 
 
 def _has_intel_gpu() -> bool:
-    """Intel iGPU 존재 여부 (간이 판별)."""
     if sys.platform == "win32":
         try:
             r = subprocess.run(
@@ -56,21 +72,13 @@ def _has_intel_gpu() -> bool:
             return "intel" in r.stdout.lower()
         except Exception:
             return False
-    return os.path.exists("/dev/dri")  # Linux Intel GPU
-
-
-def _ep_available(key: str) -> bool:
-    """번들된 ep_runtimes/{key}/onnxruntime 존재 여부."""
-    return (_BASE / key / "onnxruntime").is_dir()
+    return os.path.exists("/dev/dri")
 
 
 def _resolve_ep_path(key: str) -> "str | None":
-    """EP의 onnxruntime이 있는 디렉토리 경로를 반환."""
-    # frozen: ep_runtimes/{key}/  (onnxruntime이 바로 아래)
     if _MODE == "frozen":
         d = _BASE / key
         return str(d) if (d / "onnxruntime").is_dir() else None
-    # source: ep_venvs/{key}/lib/python3.x/site-packages/
     venv = _BASE / key
     if sys.platform == "win32":
         sp = venv / "Lib" / "site-packages"
@@ -87,46 +95,102 @@ def _resolve_ep_path(key: str) -> "str | None":
     return None
 
 
+_EP_PROVIDER_MAP = {
+    "cuda": "CUDAExecutionProvider",
+    "directml": "DmlExecutionProvider",
+    "openvino": "OpenVINOExecutionProvider",
+    "coreml": "CoreMLExecutionProvider",
+    "cpu": "CPUExecutionProvider",
+}
+
+
 def select_and_activate() -> str:
-    """
-    최적 EP를 선택하고 sys.path에 삽입.
-    반환: 선택된 ep_key.
-    """
     plat = platform.system()
     priority = _PRIORITY.get(plat, ["cpu"])
+
+    # scan bundled EPs
+    bundled = [k for k in priority if _resolve_ep_path(k)]
+    ep_result["bundled_eps"] = bundled
 
     selected = None
     for key in priority:
         if not _resolve_ep_path(key):
+            ep_result["skipped"].append({
+                "ep": key,
+                "reason": f"{_EP_LABELS.get(key, key)} runtime not bundled",
+                "fix": f"Run: python scripts/setup_ep.py {key}  then rebuild",
+            })
             continue
-        # 하드웨어 체크
+
         if key == "cuda" and not _has_nvidia_gpu():
+            ep_result["skipped"].append({
+                "ep": key,
+                "reason": "NVIDIA GPU not detected (nvidia-smi failed)",
+                "fix": "Install NVIDIA driver, or check GPU connection",
+            })
             continue
-        if key == "directml":
-            # DirectML은 Windows GPU 범용 — NVIDIA 없을 때 유용
-            pass
+
         if key == "openvino" and not _has_intel_gpu():
+            ep_result["skipped"].append({
+                "ep": key,
+                "reason": "Intel GPU not detected",
+                "fix": "This EP requires Intel iGPU/dGPU",
+            })
             continue
+
         selected = key
         break
 
-    if selected is None:
-        if _resolve_ep_path("cpu"):
-            selected = "cpu"
+    if selected is None and _resolve_ep_path("cpu"):
+        selected = "cpu"
+
+    # determine if fallback occurred
+    top_choice = priority[0] if priority else None
+    if selected and selected != top_choice:
+        ep_result["fallback"] = True
+        # find the first skipped reason
+        if ep_result["skipped"]:
+            first = ep_result["skipped"][0]
+            ep_result["fallback_reason"] = first["reason"]
+            ep_result["fallback_fix"] = first["fix"]
 
     if selected:
         ep_path = _resolve_ep_path(selected)
         if ep_path not in sys.path:
             sys.path.insert(0, ep_path)
-        # .libs 폴더도 DLL 검색 경로에 추가 (Windows CUDA DLL 등)
         if sys.platform == "win32":
-            libs = Path(ep_path) / "onnxruntime.libs"
-            if not libs.is_dir():
-                libs = _BASE / selected / "onnxruntime.libs"
-            if libs.is_dir():
-                os.add_dll_directory(str(libs))
+            for libs_name in ["onnxruntime.libs", "onnxruntime_gpu.libs"]:
+                libs = Path(ep_path) / libs_name
+                if not libs.is_dir():
+                    libs = _BASE / selected / libs_name
+                if libs.is_dir():
+                    os.add_dll_directory(str(libs))
+        ep_result["selected"] = selected
+        ep_result["provider"] = _EP_PROVIDER_MAP.get(selected, "CPUExecutionProvider")
         print(f"[EP Selector] selected: {selected} -> {ep_path}")
     else:
+        ep_result["selected"] = "auto"
+        ep_result["provider"] = "CPUExecutionProvider"
+        ep_result["fallback"] = True
+        ep_result["fallback_reason"] = "No EP runtime available"
+        ep_result["fallback_fix"] = "Run: python scripts/setup_ep.py"
         print("[EP Selector] WARNING: no EP available, using system onnxruntime")
 
+    # fill available_eps after onnxruntime is loadable
     return selected or "auto"
+
+
+def get_ort_providers() -> list:
+    """Get actual available providers from loaded onnxruntime."""
+    try:
+        import onnxruntime as ort
+        return ort.get_available_providers()
+    except Exception:
+        return []
+
+
+def get_ep_status() -> dict:
+    """Full EP status for API/UI."""
+    providers = get_ort_providers()
+    ep_result["available_eps"] = providers
+    return ep_result

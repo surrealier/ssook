@@ -93,6 +93,10 @@ Tabs.viewer = {
             <div class="text-label" style="margin-bottom:0.35rem;font-size:11px;">${t('viewer.sys_info')}</div>
             <div id="v-sys-info" class="text-secondary">—</div>
           </div>
+          <div class="card-flat" style="padding:0.6rem;">
+            <div class="text-label" style="margin-bottom:0.35rem;font-size:11px;">Execution Provider</div>
+            <div id="v-ep-info" class="text-secondary">—</div>
+          </div>
         </div>
       </div>`;
   },
@@ -138,6 +142,34 @@ Tabs.viewer = {
       const info = await API.sysInfo();
       const el = document.getElementById('v-sys-info');
       if (el) el.innerHTML = `OS: ${info.os||'—'}<br>Python: ${info.python||'—'}<br>ORT: ${info.ort||'—'}<br>Torch: ${info.torch||'—'}<br>CUDA: ${info.cuda||'—'}<br>GPU: ${info.gpu_name||'—'}`;
+    } catch(e) {}
+    // EP status
+    try {
+      const ep = await API.epStatus();
+      const el = document.getElementById('v-ep-info');
+      if (el) {
+        const sel = ep.selected || 'auto';
+        const prov = ep.provider || 'CPUExecutionProvider';
+        const avail = (ep.available_eps || []).join(', ') || '—';
+        const bundled = (ep.bundled_eps || []).join(', ') || '—';
+        el.innerHTML = `Active: <b>${sel.toUpperCase()}</b><br>Provider: ${prov}<br>Available: ${avail}<br>Bundled: ${bundled}`;
+        if (ep.fallback) {
+          el.innerHTML += `<br><span style="color:var(--color-warning,#e6a700);">Fallback</span>`;
+        }
+      }
+      // Fallback notification
+      if (ep.fallback && ep.skipped && ep.skipped.length > 0) {
+        let detail = '';
+        for (const s of ep.skipped) {
+          detail += `[${s.ep.toUpperCase()}] ${s.reason}\n  -> ${s.fix}\n\n`;
+        }
+        const msg = `EP fallback to ${(ep.selected||'cpu').toUpperCase()}: ${ep.fallback_reason||''}`;
+        if (typeof Notify !== 'undefined' && Notify.warn) {
+          Notify.warn(msg, detail.trim());
+        } else {
+          App.setStatus(msg, detail.trim());
+        }
+      }
     } catch(e) {}
     if (G.model) this._showModelInfo(G.model);
     // Seek slider

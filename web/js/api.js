@@ -32,6 +32,7 @@ const API = {
   benchmark:  (params) => API.post('/api/benchmark/run', params),
   benchmarkStatus: ()  => API.get('/api/benchmark/status'),
   sysInfo:    ()       => API.get('/api/system/info'),
+  epStatus:   ()       => API.get('/api/system/ep'),
   hwStats:    ()       => API.get('/api/system/hw'),
   videoInfo:  (path)   => API.post('/api/video/info', { path }),
   listDir:    (params) => API.post('/api/fs/list', params),

@@ -1292,6 +1292,12 @@ async def evaluation_export_csv():
                     headers={"Content-Disposition": "attachment; filename=evaluation_results.csv"})
 
 
+# ── EP Status ───────────────────────────────────────────
+@app.get("/api/system/ep")
+async def system_ep():
+    from core.ep_selector import get_ep_status
+    return get_ep_status()
+
 # ── System Info ─────────────────────────────────────────
 @app.get("/api/system/info")
 async def system_info():
