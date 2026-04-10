@@ -32,6 +32,10 @@ else:
 
 sys.path.insert(0, str(ROOT))
 
+# ── EP 런타임 선택 (onnxruntime import 전에 실행) ──
+from core.ep_selector import select_and_activate
+_selected_ep = select_and_activate()
+
 
 def _set_windows_icon():
     """Set taskbar/titlebar icon on Windows."""
