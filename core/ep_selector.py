@@ -125,8 +125,8 @@ def select_and_activate() -> str:
                 libs = _BASE / selected / "onnxruntime.libs"
             if libs.is_dir():
                 os.add_dll_directory(str(libs))
-        print(f"[EP Selector] {selected} 선택 → {ep_path}")
+        print(f"[EP Selector] selected: {selected} -> {ep_path}")
     else:
-        print("[EP Selector] ⚠ 사용 가능한 EP 없음 — 시스템 onnxruntime 사용")
+        print("[EP Selector] WARNING: no EP available, using system onnxruntime")
 
     return selected or "auto"
