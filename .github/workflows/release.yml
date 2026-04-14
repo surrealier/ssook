@@ -129,6 +129,9 @@ jobs:
       - name: Create DMG
         run: |
           VERSION="${{ github.ref_name }}"
+          # Detach any leftover mounts
+          hdiutil detach /Volumes/ssook 2>/dev/null || true
+          rm -rf dmg_staging
           mkdir -p dmg_staging
           cp -R dist/ssook.app dmg_staging/
           ln -s /Applications dmg_staging/Applications
