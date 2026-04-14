@@ -29,6 +29,13 @@ const Icons = {
   similarity: (s) => Icons._svg('<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/>', s),
   batch:      (s) => Icons._svg('<polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/>', s),
   augmentation:(s)=>Icons._svg('<path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/>', s),
+  // Phase 1: new task icons
+  pose:       (s) => Icons._svg('<path d="M12 2a1 1 0 1 0 0 2 1 1 0 0 0 0-2z"/><path d="M12 6v4"/><path d="M8 10l4-0 4 0"/><path d="M8 10l-2 6"/><path d="M16 10l2 6"/><path d="M10 14l-1 8"/><path d="M14 14l1 8"/>', s),
+  instanceSeg:(s) => Icons._svg('<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><circle cx="17.5" cy="17.5" r="3.5"/>', s),
+  tracking:   (s) => Icons._svg('<path d="M2 12h4"/><path d="M18 12h4"/><circle cx="12" cy="12" r="4"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.93 4.93l2.83 2.83"/><path d="M16.24 16.24l2.83 2.83"/>', s),
+  inspector:  (s) => Icons._svg('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>', s),
+  profiler:   (s) => Icons._svg('<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/><circle cx="12" cy="12" r="1"/>', s),
+  vlm:        (s) => Icons._svg('<rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><circle cx="8" cy="10" r="2"/><path d="M14 8h4"/><path d="M14 12h4"/>', s),
   // Notification
   bell:       (s) => Icons._svg('<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>', s),
   copy:       (s) => Icons._svg('<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>', s),

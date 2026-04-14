@@ -62,6 +62,21 @@ MODEL_TYPES = {
     "emb_efficientnet":"EfficientNet Embedder",
     "emb_dino":        "DINOv2 Embedder",
     "emb_custom":      "Custom Embedder",
+    # Pose Estimation (3)
+    "pose_yolo":       "YOLO-Pose (v8/v11)",
+    "pose_hrnet":      "HRNet Pose",
+    "pose_vitpose":    "ViTPose",
+    # Instance Segmentation (3)
+    "instseg_yolo":    "YOLO-Seg Instance (v8/v11)",
+    "instseg_maskrcnn":"Mask R-CNN",
+    "instseg_custom":  "Custom Instance Seg",
+    # Tracking (2)
+    "track_bytetrack": "ByteTrack",
+    "track_sort":      "SORT",
+    # VLM (3)
+    "vlm_vqa":         "VLM — VQA",
+    "vlm_caption":     "VLM — Captioning",
+    "vlm_grounding":   "VLM — Grounding DINO",
 }
 
 
@@ -146,6 +161,14 @@ def _detect_task_type(session: ort.InferenceSession, model_type: str = "yolo") -
         return "embedding"
     if model_type.startswith("emb_"):
         return "embedding"
+    if model_type.startswith("pose_"):
+        return "pose"
+    if model_type.startswith("instseg_"):
+        return "instance_segmentation"
+    if model_type.startswith("track_"):
+        return "detection"
+    if model_type.startswith("vlm_"):
+        return "vlm"
     shape = session.get_outputs()[0].shape
     # Classification: (1, N) — 2차원, N은 클래스 수
     if len(shape) == 2:

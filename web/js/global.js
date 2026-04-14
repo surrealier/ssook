@@ -84,48 +84,127 @@ function multiModelSlots(containerId, listId) {
   </div>`;
 }
 
-/* Picker functions */
+/* Picker functions — web-based file browser */
+function _showFileBrowser(mode, exts, callback) {
+  // mode: "file" | "dir"
+  let currentPath = '';
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;';
+  const modal = document.createElement('div');
+  modal.style.cssText = 'background:var(--background-tint-00);border-radius:12px;width:560px;max-height:70vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
+  modal.innerHTML = `
+    <div style="padding:1rem 1.25rem;border-bottom:1px solid var(--border-01);display:flex;align-items:center;justify-content:space-between;">
+      <strong>${mode === 'dir' ? 'Select Directory' : 'Select File'}</strong>
+      <button class="btn btn-ghost btn-sm" id="fb-close">✕</button>
+    </div>
+    <div style="padding:0.5rem 1.25rem;display:flex;gap:0.5rem;align-items:center;border-bottom:1px solid var(--border-01);">
+      <button class="btn btn-ghost btn-sm" id="fb-up">⬆</button>
+      <input type="text" class="form-input input-normal" id="fb-path" style="flex:1;font-size:12px;" readonly>
+    </div>
+    <div id="fb-list" style="flex:1;overflow-y:auto;padding:0.5rem;min-height:200px;max-height:50vh;"></div>
+    <div style="padding:0.75rem 1.25rem;border-top:1px solid var(--border-01);display:flex;gap:0.5rem;justify-content:flex-end;">
+      ${mode === 'dir' ? '<button class="btn btn-primary btn-sm" id="fb-select-dir">Select This Directory</button>' : ''}
+      <button class="btn btn-secondary btn-sm" id="fb-cancel">Cancel</button>
+    </div>`;
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  const listEl = modal.querySelector('#fb-list');
+  const pathEl = modal.querySelector('#fb-path');
+
+  async function navigate(path) {
+    listEl.innerHTML = '<div class="text-secondary" style="padding:1rem;text-align:center;">Loading...</div>';
+    try {
+      const r = await API.post('/api/fs/browse', {path: path || null, exts, mode});
+      currentPath = r.current || '';
+      pathEl.value = currentPath;
+      if (!r.entries || !r.entries.length) {
+        listEl.innerHTML = '<div class="text-secondary" style="padding:1rem;text-align:center;">Empty</div>';
+        return;
+      }
+      listEl.innerHTML = '';
+      r.entries.forEach(e => {
+        const row = document.createElement('div');
+        row.style.cssText = 'padding:0.35rem 0.5rem;cursor:pointer;border-radius:6px;display:flex;align-items:center;gap:0.5rem;font-size:13px;';
+        row.onmouseenter = () => row.style.background = 'var(--background-tint-01)';
+        row.onmouseleave = () => row.style.background = '';
+        if (e.type === 'drive' || e.type === 'dir') {
+          row.innerHTML = '<span style="opacity:0.6;">📁</span> ' + e.name;
+          row.ondblclick = () => navigate(e.path);
+          row.onclick = () => { pathEl.value = e.path; currentPath = e.path; };
+        } else {
+          row.innerHTML = '<span style="opacity:0.4;">📄</span> ' + e.name;
+          row.onclick = () => { cleanup(); callback(e.path); };
+        }
+        listEl.appendChild(row);
+      });
+    } catch(err) {
+      listEl.innerHTML = `<div class="text-secondary" style="padding:1rem;text-align:center;">Error: ${err.message}</div>`;
+    }
+  }
+
+  function cleanup() { overlay.remove(); }
+
+  modal.querySelector('#fb-close').onclick = cleanup;
+  modal.querySelector('#fb-cancel').onclick = cleanup;
+  overlay.onclick = (e) => { if (e.target === overlay) cleanup(); };
+  modal.querySelector('#fb-up').onclick = async () => {
+    if (!currentPath) return;
+    const r = await API.post('/api/fs/browse', {path: currentPath, exts, mode});
+    if (r.parent) navigate(r.parent);
+  };
+  const selDirBtn = modal.querySelector('#fb-select-dir');
+  if (selDirBtn) selDirBtn.onclick = () => { if (currentPath) { cleanup(); callback(currentPath); } };
+
+  navigate('');
+}
+
 async function pickModel(inputId) {
-  try {
-    const r = await API.selectFile({ filters: 'ONNX (*.onnx);;PyTorch (*.pt)' });
-    if (r.path) { setModel(r.path); document.getElementById(inputId).value = r.path; }
-  } catch(e) {}
+  _showFileBrowser('file', ['.onnx', '.pt'], (path) => {
+    setModel(path);
+    const el = document.getElementById(inputId);
+    if (el) el.value = path;
+  });
 }
 async function pickImgDir(inputId) {
-  try {
-    const r = await API.selectDir();
-    if (r.path) { setImgDir(r.path); document.getElementById(inputId).value = r.path; }
-  } catch(e) {}
+  _showFileBrowser('dir', null, (path) => {
+    setImgDir(path);
+    const el = document.getElementById(inputId);
+    if (el) el.value = path;
+  });
 }
 async function pickLblDir(inputId) {
-  try {
-    const r = await API.selectDir();
-    if (r.path) { setLblDir(r.path); document.getElementById(inputId).value = r.path; }
-  } catch(e) {}
+  _showFileBrowser('dir', null, (path) => {
+    setLblDir(path);
+    const el = document.getElementById(inputId);
+    if (el) el.value = path;
+  });
 }
 async function pickDir(inputId) {
-  try {
-    const r = await API.selectDir();
-    if (r.path) document.getElementById(inputId).value = r.path;
-  } catch(e) {}
+  _showFileBrowser('dir', null, (path) => {
+    const el = document.getElementById(inputId);
+    if (el) el.value = path;
+  });
 }
 async function pickFile(inputId, filters) {
-  try {
-    const r = await API.selectFile({ filters: filters || '' });
-    if (r.path) document.getElementById(inputId).value = r.path;
-  } catch(e) {}
+  // Parse filter string to ext array: "ONNX (*.onnx);;PyTorch (*.pt)" → [".onnx", ".pt"]
+  let exts = null;
+  if (filters) {
+    const m = filters.match(/\*\.\w+/g);
+    if (m) exts = m.map(e => e.replace('*', ''));
+  }
+  _showFileBrowser('file', exts, (path) => {
+    const el = document.getElementById(inputId);
+    if (el) el.value = path;
+  });
 }
 
 /* Add model slot to multi-model container */
 let _slotN = 0;
 async function addModelSlot(containerId, listId) {
-  try {
-    const r = await API.post('/api/fs/select-multi', { filters: 'ONNX (*.onnx)' });
-    if (!r.paths || !r.paths.length) return;
-    for (const path of r.paths) {
-      _addOneSlot(containerId, listId, path);
-    }
-  } catch(e) {}
+  _showFileBrowser('file', ['.onnx'], (path) => {
+    _addOneSlot(containerId, listId, path);
+  });
 }
 function _addOneSlot(containerId, listId, path) {
   const c = document.getElementById(containerId);

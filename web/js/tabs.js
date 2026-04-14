@@ -314,16 +314,10 @@ Tabs.viewer = {
     if (['jpg','jpeg','png','bmp'].includes(ext) && G.model) this._inferImage();
   },
   async browseModel() {
-    try {
-      const r = await API.selectFile({ filters: 'Models (*.onnx *.pt)' });
-      if (r.path) this.selectModel(r.path);
-    } catch(e) {}
+    _showFileBrowser('file', ['.onnx', '.pt'], (path) => this.selectModel(path));
   },
   async browseVideo() {
-    try {
-      const r = await API.selectFile({ filters: 'Media (*.mp4 *.avi *.mov *.mkv *.jpg *.jpeg *.png *.bmp)' });
-      if (r.path) this.selectVideo(r.path);
-    } catch(e) {}
+    _showFileBrowser('file', ['.mp4','.avi','.mov','.mkv','.jpg','.jpeg','.png','.bmp'], (path) => this.selectVideo(path));
   },
   togglePlay() {
     if (!G.model) { App.setStatus(t('viewer.select_model_first')); return; }
@@ -667,14 +661,13 @@ Tabs.settings = {
   },
 
   async _cmtBrowseModel() {
-    try {
-      const r = await API.selectFile({ filters: 'ONNX (*.onnx)' });
-      if (!r.path) return;
-      this._cmtModelPath = r.path;
-      document.getElementById('cmt-model-label').textContent = r.path.split(/[\\/]/).pop();
+    _showFileBrowser('file', ['.onnx'], async (path) => {
+      try {
+      this._cmtModelPath = path;
+      document.getElementById('cmt-model-label').textContent = path.split(/[\\/]/).pop();
       document.getElementById('cmt-shape-info').textContent = t('cmt.inferring');
       // 실제 추론으로 output shape 획득 (#1c)
-      const res = await API.post('/api/model/infer-shapes', { path: r.path });
+      const res = await API.post('/api/model/infer-shapes', { path });
       if (res.error) { document.getElementById('cmt-shape-info').textContent = 'Error: ' + res.error; return; }
       this._cmtInferredOutputs = res.outputs;
       let info = t('cmt.input') + ': ' + JSON.stringify(res.input_shape);
@@ -686,7 +679,8 @@ Tabs.settings = {
         '<option value="' + o.index + '">' + t('cmt.output') + '[' + o.index + '] ' + o.name + ' — ' + JSON.stringify(o.shape) + '</option>'
       ).join('');
       this._cmtOnOutputSelected();
-    } catch(e) { document.getElementById('cmt-shape-info').textContent = 'Error: ' + e.message; }
+      } catch(e) { document.getElementById('cmt-shape-info').textContent = 'Error: ' + e.message; }
+    });
   },
 
   _cmtOnOutputSelected() {
@@ -763,13 +757,10 @@ Tabs.settings = {
   },
 
   async _cmtBrowseTestImg() {
-    try {
-      const r = await API.selectFile({ filters: 'Images (*.jpg *.jpeg *.png *.bmp)' });
-      if (r.path) {
-        this._cmtTestImgPath = r.path;
-        document.getElementById('cmt-test-label').textContent = r.path.split(/[\\/]/).pop();
-      }
-    } catch(e) {}
+    _showFileBrowser('file', ['.jpg','.jpeg','.png','.bmp'], (path) => {
+      this._cmtTestImgPath = path;
+      document.getElementById('cmt-test-label').textContent = path.split(/[\\/]/).pop();
+    });
   },
 
   _cmtCollectAttrRoles() {
@@ -1037,13 +1028,9 @@ Tabs.evaluation = {
   _modelTypes: {},
   _evalSlotN: 0,
   async _addModel() {
-    try {
-      const r = await API.post('/api/fs/select-multi', { filters: 'ONNX (*.onnx)' });
-      if (!r.paths || !r.paths.length) return;
-      for (const path of r.paths) {
-        this._addSlot(path);
-      }
-    } catch(e) {}
+    _showFileBrowser('file', ['.onnx'], (path) => {
+      this._addSlot(path);
+    });
   },
   _addSlot(path) {
     const c = document.getElementById('eval-model-slots');

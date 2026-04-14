@@ -64,7 +64,7 @@ def _draw_label(frame, text, x1, y1, color, font_scale, font_thick, show_bg):
         txt_color = color
     cv2.putText(frame, text, (x1 + 1, ty - baseline), cv2.FONT_HERSHEY_SIMPLEX, font_scale, txt_color, font_thick, cv2.LINE_AA)
 
-app = FastAPI(title="ssook", version="1.4.0")
+app = FastAPI(title="ssook", version="1.5.0")
 
 # 백그라운드 작업용 스레드 풀 (최대 4개 동시 작업)
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ssook-bg")
@@ -1486,6 +1486,64 @@ async def list_dir(req: ListDirRequest):
                 continue
             files.append({"name": item.name, "path": str(item.resolve())})
     return {"files": files}
+
+
+class BrowseRequest(BaseModel):
+    path: Optional[str] = None
+    exts: Optional[list[str]] = None
+    mode: Optional[str] = "file"  # "file" | "dir"
+
+
+@app.post("/api/fs/browse")
+async def browse_fs(req: BrowseRequest):
+    """Web-based filesystem browser: returns dirs + files for a given path."""
+    import platform as _plat
+    if not req.path:
+        # Return drives on Windows, / on Unix
+        if _plat.system() == "Windows" or os.path.exists("/mnt/c"):
+            # WSL or Windows
+            drives = []
+            if os.path.exists("/mnt"):
+                for d in sorted(os.listdir("/mnt")):
+                    dp = f"/mnt/{d}"
+                    if os.path.isdir(dp) and len(d) == 1:
+                        drives.append({"name": f"{d.upper()}:", "path": dp, "type": "drive"})
+            if not drives:
+                for letter in "CDEFGHIJ":
+                    dp = f"{letter}:\\"
+                    if os.path.isdir(dp):
+                        drives.append({"name": f"{letter}:", "path": dp, "type": "drive"})
+            if not drives:
+                drives.append({"name": "/", "path": "/", "type": "drive"})
+            return {"current": "", "entries": drives}
+        else:
+            return {"current": "/", "entries": _list_entries("/", req.exts, req.mode)}
+
+    p = Path(req.path).resolve()
+    if not p.is_dir():
+        return {"error": "Not a directory"}
+    return {"current": str(p), "parent": str(p.parent) if str(p) != str(p.parent) else "",
+            "entries": _list_entries(str(p), req.exts, req.mode)}
+
+
+def _list_entries(dir_path: str, exts: list | None, mode: str) -> list:
+    entries = []
+    try:
+        for item in sorted(Path(dir_path).iterdir()):
+            try:
+                if item.name.startswith('.'):
+                    continue
+                if item.is_dir():
+                    entries.append({"name": item.name, "path": str(item.resolve()), "type": "dir"})
+                elif mode == "file" and item.is_file():
+                    if exts and item.suffix.lower() not in exts:
+                        continue
+                    entries.append({"name": item.name, "path": str(item.resolve()), "type": "file"})
+            except (PermissionError, OSError):
+                continue
+    except (PermissionError, OSError):
+        pass
+    return entries
 
 
 # ── Evaluation API ──────────────────────────────────────
@@ -3539,6 +3597,147 @@ async def batch_augmentation(req: dict):
         return {"original": original, "augmented": augmented, "file": os.path.basename(fp)}
     except Exception as e:
         return {"error": str(e)}
+
+
+# ── Phase 1: Model Inspector API ───────────────────────
+@app.post("/api/inspector/inspect")
+async def api_inspect_model(req: dict):
+    try:
+        path = req.get("path", "")
+        if not path or not os.path.isfile(path):
+            return {"error": "Model file not found"}
+        from core.model_inspector import inspect_model, inspection_to_dict
+        info = inspect_model(path)
+        return inspection_to_dict(info)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Phase 1: Model Profiler API ────────────────────────
+@app.post("/api/profiler/run")
+async def api_profile_model(req: dict):
+    try:
+        path = req.get("path", "")
+        num_runs = req.get("num_runs", 20)
+        if not path or not os.path.isfile(path):
+            return {"error": "Model file not found"}
+        from core.model_profiler import profile_model, profile_to_dict
+        result = profile_model(path, num_runs=num_runs)
+        return profile_to_dict(result)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Phase 1: Pose Estimation API ───────────────────────
+@app.post("/api/infer/pose")
+async def api_infer_pose(req: dict):
+    try:
+        model_path = req.get("model_path", "")
+        image_path = req.get("image_path", "")
+        conf = req.get("conf", 0.25)
+        model_type = req.get("model_type", "pose_yolo")
+        if not model_path or not image_path:
+            return {"error": "model_path and image_path required"}
+        frame = cv2.imread(image_path)
+        if frame is None:
+            return {"error": "Cannot read image"}
+        mi = _load(model_path, model_type=model_type)
+        from core.inference import run_pose, COCO_SKELETON, COCO_KPT_NAMES
+        result = run_pose(mi, frame, conf)
+        # Draw on image
+        vis = frame.copy()
+        for i in range(len(result.boxes)):
+            x1, y1, x2, y2 = result.boxes[i].astype(int)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            kpts = result.keypoints[i]
+            for j, (kx, ky, kc) in enumerate(kpts):
+                if kc > 0.5:
+                    cv2.circle(vis, (int(kx), int(ky)), 3, (0, 0, 255), -1)
+            for a, b in COCO_SKELETON:
+                if kpts[a][2] > 0.5 and kpts[b][2] > 0.5:
+                    cv2.line(vis, (int(kpts[a][0]), int(kpts[a][1])),
+                             (int(kpts[b][0]), int(kpts[b][1])), (255, 255, 0), 2)
+        return {
+            "image": _encode_jpeg(vis),
+            "num_persons": len(result.boxes),
+            "infer_ms": round(result.infer_ms, 2),
+            "detections": [
+                {"box": result.boxes[i].tolist(),
+                 "score": round(float(result.scores[i]), 3),
+                 "keypoints": result.keypoints[i].tolist()}
+                for i in range(len(result.boxes))
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Phase 1: Instance Segmentation API ─────────────────
+@app.post("/api/infer/instance-seg")
+async def api_infer_instance_seg(req: dict):
+    try:
+        model_path = req.get("model_path", "")
+        image_path = req.get("image_path", "")
+        conf = req.get("conf", 0.25)
+        model_type = req.get("model_type", "instseg_yolo")
+        if not model_path or not image_path:
+            return {"error": "model_path and image_path required"}
+        frame = cv2.imread(image_path)
+        if frame is None:
+            return {"error": "Cannot read image"}
+        mi = _load(model_path, model_type=model_type)
+        from core.inference import run_instance_seg
+        result = run_instance_seg(mi, frame, conf)
+        # Draw masks on image
+        vis = frame.copy()
+        colors = _generate_palette(max(len(result.masks), 1))
+        for i in range(len(result.masks)):
+            mask = result.masks[i]
+            color = colors[i % len(colors)]
+            overlay = vis.copy()
+            overlay[mask > 0] = color
+            cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
+            x1, y1, x2, y2 = result.boxes[i].astype(int)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            label = f"cls{result.class_ids[i]} {result.scores[i]:.2f}"
+            cv2.putText(vis, label, (x1, max(y1-4, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        return {
+            "image": _encode_jpeg(vis),
+            "num_instances": len(result.boxes),
+            "infer_ms": round(result.infer_ms, 2),
+            "detections": [
+                {"box": result.boxes[i].tolist(),
+                 "score": round(float(result.scores[i]), 3),
+                 "class_id": int(result.class_ids[i])}
+                for i in range(len(result.boxes))
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Phase 1: Tracking API ──────────────────────────────
+_trackers = {}
+
+@app.post("/api/tracking/create")
+async def api_tracking_create(req: dict):
+    try:
+        tracker_type = req.get("tracker_type", "bytetrack")
+        from core.tracking import create_tracker
+        tid = str(uuid.uuid4())[:8]
+        _trackers[tid] = create_tracker(tracker_type)
+        return {"tracker_id": tid, "type": tracker_type}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/tracking/reset")
+async def api_tracking_reset(req: dict):
+    tid = req.get("tracker_id", "")
+    if tid in _trackers:
+        _trackers[tid].reset()
+        return {"status": "ok"}
+    return {"error": "Tracker not found"}
 
 
 # ── Launch ──────────────────────────────────────────────

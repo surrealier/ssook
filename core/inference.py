@@ -814,3 +814,183 @@ def run_embedding(model_info: ModelInfo, frame: np.ndarray) -> EmbeddingResult:
     if norm > 0:
         emb = emb / norm
     return EmbeddingResult(embedding=emb, dim=len(emb), infer_ms=infer_ms)
+
+
+# ── Pose Estimation Inference ───────────────────────────
+COCO_SKELETON = [
+    (0,1),(0,2),(1,3),(2,4),  # head
+    (5,6),(5,7),(7,9),(6,8),(8,10),  # arms
+    (5,11),(6,12),(11,12),  # torso
+    (11,13),(13,15),(12,14),(14,16),  # legs
+]
+
+COCO_KPT_NAMES = [
+    "nose","left_eye","right_eye","left_ear","right_ear",
+    "left_shoulder","right_shoulder","left_elbow","right_elbow",
+    "left_wrist","right_wrist","left_hip","right_hip",
+    "left_knee","right_knee","left_ankle","right_ankle",
+]
+
+@dataclass
+class PoseResult:
+    boxes: np.ndarray       # (N, 4) xyxy
+    scores: np.ndarray      # (N,)
+    keypoints: np.ndarray   # (N, 17, 3) x,y,conf
+    infer_ms: float
+
+    @classmethod
+    def empty(cls):
+        return cls(np.zeros((0,4),dtype=np.float32), np.zeros(0,dtype=np.float32),
+                   np.zeros((0,17,3),dtype=np.float32), 0.0)
+
+
+def postprocess_pose_v8(output: np.ndarray, conf: float,
+                        ratio: float, pad: tuple, orig_shape: tuple) -> PoseResult:
+    """YOLOv8/v11-pose output: (1, 56, 8400) = 4 box + 1 conf + 51 kpts(17*3)"""
+    data = output[0]  # (56, 8400)
+    n_kpts = 17
+    box_dim = 4
+    # conf is at index 4
+    if data.shape[0] == box_dim + 1 + n_kpts * 3:
+        scores_all = data[4]  # (8400,)
+    else:
+        # fallback: treat as (4 + nc + 51)
+        nc = data.shape[0] - box_dim - n_kpts * 3
+        scores_all = data[4:4+nc].max(axis=0) if nc > 0 else data[4]
+
+    mask = scores_all > conf
+    if not mask.any():
+        return PoseResult.empty()
+
+    filtered = data[:, mask].T  # (K, 56)
+    boxes_xywh = filtered[:, :4]
+    scores = scores_all[mask].astype(np.float32)
+    kpt_raw = filtered[:, -n_kpts*3:].reshape(-1, n_kpts, 3)
+
+    boxes_xyxy = _xywh_to_xyxy_unscale(boxes_xywh, ratio, pad, orig_shape)
+    keep = _nms(boxes_xyxy, scores, np.zeros(len(scores), dtype=np.int32), _NMS_IOU)
+    if not keep:
+        return PoseResult.empty()
+
+    boxes_xyxy = boxes_xyxy[keep]
+    scores = scores[keep]
+    kpts = kpt_raw[keep].copy()
+    # unscale keypoints
+    pad_w, pad_h = pad
+    oh, ow = orig_shape[:2]
+    kpts[:, :, 0] = np.clip((kpts[:, :, 0] - pad_w) / ratio, 0, ow)
+    kpts[:, :, 1] = np.clip((kpts[:, :, 1] - pad_h) / ratio, 0, oh)
+
+    return PoseResult(boxes=boxes_xyxy.astype(np.float32), scores=scores,
+                      keypoints=kpts.astype(np.float32), infer_ms=0.0)
+
+
+def run_pose(model_info: ModelInfo, frame: np.ndarray, conf: float) -> PoseResult:
+    """Pose estimation inference"""
+    if model_info.session is None:
+        return PoseResult.empty()
+    t0 = time.perf_counter()
+    padded, ratio, pad = letterbox(frame, model_info.input_size)
+    tensor = _padded_to_tensor(padded, model_info.input_size)
+    bs = model_info.batch_size
+    if bs > 1:
+        tensor = np.repeat(tensor, bs, axis=0)
+    output = model_info.session.run(None, {model_info.input_name: tensor})
+    infer_ms = (time.perf_counter() - t0) * 1000.0
+    result = postprocess_pose_v8(output[0][:1], conf, ratio, pad, frame.shape)
+    result.infer_ms = infer_ms
+    return result
+
+
+# ── Instance Segmentation Inference ─────────────────────
+@dataclass
+class InstanceSegResult:
+    boxes: np.ndarray       # (N, 4) xyxy
+    scores: np.ndarray      # (N,)
+    class_ids: np.ndarray   # (N,)
+    masks: list             # list of (H, W) binary masks
+    infer_ms: float
+
+    @classmethod
+    def empty(cls):
+        return cls(np.zeros((0,4),dtype=np.float32), np.zeros(0,dtype=np.float32),
+                   np.zeros(0,dtype=np.int32), [], 0.0)
+
+
+def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
+                     conf: float) -> InstanceSegResult:
+    """YOLO-Seg instance segmentation: returns per-instance masks"""
+    if model_info.session is None:
+        return InstanceSegResult.empty()
+    t0 = time.perf_counter()
+    h_orig, w_orig = frame.shape[:2]
+    padded, ratio, pad = letterbox(frame, model_info.input_size)
+    tensor = _padded_to_tensor(padded, model_info.input_size)
+    bs = model_info.batch_size
+    if bs > 1:
+        tensor = np.repeat(tensor, bs, axis=0)
+    output = model_info.session.run(None, {model_info.input_name: tensor})
+    infer_ms = (time.perf_counter() - t0) * 1000.0
+
+    if len(output) < 2 or output[0].ndim != 3 or output[1].ndim != 4:
+        return InstanceSegResult.empty()
+
+    det = output[0][0]      # (116, 8400)
+    protos = output[1][0]   # (32, mh, mw)
+    nm = protos.shape[0]
+    nc = det.shape[0] - 4 - nm
+
+    scores_all = det[4:4+nc, :]
+    max_scores = scores_all.max(axis=0)
+    keep_mask = max_scores > conf
+    if not keep_mask.any():
+        return InstanceSegResult.empty()
+
+    det_k = det[:, keep_mask]
+    scores_k = scores_all[:, keep_mask]
+    class_ids = scores_k.argmax(axis=0).astype(np.int32)
+    confs = max_scores[keep_mask]
+
+    cx, cy, bw, bh = det_k[0], det_k[1], det_k[2], det_k[3]
+    x1 = cx - bw/2; y1 = cy - bh/2
+
+    boxes_nms = np.stack([x1, y1, bw, bh], axis=1).tolist()
+    indices = cv2.dnn.NMSBoxes(boxes_nms, confs.tolist(), conf, 0.45)
+    if len(indices) == 0:
+        return InstanceSegResult.empty()
+    indices = np.array(indices).flatten()
+
+    mask_coeffs = det_k[4+nc:, indices].T
+    mh, mw = protos.shape[1], protos.shape[2]
+    raw_masks = (mask_coeffs @ protos.reshape(nm, -1)).reshape(-1, mh, mw)
+    raw_masks = 1.0 / (1.0 + np.exp(-raw_masks))
+
+    ih, iw = model_info.input_size
+    pad_h_i, pad_w_i = int(round(pad[1])), int(round(pad[0]))
+
+    boxes_out, scores_out, cids_out, masks_out = [], [], [], []
+    for i, idx in enumerate(indices):
+        m = cv2.resize(raw_masks[i], (iw, ih), interpolation=cv2.INTER_LINEAR)
+        unpadded = m[pad_h_i:ih-pad_h_i if pad_h_i else ih,
+                     pad_w_i:iw-pad_w_i if pad_w_i else iw]
+        inst_mask = cv2.resize(unpadded, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
+        masks_out.append((inst_mask > 0.5).astype(np.uint8))
+
+        bx = np.array([cx[idx]-bw[idx]/2, cy[idx]-bh[idx]/2,
+                        cx[idx]+bw[idx]/2, cy[idx]+bh[idx]/2])
+        bx_orig = np.array([
+            np.clip((bx[0]-pad[0])/ratio, 0, w_orig),
+            np.clip((bx[1]-pad[1])/ratio, 0, h_orig),
+            np.clip((bx[2]-pad[0])/ratio, 0, w_orig),
+            np.clip((bx[3]-pad[1])/ratio, 0, h_orig),
+        ])
+        boxes_out.append(bx_orig)
+        scores_out.append(float(confs[idx]))
+        cids_out.append(int(class_ids[idx]))
+
+    return InstanceSegResult(
+        boxes=np.array(boxes_out, dtype=np.float32),
+        scores=np.array(scores_out, dtype=np.float32),
+        class_ids=np.array(cids_out, dtype=np.int32),
+        masks=masks_out, infer_ms=infer_ms,
+    )

@@ -699,11 +699,25 @@ Tabs.embedder = {
   async _compareImages() {
     const modelPath = document.getElementById('emb-model')?.value || G.model;
     if (!modelPath) { App.setStatus(t('emb.select_model')); return; }
+    // Collect images via two sequential picks
+    const paths = [];
+    const pickNext = () => {
+      _showFileBrowser('file', ['.jpg','.jpeg','.png','.bmp'], (path) => {
+        paths.push(path);
+        if (paths.length < 2) {
+          App.setStatus(`Selected ${paths.length} image(s), pick more...`);
+          pickNext();
+        } else {
+          this._runCompare(modelPath, paths);
+        }
+      });
+    };
+    pickNext();
+  },
+  async _runCompare(modelPath, paths) {
     try {
-      const r = await API.post('/api/fs/select-multi', { filters: 'Images (*.jpg *.jpeg *.png *.bmp)' });
-      if (!r.paths || r.paths.length < 2) { App.setStatus(t('emb.select_2_images')); return; }
       App.setStatus(t('emb.computing'));
-      const res = await API.post('/api/embedder/compare', { model_path: modelPath, img_paths: r.paths });
+      const res = await API.post('/api/embedder/compare', { model_path: modelPath, img_paths: paths });
       if (res.error) { App.setStatus('Error: ' + res.error); return; }
       const names = res.names;
       const matrix = res.matrix;
@@ -1231,5 +1245,320 @@ Tabs.augmentation = {
       document.getElementById('aug-result').innerHTML = `<img src="data:image/jpeg;base64,${r.augmented}" style="max-width:100%;max-height:300px;">`;
       App.setStatus(t('aug.ready'));
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  }
+};
+
+
+/* ── Phase 1: Pose Estimation Tab ───────────────────── */
+Tabs['pose'] = {
+  title: true,
+  render() {
+    return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
+      <div class="card" style="padding:1.5rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('pose.title')}</h3>
+        ${modelInput('pose-model')}
+        ${imgDirInput('pose-img')}
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:0.75rem;">
+          <div class="form-group"><label class="form-label">${t('pose.model_type')}</label>
+            <select class="form-input input-normal" id="pose-model-type">
+              <option value="pose_yolo">YOLO-Pose (v8/v11)</option>
+              <option value="pose_hrnet">HRNet Pose</option>
+              <option value="pose_vitpose">ViTPose</option>
+            </select></div>
+          <div class="form-group"><label class="form-label">${t('settings.conf')}</label>
+            <input type="number" class="form-input input-normal" id="pose-conf" value="0.25" min="0.01" max="0.99" step="0.05"></div>
+        </div>
+        <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.pose.run()">${t('pose.run')}</button>
+      </div>
+      <div class="card" style="padding:1.5rem;min-height:300px;" id="pose-result">
+        <span class="text-secondary">${t('pose.hint')}</span>
+      </div>
+    </div>`;
+  },
+  async run() {
+    const model_path = document.getElementById('pose-model')?.value || G.model;
+    const img_dir = document.getElementById('pose-img')?.value || G.imgDir;
+    if (!model_path) { App.setStatus(t('select_model')); return; }
+    if (!img_dir) { App.setStatus(t('eval.select_images')); return; }
+    App.setStatus(t('pose.running'));
+    try {
+      const imgs = await API.post('/api/list-files', {dir: img_dir, exts: ['.jpg','.jpeg','.png','.bmp']});
+      const image_path = (imgs.files && imgs.files.length) ? imgs.files[0] : img_dir;
+      const r = await API.post('/api/infer/pose', {
+        model_path, image_path,
+        conf: parseFloat(document.getElementById('pose-conf').value) || 0.25,
+        model_type: document.getElementById('pose-model-type').value,
+      });
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      let html = `<div style="text-align:center;"><img src="data:image/jpeg;base64,${r.image}" style="max-width:100%;max-height:500px;border-radius:8px;"></div>`;
+      html += `<div style="margin-top:1rem;" class="text-secondary">${t('pose.persons')}: ${r.num_persons} | ${t('pose.infer_ms')}: ${r.infer_ms}ms</div>`;
+      if (r.detections && r.detections.length) {
+        html += '<div class="table-container" style="margin-top:0.75rem;"><table><thead><tr><th>#</th><th>Score</th><th>Keypoints (visible)</th></tr></thead><tbody>';
+        r.detections.forEach((d, i) => {
+          const visible = d.keypoints.filter(k => k[2] > 0.5).length;
+          html += `<tr><td>${i+1}</td><td>${d.score}</td><td>${visible}/17</td></tr>`;
+        });
+        html += '</tbody></table></div>';
+      }
+      document.getElementById('pose-result').innerHTML = html;
+      App.setStatus(t('pose.done'));
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  }
+};
+
+/* ── Phase 1: Instance Segmentation Tab ─────────────── */
+Tabs['instance-seg'] = {
+  title: true,
+  render() {
+    return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
+      <div class="card" style="padding:1.5rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('instseg.title')}</h3>
+        ${modelInput('iseg-model')}
+        ${imgDirInput('iseg-img')}
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:0.75rem;">
+          <div class="form-group"><label class="form-label">${t('instseg.model_type')}</label>
+            <select class="form-input input-normal" id="iseg-model-type">
+              <option value="instseg_yolo">YOLO-Seg Instance (v8/v11)</option>
+              <option value="instseg_maskrcnn">Mask R-CNN</option>
+            </select></div>
+          <div class="form-group"><label class="form-label">${t('settings.conf')}</label>
+            <input type="number" class="form-input input-normal" id="iseg-conf" value="0.25" min="0.01" max="0.99" step="0.05"></div>
+        </div>
+        <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs['instance-seg'].run()">${t('instseg.run')}</button>
+      </div>
+      <div class="card" style="padding:1.5rem;min-height:300px;" id="iseg-result">
+        <span class="text-secondary">${t('instseg.hint')}</span>
+      </div>
+    </div>`;
+  },
+  async run() {
+    const model_path = document.getElementById('iseg-model')?.value || G.model;
+    const img_dir = document.getElementById('iseg-img')?.value || G.imgDir;
+    if (!model_path) { App.setStatus(t('select_model')); return; }
+    if (!img_dir) { App.setStatus(t('eval.select_images')); return; }
+    App.setStatus(t('instseg.running'));
+    try {
+      const imgs = await API.post('/api/list-files', {dir: img_dir, exts: ['.jpg','.jpeg','.png','.bmp']});
+      const image_path = (imgs.files && imgs.files.length) ? imgs.files[0] : img_dir;
+      const r = await API.post('/api/infer/instance-seg', {
+        model_path, image_path,
+        conf: parseFloat(document.getElementById('iseg-conf').value) || 0.25,
+        model_type: document.getElementById('iseg-model-type').value,
+      });
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      let html = `<div style="text-align:center;"><img src="data:image/jpeg;base64,${r.image}" style="max-width:100%;max-height:500px;border-radius:8px;"></div>`;
+      html += `<div style="margin-top:1rem;" class="text-secondary">${t('instseg.instances')}: ${r.num_instances} | ${t('instseg.infer_ms')}: ${r.infer_ms}ms</div>`;
+      document.getElementById('iseg-result').innerHTML = html;
+      App.setStatus(t('instseg.done'));
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  }
+};
+
+/* ── Phase 1: Object Tracking Tab ───────────────────── */
+Tabs['tracking'] = {
+  title: true,
+  _trackerId: null,
+  render() {
+    return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
+      <div class="card" style="padding:1.5rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('tracking.title')}</h3>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;">
+          <div class="form-group"><label class="form-label">${t('tracking.tracker_type')}</label>
+            <select class="form-input input-normal" id="track-type">
+              <option value="bytetrack">ByteTrack</option>
+              <option value="sort">SORT</option>
+            </select></div>
+        </div>
+        <p class="text-secondary" style="margin-top:0.75rem;font-size:12px;">${t('tracking.desc')}</p>
+        <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+          <button class="btn btn-primary" onclick="Tabs.tracking.create()">${t('tracking.create')}</button>
+          <button class="btn btn-secondary" onclick="Tabs.tracking.reset()">${t('tracking.reset')}</button>
+        </div>
+      </div>
+      <div class="card" style="padding:1.5rem;" id="track-result">
+        <span class="text-secondary">${t('tracking.hint')}</span>
+      </div>
+    </div>`;
+  },
+  async create() {
+    try {
+      const r = await API.post('/api/tracking/create', {tracker_type: document.getElementById('track-type').value});
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      this._trackerId = r.tracker_id;
+      document.getElementById('track-result').innerHTML = `<div class="text-secondary">${t('tracking.created')}: <strong>${r.tracker_id}</strong> (${r.type})</div>`;
+      App.setStatus(t('tracking.created_status'));
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  },
+  async reset() {
+    if (!this._trackerId) { App.setStatus(t('tracking.no_tracker')); return; }
+    try {
+      await API.post('/api/tracking/reset', {tracker_id: this._trackerId});
+      App.setStatus(t('tracking.reset_done'));
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  }
+};
+
+/* ── Phase 1: ONNX Model Inspector Tab ──────────────── */
+Tabs['inspector'] = {
+  title: true,
+  render() {
+    return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
+      <div class="card" style="padding:1.5rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('inspector.title')}</h3>
+        ${modelInput('insp-model')}
+        <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.inspector.run()">${t('inspector.inspect')}</button>
+      </div>
+      <div class="card" style="padding:1.5rem;" id="insp-result">
+        <span class="text-secondary">${t('inspector.hint')}</span>
+      </div>
+    </div>`;
+  },
+  async run() {
+    const path = document.getElementById('insp-model')?.value || G.model;
+    if (!path) { App.setStatus(t('select_model')); return; }
+    App.setStatus(t('inspector.running'));
+    try {
+      const r = await API.post('/api/inspector/inspect', {path});
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">';
+      // Basic info
+      html += `<div class="card-flat" style="padding:1rem;">
+        <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.basic')}</div>
+        <table style="width:100%;font-size:12px;">
+          <tr><td class="text-secondary">File</td><td>${r.file_name}</td></tr>
+          <tr><td class="text-secondary">Size</td><td>${r.file_size_mb} MB</td></tr>
+          <tr><td class="text-secondary">Opset</td><td>${r.opset_version}</td></tr>
+          <tr><td class="text-secondary">IR Version</td><td>${r.ir_version}</td></tr>
+          <tr><td class="text-secondary">Producer</td><td>${r.producer || '—'}</td></tr>
+          <tr><td class="text-secondary">Nodes</td><td>${r.num_nodes}</td></tr>
+          <tr><td class="text-secondary">Parameters</td><td>${r.num_parameters ? r.num_parameters.toLocaleString() : '—'}</td></tr>
+        </table></div>`;
+      // I/O
+      html += `<div class="card-flat" style="padding:1rem;">
+        <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.io')}</div>
+        <div style="font-size:12px;"><strong>Inputs:</strong><ul style="margin:0.25rem 0;">`;
+      (r.inputs||[]).forEach(i => { html += `<li>${i.name}: [${i.shape.join(', ')}] (${i.dtype})</li>`; });
+      html += `</ul><strong>Outputs:</strong><ul style="margin:0.25rem 0;">`;
+      (r.outputs||[]).forEach(o => { html += `<li>${o.name}: [${o.shape.join(', ')}] (${o.dtype})</li>`; });
+      html += '</ul></div></div>';
+      // EP compatibility
+      html += `<div class="card-flat" style="padding:1rem;">
+        <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.ep')}</div>
+        <div style="font-size:12px;">`;
+      (r.compatible_eps||[]).forEach(ep => { html += `<span class="badge" style="margin:2px;">${ep}</span> `; });
+      html += '</div></div>';
+      // Op counts (top 10)
+      html += `<div class="card-flat" style="padding:1rem;">
+        <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.ops')}</div>
+        <div style="font-size:12px;">`;
+      const ops = Object.entries(r.node_op_counts||{}).sort((a,b)=>b[1]-a[1]).slice(0,10);
+      ops.forEach(([op, cnt]) => { html += `<div style="display:flex;justify-content:space-between;"><span>${op}</span><span>${cnt}</span></div>`; });
+      html += '</div></div>';
+      // Metadata
+      if (r.metadata && Object.keys(r.metadata).length) {
+        html += `<div class="card-flat" style="padding:1rem;grid-column:span 2;">
+          <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.metadata')}</div>
+          <div style="font-size:11px;max-height:200px;overflow-y:auto;word-break:break-all;">`;
+        Object.entries(r.metadata).forEach(([k,v]) => {
+          const val = String(v).length > 200 ? String(v).substring(0,200) + '…' : v;
+          html += `<div><strong>${k}:</strong> ${val}</div>`;
+        });
+        html += '</div></div>';
+      }
+      html += '</div>';
+      document.getElementById('insp-result').innerHTML = html;
+      App.setStatus(t('inspector.done'));
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  }
+};
+
+/* ── Phase 1: Model Profiler Tab ────────────────────── */
+Tabs['profiler'] = {
+  title: true,
+  render() {
+    return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
+      <div class="card" style="padding:1.5rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('profiler.title')}</h3>
+        ${modelInput('prof-model')}
+        <div class="form-group" style="margin-top:0.75rem;">
+          <label class="form-label">${t('profiler.num_runs')}</label>
+          <input type="number" class="form-input input-normal" id="prof-runs" value="20" min="5" max="200" style="width:120px;">
+        </div>
+        <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.profiler.run()">${t('profiler.run')}</button>
+      </div>
+      <div class="card" style="padding:1.5rem;" id="prof-result">
+        <span class="text-secondary">${t('profiler.hint')}</span>
+      </div>
+    </div>`;
+  },
+  async run() {
+    const path = document.getElementById('prof-model')?.value || G.model;
+    if (!path) { App.setStatus(t('select_model')); return; }
+    App.setStatus(t('profiler.running'));
+    try {
+      const r = await API.post('/api/profiler/run', {path, num_runs: parseInt(document.getElementById('prof-runs').value)||20});
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">';
+      // Latency stats
+      html += `<div class="card-flat" style="padding:1rem;">
+        <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.latency')}</div>
+        <table style="width:100%;font-size:12px;">
+          <tr><td class="text-secondary">Avg</td><td><strong>${r.avg_infer_ms} ms</strong></td></tr>
+          <tr><td class="text-secondary">Min</td><td>${r.min_infer_ms} ms</td></tr>
+          <tr><td class="text-secondary">Max</td><td>${r.max_infer_ms} ms</td></tr>
+          <tr><td class="text-secondary">P50</td><td>${r.p50_ms} ms</td></tr>
+          <tr><td class="text-secondary">P95</td><td>${r.p95_ms} ms</td></tr>
+          <tr><td class="text-secondary">P99</td><td>${r.p99_ms} ms</td></tr>
+          <tr><td class="text-secondary">Runs</td><td>${r.num_runs}</td></tr>
+        </table></div>`;
+      // Model info
+      html += `<div class="card-flat" style="padding:1rem;">
+        <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.model_info')}</div>
+        <table style="width:100%;font-size:12px;">
+          <tr><td class="text-secondary">Parameters</td><td>${r.num_parameters ? r.num_parameters.toLocaleString() : '—'}</td></tr>
+          <tr><td class="text-secondary">Est. FLOPs</td><td>${r.estimated_flops ? (r.estimated_flops/1e9).toFixed(2)+' G' : '—'}</td></tr>
+          <tr><td class="text-secondary">FPS (avg)</td><td>${r.avg_infer_ms > 0 ? (1000/r.avg_infer_ms).toFixed(1) : '—'}</td></tr>
+        </table></div>`;
+      // Bottlenecks
+      if (r.top_bottlenecks && r.top_bottlenecks.length) {
+        html += `<div class="card-flat" style="padding:1rem;grid-column:span 2;">
+          <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.bottlenecks')}</div>
+          <div class="table-container"><table><thead><tr><th>Layer</th><th>Op</th><th>Time (μs)</th></tr></thead><tbody>`;
+        r.top_bottlenecks.forEach(l => {
+          html += `<tr><td style="font-size:11px;max-width:300px;overflow:hidden;text-overflow:ellipsis;">${l.name}</td><td>${l.op_type}</td><td>${l.duration_us}</td></tr>`;
+        });
+        html += '</tbody></table></div></div>';
+      }
+      html += '</div>';
+      document.getElementById('prof-result').innerHTML = html;
+      App.setStatus(t('profiler.done'));
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  }
+};
+
+/* ── Phase 1: VLM Tab (placeholder) ─────────────────── */
+Tabs['vlm'] = {
+  title: true,
+  render() {
+    return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
+      <div class="card" style="padding:1.5rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('vlm.title')}</h3>
+        ${modelInput('vlm-model')}
+        ${imgDirInput('vlm-img')}
+        <div class="form-group" style="margin-top:0.75rem;">
+          <label class="form-label">${t('vlm.task')}</label>
+          <select class="form-input input-normal" id="vlm-task">
+            <option value="vqa">Visual Question Answering (VQA)</option>
+            <option value="caption">Image Captioning</option>
+            <option value="grounding">Visual Grounding</option>
+          </select>
+        </div>
+        <div class="form-group" style="margin-top:0.75rem;">
+          <label class="form-label">${t('vlm.prompt')}</label>
+          <input type="text" class="form-input input-normal" id="vlm-prompt" placeholder="${t('vlm.prompt_hint')}" value="">
+        </div>
+        <p class="text-secondary" style="margin-top:0.75rem;font-size:12px;">${t('vlm.desc')}</p>
+      </div>
+    </div>`;
   }
 };
