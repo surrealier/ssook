@@ -41,7 +41,13 @@ Tabs.viewer = {
             <div class="text-label" style="margin-bottom:0.5rem;">${t('viewer.video_image')}</div>
             <div style="display:flex;gap:0.25rem;margin-bottom:0.5rem;">
               <button class="btn btn-secondary btn-sm" style="flex:1;" onclick="Tabs.viewer.browseVideo()">${t('browse')}</button>
+              <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseImageFolder()" title="Open image folder">📁</button>
               <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshVideos()" title="Refresh">↻</button>
+            </div>
+            <div id="v-img-nav-bar" style="display:none;align-items:center;gap:0.25rem;margin-bottom:0.5rem;">
+              <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer._navImage(-1)">◀</button>
+              <span id="v-img-nav" style="flex:1;text-align:center;font-size:11px;" class="text-secondary"></span>
+              <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer._navImage(1)">▶</button>
             </div>
             <div id="v-video-list" style="flex:1;overflow-y:auto;font-size:12px;" class="text-secondary">${t('viewer.loading')}</div>
           </div>
@@ -208,8 +214,8 @@ Tabs.viewer = {
   _onKey(e) {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
     if (e.key === ' ') { e.preventDefault(); this._streamSessionId ? (this._paused ? this.play() : this.pause()) : this.play(); }
-    else if (e.key === 'ArrowLeft') { e.preventDefault(); this.stepBack(); }
-    else if (e.key === 'ArrowRight') { e.preventDefault(); this.stepFwd(); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); this._imgList ? this._navImage(-1) : this.stepBack(); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); this._imgList ? this._navImage(1) : this.stepFwd(); }
     else if (e.key === 's' || e.key === 'S') this.snapshot();
     else if (e.key === '+' || e.key === '=') this._changeSpeed(1);
     else if (e.key === '-') this._changeSpeed(-1);
@@ -291,6 +297,12 @@ Tabs.viewer = {
       this._streamSessionId = null;
       this._paused = false;
     }
+    // 단일 파일 직접 선택 시 폴더 네비게이션 해제
+    if (!this._imgList || !this._imgList.includes(path)) {
+      this._imgList = null; this._imgIdx = 0;
+      const navBar = document.getElementById('v-img-nav-bar');
+      if (navBar) navBar.style.display = 'none';
+    }
     G.videoPath = path;
     const name = path.split(/[\\/]/).pop();
     App.setStatus(`Video: ${name}`);
@@ -318,6 +330,32 @@ Tabs.viewer = {
   },
   async browseVideo() {
     _showFileBrowser('file', ['.mp4','.avi','.mov','.mkv','.jpg','.jpeg','.png','.bmp'], (path) => this.selectVideo(path));
+  },
+  async browseImageFolder() {
+    _showFileBrowser('dir', null, async (dirPath) => {
+      try {
+        const r = await API.post('/api/fs/list', { path: dirPath, exts: ['.jpg','.jpeg','.png','.bmp'] });
+        if (!r.files || !r.files.length) { App.setStatus('No images found in folder'); return; }
+        this._imgList = r.files.map(f => f.path);
+        this._imgIdx = 0;
+        this.selectVideo(this._imgList[0]);
+        const navBar = document.getElementById('v-img-nav-bar');
+        if (navBar) navBar.style.display = 'flex';
+        this._updateImgNav();
+      } catch(e) { App.setStatus('Error: ' + e.message); }
+    });
+  },
+  _imgList: null,
+  _imgIdx: 0,
+  _navImage(delta) {
+    if (!this._imgList || !this._imgList.length) return;
+    this._imgIdx = Math.max(0, Math.min(this._imgList.length - 1, this._imgIdx + delta));
+    this.selectVideo(this._imgList[this._imgIdx]);
+    this._updateImgNav();
+  },
+  _updateImgNav() {
+    const el = document.getElementById('v-img-nav');
+    if (el && this._imgList) el.textContent = `${this._imgIdx + 1} / ${this._imgList.length}`;
   },
   togglePlay() {
     if (!G.model) { App.setStatus(t('viewer.select_model_first')); return; }
