@@ -7,7 +7,6 @@ const App = {
     ['sec.inference',  [['viewer','viewer'],['settings','settings']]],
     ['sec.evaluation', [['evaluation','evaluation'],['benchmark','benchmark'],['segmentation','segmentation'],['clip','clip'],['embedder','embedder']]],
     ['sec.analysis',   [['analysis','analysis'],['model-compare','compare'],['error-analyzer','errorAnalyzer'],['conf-optimizer','confOptimizer'],['embedding-viewer','embeddingViewer']]],
-    ['sec.tasks',      [['pose','pose'],['instance-seg','instanceSeg'],['tracking','tracking'],['vlm','vlm']]],
     ['sec.tools',      [['inspector','inspector'],['profiler','profiler']]],
     ['sec.data',       [['explorer','explorer'],['splitter','splitter'],['converter','converter'],['remapper','remapper'],['merger','merger'],['sampler','sampler'],['augmentation','augmentation']]],
     ['sec.quality',    [['anomaly','anomaly'],['quality','quality'],['duplicate','duplicate'],['leaky','leaky'],['similarity','similarity']]],
@@ -168,4 +167,8 @@ const App = {
   }
 };
 
-document.addEventListener('DOMContentLoaded', () => App.init());
+document.addEventListener('DOMContentLoaded', () => {
+  App.init();
+  // Heartbeat: keep server alive while browser is open
+  setInterval(() => fetch('/api/heartbeat', {method:'POST'}).catch(()=>{}), 10000);
+});

@@ -123,15 +123,22 @@ function _showFileBrowser(mode, exts, callback) {
         return;
       }
       listEl.innerHTML = '';
+      let selectedRow = null;
       r.entries.forEach(e => {
         const row = document.createElement('div');
-        row.style.cssText = 'padding:0.35rem 0.5rem;cursor:pointer;border-radius:6px;display:flex;align-items:center;gap:0.5rem;font-size:13px;';
-        row.onmouseenter = () => row.style.background = 'var(--background-tint-01)';
-        row.onmouseleave = () => row.style.background = '';
+        row.style.cssText = 'padding:0.35rem 0.5rem;cursor:pointer;border-radius:6px;display:flex;align-items:center;gap:0.5rem;font-size:13px;transition:background 0.1s;';
+        row.onmouseenter = () => { if (row !== selectedRow) row.style.background = 'var(--background-tint-01)'; };
+        row.onmouseleave = () => { if (row !== selectedRow) row.style.background = ''; };
         if (e.type === 'drive' || e.type === 'dir') {
           row.innerHTML = '<span style="opacity:0.6;">📁</span> ' + e.name;
           row.ondblclick = () => navigate(e.path);
-          row.onclick = () => { pathEl.value = e.path; currentPath = e.path; };
+          row.onclick = () => {
+            if (selectedRow) { selectedRow.style.background = ''; selectedRow.style.outline = ''; }
+            selectedRow = row;
+            row.style.background = 'var(--action-link-01, rgba(74,158,255,0.15))';
+            row.style.outline = '1px solid var(--action-link-05, #4a9eff)';
+            pathEl.value = e.path; currentPath = e.path;
+          };
         } else {
           row.innerHTML = '<span style="opacity:0.4;">📄</span> ' + e.name;
           row.onclick = () => { cleanup(); callback(e.path); };

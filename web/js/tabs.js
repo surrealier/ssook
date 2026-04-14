@@ -32,7 +32,8 @@ Tabs.viewer = {
           <div class="card-flat" style="padding:0.75rem;">
             <div class="text-label" style="margin-bottom:0.5rem;">${t('settings.model')}</div>
             <div style="display:flex;gap:0.25rem;margin-bottom:0.5rem;">
-              <button class="btn btn-secondary btn-sm" style="flex:1;" onclick="Tabs.viewer.browseModel()">${t('browse')}</button>
+              <input type="text" class="form-input input-normal" style="flex:1;font-size:11px;height:28px;" id="v-model-path" placeholder="Model path" value="${G.model}" onchange="Tabs.viewer.selectModel(this.value)">
+              <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseModel()">${t('browse')}</button>
               <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshModels()" title="Refresh">↻</button>
             </div>
             <div id="v-model-list" style="flex:1;overflow-y:auto;font-size:12px;" class="text-secondary">${t('viewer.loading')}</div>
@@ -40,7 +41,8 @@ Tabs.viewer = {
           <div class="card-flat" style="padding:0.75rem;flex:1;display:flex;flex-direction:column;">
             <div class="text-label" style="margin-bottom:0.5rem;">${t('viewer.video_image')}</div>
             <div style="display:flex;gap:0.25rem;margin-bottom:0.5rem;">
-              <button class="btn btn-secondary btn-sm" style="flex:1;" onclick="Tabs.viewer.browseVideo()">${t('browse')}</button>
+              <input type="text" class="form-input input-normal" style="flex:1;font-size:11px;height:28px;" id="v-video-path" placeholder="Video/Image path" value="${G.videoPath||''}" onchange="Tabs.viewer.selectVideo(this.value)">
+              <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseVideo()">${t('browse')}</button>
               <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseImageFolder()" title="Open image folder">📁</button>
               <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshVideos()" title="Refresh">↻</button>
             </div>
@@ -50,6 +52,23 @@ Tabs.viewer = {
               <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer._navImage(1)">▶</button>
             </div>
             <div id="v-video-list" style="flex:1;overflow-y:auto;font-size:12px;" class="text-secondary">${t('viewer.loading')}</div>
+          </div>
+          <!-- CLIP/VLM text input panel (hidden by default) -->
+          <div id="v-text-panel" class="card-flat" style="padding:0.75rem;display:none;">
+            <div class="text-label" style="margin-bottom:0.35rem;font-size:11px;">Text Input</div>
+            <div id="v-clip-inputs" style="display:none;">
+              <input type="text" class="form-input input-normal" style="font-size:11px;height:28px;margin-bottom:0.35rem;" id="v-clip-labels" placeholder="Labels (comma separated): dog, cat, bird">
+              <div class="form-group" style="margin-bottom:0.35rem;">
+                <label class="form-label" style="font-size:10px;">Text Encoder</label>
+                <div style="display:flex;gap:0.25rem;">
+                  <input type="text" class="form-input input-normal" style="flex:1;font-size:11px;height:28px;" id="v-clip-txt-enc" placeholder="Text encoder .onnx">
+                  <button class="btn btn-secondary btn-sm" onclick="pickFile('v-clip-txt-enc','ONNX (*.onnx)')" style="font-size:10px;">📂</button>
+                </div>
+              </div>
+            </div>
+            <div id="v-vlm-inputs" style="display:none;">
+              <textarea class="form-input input-normal" style="font-size:11px;height:60px;resize:vertical;" id="v-vlm-prompt" placeholder="Enter prompt / question..."></textarea>
+            </div>
           </div>
         </div>
         <!-- Center: canvas + controls -->
@@ -122,13 +141,18 @@ Tabs.viewer = {
           mt.innerHTML = '';
           const groups = {
             'Detection': [], 'Classification': [], 'Segmentation': [],
-            'CLIP': [], 'Embedder': [], 'Custom': []
+            'Pose': [], 'Instance Seg': [], 'Tracking': [],
+            'CLIP': [], 'Embedder': [], 'VLM': [], 'Custom': []
           };
           for (const [key, label] of Object.entries(c.model_types)) {
             if (key.startsWith('cls_')) groups['Classification'].push([key, label]);
             else if (key.startsWith('seg_')) groups['Segmentation'].push([key, label]);
             else if (key.startsWith('clip_')) groups['CLIP'].push([key, label]);
             else if (key.startsWith('emb_')) groups['Embedder'].push([key, label]);
+            else if (key.startsWith('pose_')) groups['Pose'].push([key, label]);
+            else if (key.startsWith('instseg_')) groups['Instance Seg'].push([key, label]);
+            else if (key.startsWith('track_')) groups['Tracking'].push([key, label]);
+            else if (key.startsWith('vlm_')) groups['VLM'].push([key, label]);
             else if (key.startsWith('custom:')) groups['Custom'].push([key, label]);
             else groups['Detection'].push([key, label]);
           }
@@ -223,11 +247,18 @@ Tabs.viewer = {
   _getConf() { return +(document.getElementById('v-conf-slider')?.value || 25) / 100; },
   async _onModelTypeChange() {
     const v = document.getElementById('v-model-type').value;
-    if (v.startsWith('clip_') || v.startsWith('emb_')) {
-      App.setStatus(t('viewer.clip_not_viewer'));
-      return;
-    }
     await API.post('/api/config', { model_type: v });
+    // Show/hide text input panels based on model type
+    const textPanel = document.getElementById('v-text-panel');
+    const clipInputs = document.getElementById('v-clip-inputs');
+    const vlmInputs = document.getElementById('v-vlm-inputs');
+    if (v.startsWith('clip_') || v.startsWith('emb_')) {
+      textPanel.style.display = ''; clipInputs.style.display = ''; vlmInputs.style.display = 'none';
+    } else if (v.startsWith('vlm_')) {
+      textPanel.style.display = ''; clipInputs.style.display = 'none'; vlmInputs.style.display = '';
+    } else {
+      textPanel.style.display = 'none';
+    }
   },
   async _onBatchChange() {
     await API.post('/api/config', { batch_size: +document.getElementById('v-batch-size').value });
@@ -273,6 +304,8 @@ Tabs.viewer = {
   },
   async selectModel(path) {
     setModel(path);
+    const mp = document.getElementById('v-model-path');
+    if (mp) mp.value = path;
     await this._showModelInfo(path);
     // 이미지가 이미 로드되어 있으면 자동 추론
     if (G.videoPath) {
@@ -297,6 +330,8 @@ Tabs.viewer = {
       this._streamSessionId = null;
       this._paused = false;
     }
+    const vp = document.getElementById('v-video-path');
+    if (vp) vp.value = path;
     // 단일 파일 직접 선택 시 폴더 네비게이션 해제
     if (!this._imgList || !this._imgList.includes(path)) {
       this._imgList = null; this._imgIdx = 0;
@@ -376,19 +411,31 @@ Tabs.viewer = {
   async _inferImage() {
     try {
       const conf = this._getConf();
-      const r = await API.post('/api/infer/image', {
-        model_path: G.model, image_path: G.videoPath, conf
-      });
+      const body = { model_path: G.model, image_path: G.videoPath, conf };
+      // CLIP/Embedder: text labels + text encoder
+      const clipLabels = document.getElementById('v-clip-labels')?.value;
+      if (clipLabels) body.clip_labels = clipLabels;
+      const clipTxtEnc = document.getElementById('v-clip-txt-enc')?.value;
+      if (clipTxtEnc) body.clip_text_encoder = clipTxtEnc;
+      // VLM: prompt
+      const vlmPrompt = document.getElementById('v-vlm-prompt')?.value;
+      if (vlmPrompt) body.vlm_prompt = vlmPrompt;
+      const r = await API.post('/api/infer/image', body);
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       document.getElementById('viewer-canvas').innerHTML = `<img src="data:image/jpeg;base64,${r.image}" style="max-width:100%;max-height:100%;">`;
       const resEl = document.getElementById('viewer-results');
       if (r.classification) resEl.innerHTML = `<b>${r.classification}</b>` + (r.top_k ? '<br>' + r.top_k.map(t=>`${t.class}: ${t.score}`).join('<br>') : '');
       else if (r.segmentation) resEl.textContent = r.segmentation;
       else if (r.embedding) resEl.textContent = r.embedding;
+      else if (r.pose) resEl.textContent = r.pose;
+      else if (r.instance_seg) resEl.textContent = r.instance_seg;
+      else if (r.clip_result) resEl.innerHTML = r.clip_result.map(c=>`${c.label}: ${(c.score*100).toFixed(1)}%`).join('<br>');
+      else if (r.vlm_result) resEl.textContent = r.vlm_result;
       else resEl.textContent = `${r.detections} detections`;
       document.getElementById('v-infer-stats').innerHTML = `Infer: ${r.infer_ms} ms`;
-      App.setStatus(r.classification ? `Classification: ${r.classification}` : r.segmentation ? `Segmentation: ${r.segmentation}` : r.embedding ? `Embedding: ${r.embedding}, ${r.infer_ms}ms` : `Inference done: ${r.detections} detections, ${r.infer_ms}ms`);
-      if (document.getElementById('v-save-crops')?.checked && r.detections > 0 && !r.classification && !r.segmentation && !r.embedding) {
+      const status = r.classification ? `Classification: ${r.classification}` : r.segmentation ? `Segmentation: ${r.segmentation}` : r.pose ? `Pose: ${r.pose}` : r.instance_seg ? `Instance Seg: ${r.instance_seg}` : r.clip_result ? `CLIP: ${r.clip_result[0]?.label}` : r.vlm_result ? `VLM: ${r.vlm_result.substring(0,50)}` : `Inference done: ${r.detections} detections, ${r.infer_ms}ms`;
+      App.setStatus(status);
+      if (document.getElementById('v-save-crops')?.checked && r.detections > 0 && !r.classification && !r.segmentation && !r.embedding && !r.pose && !r.instance_seg) {
         const cr = await API.post('/api/infer/save-crops', { model_path: G.model, image_path: G.videoPath, conf });
         if (cr.ok) App.setStatus(t('viewer.crops_saved', {count: cr.count, path: cr.path}));
       }
@@ -655,7 +702,7 @@ Tabs.settings = {
         <div class="form-group" style="margin-top:0.75rem;">
           <label class="form-label">${t('cmt.onnx_model')}</label>
           <div style="display:flex;gap:0.5rem;">
-            <span id="cmt-model-label" class="text-secondary" style="flex:1;line-height:36px;">${t('cmt.not_selected')}</span>
+            <input type="text" class="form-input input-normal" style="flex:1;" id="cmt-model-path" placeholder="ONNX model path" onchange="Tabs.settings._cmtLoadModel(this.value)">
             <button class="btn btn-secondary btn-sm" onclick="Tabs.settings._cmtBrowseModel()">${t('cmt.select_model')}</button>
           </div>
         </div>
@@ -678,7 +725,7 @@ Tabs.settings = {
           <div class="form-group">
             <label class="form-label">${t('cmt.test_image')}</label>
             <div style="display:flex;gap:0.5rem;">
-              <span id="cmt-test-label" class="text-secondary" style="flex:1;line-height:36px;">${t('cmt.not_selected')}</span>
+              <input type="text" class="form-input input-normal" style="flex:1;" id="cmt-test-path" placeholder="Image path" onchange="Tabs.settings._cmtTestPath=this.value;document.getElementById('cmt-test-label').textContent=this.value.split(/[\\\\/]/).pop()">
               <button class="btn btn-secondary btn-sm" onclick="Tabs.settings._cmtBrowseTestImg()">${t('cmt.select_image')}</button>
               <button class="btn btn-primary btn-sm" onclick="Tabs.settings._cmtRunTest()">${t('cmt.run_infer')}</button>
             </div>
@@ -698,11 +745,31 @@ Tabs.settings = {
     this._cmtInferredOutputs = [];
   },
 
+  async _cmtLoadModel(path) {
+    if (!path) return;
+    this._cmtModelPath = path;
+    document.getElementById('cmt-shape-info').textContent = t('cmt.inferring');
+    try {
+      const res = await API.post('/api/model/infer-shapes', { path });
+      if (res.error) { document.getElementById('cmt-shape-info').textContent = 'Error: ' + res.error; return; }
+      this._cmtInferredOutputs = res.outputs;
+      let info = t('cmt.input') + ': ' + JSON.stringify(res.input_shape);
+      res.outputs.forEach(o => { info += '\n' + t('cmt.output') + '[' + o.index + '] ' + o.name + ': ' + JSON.stringify(o.shape); });
+      document.getElementById('cmt-shape-info').innerText = info;
+      const sel = document.getElementById('cmt-oi');
+      sel.innerHTML = res.outputs.map(o =>
+        '<option value="' + o.index + '">' + t('cmt.output') + '[' + o.index + '] ' + o.name + ' — ' + JSON.stringify(o.shape) + '</option>'
+      ).join('');
+      this._cmtOnOutputSelected();
+    } catch(e) { document.getElementById('cmt-shape-info').textContent = 'Error: ' + e.message; }
+  },
+
   async _cmtBrowseModel() {
     _showFileBrowser('file', ['.onnx'], async (path) => {
       try {
       this._cmtModelPath = path;
-      document.getElementById('cmt-model-label').textContent = path.split(/[\\/]/).pop();
+      const pathEl = document.getElementById('cmt-model-path');
+      if (pathEl) pathEl.value = path;
       document.getElementById('cmt-shape-info').textContent = t('cmt.inferring');
       // 실제 추론으로 output shape 획득 (#1c)
       const res = await API.post('/api/model/infer-shapes', { path });
@@ -797,7 +864,8 @@ Tabs.settings = {
   async _cmtBrowseTestImg() {
     _showFileBrowser('file', ['.jpg','.jpeg','.png','.bmp'], (path) => {
       this._cmtTestImgPath = path;
-      document.getElementById('cmt-test-label').textContent = path.split(/[\\/]/).pop();
+      const pathEl = document.getElementById('cmt-test-path');
+      if (pathEl) pathEl.value = path;
     });
   },
 
@@ -834,7 +902,8 @@ Tabs.settings = {
     const conf = parseFloat(document.getElementById('cmt-conf').value || '0.25');
     const classNames = this._cmtParseClassNames();
     try {
-      if (this._cmtTestImgPath) {
+      const testImg = this._cmtTestImgPath || (document.getElementById('cmt-test-path')?.value || '');
+      if (testImg) {
         await API.post('/api/config/custom-model-type', {
           name, model_path: this._cmtModelPath, output_index: oi,
           attr_roles: attrRoles, dim_roles: dimRoles,
@@ -843,7 +912,7 @@ Tabs.settings = {
         });
         await API.post('/api/config', { model_type: 'custom:' + name, conf_threshold: conf });
         const r = await API.post('/api/infer/image', {
-          model_path: this._cmtModelPath, image_path: this._cmtTestImgPath, conf
+          model_path: this._cmtModelPath, image_path: testImg, conf
         });
         if (r.error) {
           document.getElementById('cmt-test-result').innerHTML = '<span style="color:var(--action-danger-05);">Error: ' + r.error + '</span>';

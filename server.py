@@ -27,6 +27,15 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 
+def _imread(path, flags=cv2.IMREAD_COLOR):
+    """cv2.imread replacement that handles unicode/Korean paths on Windows."""
+    try:
+        buf = np.fromfile(path, dtype=np.uint8)
+        return cv2.imdecode(buf, flags)
+    except Exception:
+        return None
+
+
 def _generate_palette(n):
     """HSV 균등 분포로 n개의 BGR 색상 생성"""
     colors = []
@@ -64,10 +73,35 @@ def _draw_label(frame, text, x1, y1, color, font_scale, font_thick, show_bg):
         txt_color = color
     cv2.putText(frame, text, (x1 + 1, ty - baseline), cv2.FONT_HERSHEY_SIMPLEX, font_scale, txt_color, font_thick, cv2.LINE_AA)
 
-app = FastAPI(title="ssook", version="1.5.0")
+app = FastAPI(title="ssook", version="1.5.3")
 
 # 백그라운드 작업용 스레드 풀 (최대 4개 동시 작업)
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ssook-bg")
+
+# ── Client heartbeat & auto-shutdown ────────────────────
+_last_heartbeat = time.time()
+_HEARTBEAT_TIMEOUT = 30  # seconds without heartbeat before shutdown
+
+
+@app.post("/api/heartbeat")
+async def heartbeat():
+    global _last_heartbeat
+    _last_heartbeat = time.time()
+    return {"ok": True}
+
+
+def _heartbeat_watchdog():
+    """Background thread: shutdown server if no heartbeat received."""
+    global _last_heartbeat
+    while True:
+        time.sleep(5)
+        if time.time() - _last_heartbeat > _HEARTBEAT_TIMEOUT:
+            import logging
+            logging.info("No client heartbeat — shutting down server")
+            os._exit(0)
+
+
+threading.Thread(target=_heartbeat_watchdog, daemon=True).start()
 
 # ── Static files ────────────────────────────────────────
 WEB_DIR = ROOT / "web"
@@ -78,7 +112,10 @@ app.mount("/assets", StaticFiles(directory=ROOT / "assets"), name="assets")
 
 @app.get("/")
 async def index():
-    return FileResponse(WEB_DIR / "index.html")
+    from fastapi.responses import HTMLResponse
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    html = html.replace("{{VERSION}}", app.version)
+    return HTMLResponse(html)
 
 
 # ── Config API ──────────────────────────────────────────
@@ -341,7 +378,7 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                     if fp in _img_cache:
                         frame = _img_cache[fp]
                     else:
-                        frame = cv2.imread(fp)
+                        frame = _imread(fp)
                         if frame is not None:
                             _img_cache[fp] = frame
                     if frame is None:
@@ -572,6 +609,9 @@ class InferRequest(BaseModel):
     model_path: str
     image_path: Optional[str] = None
     conf: float = 0.25
+    clip_labels: Optional[str] = None          # comma-separated labels for CLIP
+    clip_text_encoder: Optional[str] = None    # text encoder ONNX path
+    vlm_prompt: Optional[str] = None           # VLM prompt
 
 
 @app.post("/api/infer/image")
@@ -602,14 +642,104 @@ def _infer_image_sync(req: InferRequest):
                     _loaded_model.names = cmt.class_names
             _loaded_model_meta = {"name": os.path.basename(req.model_path)}
 
-        frame = cv2.imread(req.image_path)
+        frame = _imread(req.image_path)
         if frame is None:
             return {"error": "Cannot read image"}
 
         names = _loaded_model.names or {}
 
         if _loaded_model.task_type == "embedding":
-            return {"error": "CLIP/Embedder 모델은 뷰어에서 사용할 수 없습니다. 전용 탭을 이용하세요."}
+            # CLIP zero-shot classification or embedding visualization
+            from core.clip_inference import CLIPModel, simple_tokenize
+            import time as _time
+            t0 = _time.perf_counter()
+            clip_model = CLIPModel(req.model_path, req.clip_text_encoder or None)
+            if req.clip_labels:
+                labels = [l.strip() for l in req.clip_labels.split(',') if l.strip()]
+                text_embs = [clip_model.encode_text(simple_tokenize(l)) for l in labels]
+                ranked = clip_model.zero_shot_classify(frame, text_embs, labels)
+                infer_ms = (_time.perf_counter() - t0) * 1000
+                vis = frame.copy()
+                y = 30
+                for label, score in ranked[:5]:
+                    cv2.putText(vis, f"{label}: {score*100:.1f}%", (10, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    y += 28
+                _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                return {
+                    "image": base64.b64encode(buf).decode(), "detections": 0,
+                    "clip_result": [{"label": l, "score": round(s, 4)} for l, s in ranked],
+                    "infer_ms": round(infer_ms, 2), "classes": {},
+                }
+            else:
+                emb = clip_model.encode_image(frame)
+                infer_ms = (_time.perf_counter() - t0) * 1000
+                _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                return {
+                    "image": base64.b64encode(buf).decode(), "detections": 0,
+                    "embedding": f"dim={len(emb)}, norm={float(np.linalg.norm(emb)):.4f}",
+                    "infer_ms": round(infer_ms, 2), "classes": {},
+                }
+
+        if _loaded_model.task_type == "pose":
+            from core.inference import run_pose
+            result = run_pose(_loaded_model, frame, cfg.conf_threshold)
+            vis = frame.copy()
+            _SKELETON = [(0,1),(0,2),(1,3),(2,4),(5,6),(5,7),(7,9),(6,8),(8,10),
+                         (5,11),(6,12),(11,12),(11,13),(13,15),(12,14),(14,16)]
+            for i in range(len(result.boxes)):
+                x1, y1, x2, y2 = map(int, result.boxes[i])
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                kpts = result.keypoints[i]  # (17, 3)
+                for j in range(17):
+                    if kpts[j, 2] > 0.3:
+                        cv2.circle(vis, (int(kpts[j,0]), int(kpts[j,1])), 3, (0, 0, 255), -1)
+                for a, b in _SKELETON:
+                    if kpts[a, 2] > 0.3 and kpts[b, 2] > 0.3:
+                        cv2.line(vis, (int(kpts[a,0]), int(kpts[a,1])),
+                                 (int(kpts[b,0]), int(kpts[b,1])), (255, 128, 0), 2)
+            _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            return {
+                "image": base64.b64encode(buf).decode(),
+                "detections": len(result.boxes),
+                "pose": f"{len(result.boxes)} persons detected",
+                "infer_ms": round(result.infer_ms, 2), "classes": {},
+            }
+
+        if _loaded_model.task_type == "instance_segmentation":
+            from core.inference import run_instance_seg
+            result = run_instance_seg(_loaded_model, frame, cfg.conf_threshold)
+            vis = frame.copy()
+            colors = _generate_palette(max(len(result.masks), 1))
+            for i, mask in enumerate(result.masks):
+                color = colors[i % len(colors)]
+                overlay = vis.copy()
+                overlay[mask > 0] = color
+                vis = cv2.addWeighted(vis, 0.6, overlay, 0.4, 0)
+                x1, y1, x2, y2 = map(int, result.boxes[i])
+                cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+                cid = int(result.class_ids[i])
+                label = f"{names.get(cid, str(cid))} {result.scores[i]:.2f}"
+                _draw_label(vis, label, x1, y1, color, 0.5, 1, True)
+            _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            return {
+                "image": base64.b64encode(buf).decode(),
+                "detections": len(result.boxes),
+                "instance_seg": f"{len(result.boxes)} instances",
+                "infer_ms": round(result.infer_ms, 2), "classes": {},
+            }
+
+        if _loaded_model.task_type == "vlm":
+            vis = frame.copy()
+            prompt = req.vlm_prompt or "Describe this image."
+            cv2.putText(vis, f"VLM: {prompt[:60]}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            return {
+                "image": base64.b64encode(buf).decode(), "detections": 0,
+                "vlm_result": f"VLM inference not yet implemented (prompt: {prompt})",
+                "infer_ms": 0, "classes": {},
+            }
 
         if _loaded_model.task_type == "classification":
             result = run_classification(_loaded_model, frame)
@@ -1033,7 +1163,7 @@ async def infer_save_crops(req: InferRequest):
                 if cmt and cmt.class_names:
                     _loaded_model.names = cmt.class_names
             _loaded_model_meta = {"name": os.path.basename(req.model_path)}
-        frame = cv2.imread(req.image_path)
+        frame = _imread(req.image_path)
         if frame is None:
             return {"error": "Cannot read image"}
         if _loaded_model.task_type != "detection":
@@ -1069,6 +1199,19 @@ class VideoInfoRequest(BaseModel):
 @app.post("/api/video/info")
 async def video_info(req: VideoInfoRequest):
     try:
+        ext = os.path.splitext(req.path)[1].lower()
+        # 이미지 파일인 경우 _imread로 처리
+        if ext in ('.jpg', '.jpeg', '.png', '.bmp'):
+            frame = _imread(req.path)
+            if frame is None:
+                return {"error": "Cannot read image"}
+            h, w = frame.shape[:2]
+            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            return {
+                "width": w, "height": h, "fps": 0,
+                "total_frames": 1, "duration": "0:00",
+                "first_frame": base64.b64encode(buf).decode(),
+            }
         cap = cv2.VideoCapture(req.path)
         if not cap.isOpened():
             return {"error": "Cannot open video"}
@@ -1574,7 +1717,7 @@ async def run_evaluation(req: EvalRequest):
                 mi = _load_model(model_path)
                 pred_data = {}
                 for fp in img_files:
-                    frame = cv2.imread(fp)
+                    frame = _imread(fp)
                     if frame is None:
                         continue
                     h, w = frame.shape[:2]
@@ -1716,7 +1859,7 @@ async def run_model_compare(req: ModelCompareRequest):
         names_b = mi_b.names or {}
         try:
             for i, fp in enumerate(imgs):
-                frame = cv2.imread(fp)
+                frame = _imread(fp)
                 if frame is None:
                     _compare_state["progress"] = i + 1
                     continue
@@ -1826,7 +1969,7 @@ async def run_error_analysis(req: ErrorAnalysisRequest):
             fn_stats = {"count": 0, "small": 0, "medium": 0, "large": 0, "top": 0, "center": 0, "bottom": 0}
 
             for i, fp in enumerate(imgs):
-                frame = cv2.imread(fp)
+                frame = _imread(fp)
                 if frame is None:
                     _error_analysis_state["progress"] = i + 1
                     continue
@@ -1937,7 +2080,7 @@ async def run_conf_optimizer(req: ConfOptimizerRequest):
             _conf_opt_state["msg"] = "Running inference..."
 
             for idx, fp in enumerate(imgs):
-                frame = cv2.imread(fp)
+                frame = _imread(fp)
                 if frame is None:
                     _conf_opt_state["progress"] = idx + 1
                     continue
@@ -2065,7 +2208,7 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
 
         _embedding_state["msg"] = f"Extracting embeddings: 0/{len(files)}"
         for i, (fp, label) in enumerate(files):
-            img = cv2.imread(str(fp))
+            img = _imread(str(fp))
             if img is None:
                 continue
             img = cv2.resize(img, (w, h))
@@ -2190,7 +2333,7 @@ async def run_clip(req: CLIPRequest):
             label_total = {l: 0 for l in labels}
             detail_log = []  # per-image detail
             for idx, fp in enumerate(imgs):
-                frame = cv2.imread(fp)
+                frame = _imread(fp)
                 if frame is None:
                     _clip_state["progress"] = idx + 1
                     continue
@@ -2285,7 +2428,7 @@ async def run_embedder(req: EmbedderRequest):
             _embedder_state["msg"] = "Extracting embeddings..."
             embeddings = []  # (class_name, embedding)
             for idx, (cls, fp) in enumerate(all_files):
-                frame = cv2.imread(fp)
+                frame = _imread(fp)
                 if frame is None:
                     _embedder_state["progress"] = idx + 1
                     continue
@@ -2391,7 +2534,7 @@ async def embedder_compare(req: dict):
         embeddings = []
         names = []
         for fp in img_paths:
-            img = cv2.imread(fp)
+            img = _imread(fp)
             if img is None:
                 continue
             img = cv2.resize(img, (w, h))
@@ -2450,7 +2593,7 @@ async def run_segmentation_eval(req: SegmentationRequest):
             detail_log = []
 
             for idx, fp in enumerate(imgs):
-                frame = cv2.imread(fp)
+                frame = _imread(fp)
                 if frame is None:
                     _seg_state["progress"] = idx + 1
                     continue
@@ -2485,7 +2628,7 @@ async def run_segmentation_eval(req: SegmentationRequest):
                 if gt_path is None:
                     _seg_state["progress"] = idx + 1
                     continue
-                gt_mask = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
+                gt_mask = _imread(gt_path, cv2.IMREAD_GRAYSCALE)
                 if gt_mask is None:
                     _seg_state["progress"] = idx + 1
                     continue
@@ -2569,7 +2712,7 @@ async def run_inference_analysis(req: InferenceAnalysisRequest):
         import time as _time
 
         mi = _load(req.model_path, model_type=req.model_type)
-        frame = cv2.imread(req.image_path)
+        frame = _imread(req.image_path)
         if frame is None:
             return {"error": "Cannot read image"}
         names = mi.names or {}
@@ -2718,7 +2861,7 @@ async def data_explorer(req: dict):
                                 box_aspect_ratios.append(round(bw / max(bh, 1e-6), 2))
                 # image aspect ratio
                 try:
-                    im = cv2.imread(fp)
+                    im = _imread(fp)
                     if im is not None:
                         h_, w_ = im.shape[:2]
                         aspect_ratios.append(round(w_ / max(h_, 1), 2))
@@ -2758,7 +2901,7 @@ async def explorer_preview(req: dict):
     lbl_dir = req.get("label_dir", "")
     if not img_path or not os.path.isfile(img_path):
         return {"error": "Image not found"}
-    img = cv2.imread(img_path)
+    img = _imread(img_path)
     if img is None:
         return {"error": "Cannot read image"}
     h, w = img.shape[:2]
@@ -2925,7 +3068,7 @@ async def data_converter(req: ConverterRequest):
                             break
                     w, h = 640, 640
                     if img_path:
-                        img = cv2.imread(img_path)
+                        img = _imread(img_path)
                         if img is not None:
                             h, w = img.shape[:2]
                     coco["images"].append({"id": i+1, "file_name": stem + (os.path.splitext(img_path)[1] if img_path else ".jpg"), "width": w, "height": h})
@@ -2993,7 +3136,7 @@ async def data_converter(req: ConverterRequest):
                             break
                     w, h = 640, 640
                     if img_path:
-                        img = cv2.imread(img_path)
+                        img = _imread(img_path)
                         if img is not None:
                             h, w = img.shape[:2]
                     root = Element("annotation")
@@ -3365,7 +3508,7 @@ async def quality_check(req: dict):
             _quality_state["total"] = len(imgs)
             results = []
             for i, fp in enumerate(imgs):
-                frame = cv2.imread(fp)
+                frame = _imread(fp)
                 if frame is None:
                     _quality_state["progress"] = i + 1
                     continue
@@ -3425,7 +3568,7 @@ async def quality_duplicate(req: dict):
             _dup_state["total"] = len(imgs)
             hashes = []
             for i, fp in enumerate(imgs):
-                frame = cv2.imread(fp)
+                frame = _imread(fp)
                 if frame is not None:
                     hashes.append((os.path.basename(fp), _dhash(frame)))
                 _dup_state["progress"] = i + 1
@@ -3474,7 +3617,7 @@ async def quality_leaky(req: dict):
                 if not d:
                     continue
                 imgs = _glob_images(d)
-                split_hashes[name] = {os.path.basename(fp): _dhash(cv2.imread(fp)) for fp in imgs if cv2.imread(fp) is not None}
+                split_hashes[name] = {os.path.basename(fp): _dhash(_imread(fp)) for fp in imgs if _imread(fp) is not None}
             _leaky_state["total"] = sum(len(v) for v in split_hashes.values())
             results = []
             names = list(split_hashes.keys())
@@ -3522,12 +3665,12 @@ async def quality_similarity(req: dict):
             _sim_state["total"] = len(imgs)
             hashes = []
             for i, fp in enumerate(imgs):
-                frame = cv2.imread(fp)
+                frame = _imread(fp)
                 if frame is not None:
                     hashes.append((os.path.basename(fp), _dhash(frame, 16)))
                 _sim_state["progress"] = i + 1
             if query and os.path.isfile(query):
-                q_frame = cv2.imread(query)
+                q_frame = _imread(query)
                 q_hash = _dhash(q_frame, 16) if q_frame is not None else 0
                 ranked = sorted(hashes, key=lambda x: bin(x[1] ^ q_hash).count('1'))
                 _sim_state["results"] = [{"rank": i+1, "image": name, "distance": bin(h ^ q_hash).count('1')} for i, (name, h) in enumerate(ranked[:top_k])]
@@ -3556,7 +3699,7 @@ async def batch_augmentation(req: dict):
             return {"error": "No images found"}
         import random
         fp = random.choice(imgs)
-        frame = cv2.imread(fp)
+        frame = _imread(fp)
         if frame is None:
             return {"error": "Cannot read image"}
         original = _encode_jpeg(frame)
@@ -3570,7 +3713,7 @@ async def batch_augmentation(req: dict):
         elif "Mosaic" in aug_type:
             h, w = frame.shape[:2]
             half_h, half_w = h//2, w//2
-            samples = [cv2.imread(random.choice(imgs)) for _ in range(4)]
+            samples = [_imread(random.choice(imgs)) for _ in range(4)]
             samples = [cv2.resize(s, (half_w, half_h)) if s is not None else np.zeros((half_h, half_w, 3), dtype=np.uint8) for s in samples]
             top = np.hstack([samples[0], samples[1]])
             bot = np.hstack([samples[2], samples[3]])
@@ -3622,7 +3765,7 @@ async def api_infer_pose(req: dict):
         model_type = req.get("model_type", "pose_yolo")
         if not model_path or not image_path:
             return {"error": "model_path and image_path required"}
-        frame = cv2.imread(image_path)
+        frame = _imread(image_path)
         if frame is None:
             return {"error": "Cannot read image"}
         mi = _load(model_path, model_type=model_type)
@@ -3666,7 +3809,7 @@ async def api_infer_instance_seg(req: dict):
         model_type = req.get("model_type", "instseg_yolo")
         if not model_path or not image_path:
             return {"error": "model_path and image_path required"}
-        frame = cv2.imread(image_path)
+        frame = _imread(image_path)
         if frame is None:
             return {"error": "Cannot read image"}
         mi = _load(model_path, model_type=model_type)
