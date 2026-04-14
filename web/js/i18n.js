@@ -194,6 +194,9 @@ const I18n = {
     'viewer.playback_done': { en: 'Playback finished', ko: '재생 완료' },
     'viewer.snapshot_saved':  { en: 'Snapshot saved: {path}',  ko: '스냅샷 저장: {path}' },
     'viewer.snapshot_failed': { en: 'Snapshot failed',         ko: '스냅샷 실패' },
+    'viewer.save_crops':      { en: 'Save Crops',              ko: '크롭 저장' },
+    'viewer.save_crops_tip':  { en: 'Save detected box regions as individual images', ko: '탐지된 박스 영역을 개별 이미지로 저장' },
+    'viewer.crops_saved':     { en: 'Crops saved: {count} images → {path}', ko: '크롭 저장: {count}개 → {path}' },
     // Settings extra
     'settings.model_type_mgmt':   { en: 'Model Type Management',    ko: '모델 타입 관리' },
     'settings.add_model_type':    { en: 'Add Model Type…',          ko: '모델 타입 추가…' },

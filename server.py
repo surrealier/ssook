@@ -983,6 +983,84 @@ async def viewer_snapshot(session_id: str):
     return {"ok": True, "path": path}
 
 
+@app.post("/api/viewer/save-crops/{session_id}")
+async def viewer_save_crops(session_id: str):
+    """Save cropped detection boxes from the last frame."""
+    sess = _video_sessions.get(session_id)
+    if not sess:
+        return {"error": "No session"}
+    frame = sess.get("last_frame")
+    result = sess.get("last_result")
+    if frame is None or result is None or len(result.boxes) == 0:
+        return {"error": "No detections available"}
+    names = (sess.get("model") and sess["model"].names) or {}
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join("snapshots", f"crops_{ts}")
+    os.makedirs(out_dir, exist_ok=True)
+    h, w = frame.shape[:2]
+    saved = 0
+    for i, (box, score, cid) in enumerate(zip(result.boxes, result.scores, result.class_ids)):
+        x1, y1, x2, y2 = max(0, int(box[0])), max(0, int(box[1])), min(w, int(box[2])), min(h, int(box[3]))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        cls_name = names.get(int(cid), str(int(cid)))
+        crop = frame[y1:y2, x1:x2]
+        cv2.imwrite(os.path.join(out_dir, f"{i:03d}_{cls_name}_{score:.2f}.jpg"), crop)
+        saved += 1
+    return {"ok": True, "path": out_dir, "count": saved}
+
+
+@app.post("/api/infer/save-crops")
+async def infer_save_crops(req: InferRequest):
+    """Run inference on a single image and save cropped boxes."""
+    global _loaded_model, _loaded_model_meta
+    try:
+        from core.model_loader import load_model as _load
+        from core.inference import run_inference
+        from core.app_config import AppConfig
+        cfg = AppConfig()
+        model_type = cfg.model_type
+        custom_name = ""
+        if model_type.startswith("custom:"):
+            custom_name = model_type.split(":", 1)[1]
+            model_type = "custom"
+        if _loaded_model is None or _loaded_model.path != req.model_path or _loaded_model.model_type != model_type:
+            _loaded_model = _load(req.model_path, model_type=model_type)
+            if custom_name:
+                _loaded_model.custom_type_name = custom_name
+                cmt = cfg.custom_model_types.get(custom_name)
+                if cmt and cmt.class_names:
+                    _loaded_model.names = cmt.class_names
+            _loaded_model_meta = {"name": os.path.basename(req.model_path)}
+        frame = cv2.imread(req.image_path)
+        if frame is None:
+            return {"error": "Cannot read image"}
+        if _loaded_model.task_type != "detection":
+            return {"error": "Crop save is only for detection models"}
+        result = run_inference(_loaded_model, frame, cfg.conf_threshold)
+        if len(result.boxes) == 0:
+            return {"error": "No detections"}
+        names = _loaded_model.names or {}
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = os.path.join("snapshots", f"crops_{ts}")
+        os.makedirs(out_dir, exist_ok=True)
+        h, w = frame.shape[:2]
+        saved = 0
+        for i, (box, score, cid) in enumerate(zip(result.boxes, result.scores, result.class_ids)):
+            x1, y1, x2, y2 = max(0, int(box[0])), max(0, int(box[1])), min(w, int(box[2])), min(h, int(box[3]))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            cls_name = names.get(int(cid), str(int(cid)))
+            crop = frame[y1:y2, x1:x2]
+            cv2.imwrite(os.path.join(out_dir, f"{i:03d}_{cls_name}_{score:.2f}.jpg"), crop)
+            saved += 1
+        return {"ok": True, "path": out_dir, "count": saved}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ── Video Info ──────────────────────────────────────────
 class VideoInfoRequest(BaseModel):
     path: str

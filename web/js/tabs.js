@@ -60,6 +60,10 @@ Tabs.viewer = {
             <span style="width:1px;height:20px;background:var(--border-default);margin:0 0.25rem;"></span>
             <button class="btn btn-secondary btn-sm" id="btn-snapshot" onclick="Tabs.viewer.snapshot()" disabled style="display:flex;align-items:center;gap:2px;">${Icons._svg('<rect x="2" y="4" width="20" height="16" rx="2"/><circle cx="12" cy="13" r="4"/><path d="M17 4l-2-2H9L7 4"/>',14)}</button>
             <span style="width:1px;height:20px;background:var(--border-default);margin:0 0.25rem;"></span>
+            <label style="font-size:11px;display:flex;align-items:center;gap:3px;cursor:pointer;" title="${t('viewer.save_crops_tip')}">
+              <input type="checkbox" id="v-save-crops"> ${t('viewer.save_crops')}
+            </label>
+            <span style="width:1px;height:20px;background:var(--border-default);margin:0 0.25rem;"></span>
             <label class="text-secondary" style="font-size:12px;">${t('viewer.frame_skip')}:</label>
             <select class="form-input" id="v-speed" style="width:76px;height:30px;font-size:10px;min-width:0;overflow:hidden;text-overflow:ellipsis;padding:0 6px;" onchange="Tabs.viewer.setSpeed(this.value)">${speedOpts}</select>
             <div style="flex:1;"></div>
@@ -352,6 +356,10 @@ Tabs.viewer = {
       else resEl.textContent = `${r.detections} detections`;
       document.getElementById('v-infer-stats').innerHTML = `Infer: ${r.infer_ms} ms`;
       App.setStatus(r.classification ? `Classification: ${r.classification}` : r.segmentation ? `Segmentation: ${r.segmentation}` : r.embedding ? `Embedding: ${r.embedding}, ${r.infer_ms}ms` : `Inference done: ${r.detections} detections, ${r.infer_ms}ms`);
+      if (document.getElementById('v-save-crops')?.checked && r.detections > 0 && !r.classification && !r.segmentation && !r.embedding) {
+        const cr = await API.post('/api/infer/save-crops', { model_path: G.model, image_path: G.videoPath, conf });
+        if (cr.ok) App.setStatus(t('viewer.crops_saved', {count: cr.count, path: cr.path}));
+      }
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
   _streamSessionId: null,
@@ -439,6 +447,10 @@ Tabs.viewer = {
     const r = await API.post('/api/viewer/snapshot/' + this._streamSessionId, {});
     if (r.ok) App.setStatus(t('viewer.snapshot_saved', {path: r.path}));
     else App.setStatus(t('viewer.snapshot_failed') + ': ' + (r.error||''));
+    if (document.getElementById('v-save-crops')?.checked) {
+      const cr = await API.post('/api/viewer/save-crops/' + this._streamSessionId, {});
+      if (cr.ok) App.setStatus(t('viewer.crops_saved', {count: cr.count, path: cr.path}));
+    }
   },
 };
 
