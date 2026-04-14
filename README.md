@@ -207,44 +207,6 @@ python -m pytest tests/ -v
 
 ---
 
-## 🔮 Future Works
-
-> ssook은 현재 Object Detection 중심으로 개발되어 있습니다. 진정한 Vision AI All-in-One 도구가 되기 위한 로드맵입니다.
-> 상세 내용은 [`docs/future-works.md`](docs/future-works.md)를 참고하세요.
-
-### 🎯 Phase 1 — 핵심 태스크 확장
-- **Pose Estimation**: YOLO-Pose, HRNet 등 키포인트 검출 + OKS/PCK 평가
-- **Object Tracking (MOT)**: ByteTrack, DeepSORT 통합 + MOTA/IDF1/HOTA 메트릭
-- **Instance Segmentation 강화**: YOLO-Seg, Mask R-CNN + Mask AP 평가
-- **VLM 확장**: VQA, Image Captioning, Open-Vocabulary Detection
-- **ONNX 모델 인스펙터**: 그래프 시각화, I/O shape, opset 정보
-- **모델 프로파일링**: 레이어별 latency, FLOPs, 메모리 사용량
-
-### 📦 Phase 2 — 데이터 워크플로우
-- **어노테이션 도구**: BBox, Polygon, Keypoint 라벨링 (앱 내장)
-- **Auto-Labeling**: 모델 기반 자동 라벨 생성 + SAM 통합
-- **세그멘테이션 포맷 변환**: COCO Seg ↔ 마스크 이미지 ↔ Polygon
-- **데이터 증강 파이프라인**: 미리보기 → 실제 데이터셋 생성
-- **PDF/HTML 리포트 생성**: 평가 결과 자동 리포트
-
-### 🔬 Phase 3 — 고급 분석 & 인프라
-- **Grad-CAM / Explainability**: 모델 판단 근거 시각화
-- **양자화 비교**: FP32 vs FP16 vs INT8 정확도/속도 비교
-- **모델 허브**: Hugging Face / ONNX Model Zoo 연동
-- **모델 변환**: PyTorch/TensorFlow → ONNX 앱 내 변환
-- **실험 추적**: 평가 히스토리 + 실험 간 비교 대시보드
-- **Robustness 테스트**: 이미지 corruption별 성능 저하 분석
-
-### 🌐 Phase 4 — 확장 & 생태계
-- **OCR**: 텍스트 검출 + 인식 파이프라인
-- **Depth Estimation**: MiDaS, Depth Anything 깊이맵 시각화
-- **Anomaly Detection**: 비지도 시각적 이상 탐지 (PatchCore 등)
-- **Face Detection & Recognition**: RetinaFace, ArcFace 등
-- **플러그인 시스템**: 커스텀 파이프라인/메트릭/시각화 확장
-- **원격 추론**: 클라우드 GPU / Triton Server 연동
-
----
-
 ## 📄 License
 
 [MIT License](LICENSE)
