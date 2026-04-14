@@ -30,7 +30,9 @@ jobs:
       # ZIP portable
       - name: Package ZIP
         shell: pwsh
-        run: Compress-Archive -Path dist/ssook -DestinationPath ssook-Windows-portable.zip
+        run: |
+          $version = "${{ github.ref_name }}"
+          Compress-Archive -Path dist/ssook -DestinationPath "ssook-${version}-Windows-portable.zip"
 
       # MSI installer via WiX
       - name: Install WiX Toolset
@@ -84,14 +86,15 @@ jobs:
             -ext WixToolset.UI.wixext `
             -bindpath dist\ssook\_internal `
             -d wix.BindPath=dist\ssook\_internal `
-            -o ssook-Windows.msi
+            -o "ssook-${{ github.ref_name }}-Windows.msi"
         continue-on-error: true
 
       - name: Fallback if MSI failed
         if: ${{ !hashFiles('ssook-Windows.msi') }}
         shell: pwsh
         run: |
-          if (-not (Test-Path "ssook-Windows.msi")) {
+          $version = "${{ github.ref_name }}"
+          if (-not (Test-Path "ssook-${version}-Windows.msi")) {
             echo "MSI build skipped — ZIP only"
           }
 
@@ -99,8 +102,8 @@ jobs:
         with:
           name: windows-build
           path: |
-            ssook-Windows-portable.zip
-            ssook-Windows.msi
+            ssook-*-Windows-portable.zip
+            ssook-*-Windows.msi
 
   build-macos:
     runs-on: macos-latest
@@ -125,22 +128,25 @@ jobs:
       # DMG
       - name: Create DMG
         run: |
+          VERSION="${{ github.ref_name }}"
           mkdir -p dmg_staging
           cp -R dist/ssook.app dmg_staging/
           ln -s /Applications dmg_staging/Applications
           hdiutil create -volname "ssook" -srcfolder dmg_staging \
-            -ov -format UDZO ssook-macOS.dmg
+            -ov -format UDZO "ssook-${VERSION}-macOS.dmg"
 
       # ZIP fallback
       - name: Package ZIP
-        run: cd dist && zip -r ../ssook-macOS.zip ssook.app
+        run: |
+          VERSION="${{ github.ref_name }}"
+          cd dist && zip -r "../ssook-${VERSION}-macOS.zip" ssook.app
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-build
           path: |
-            ssook-macOS.dmg
-            ssook-macOS.zip
+            ssook-*-macOS.dmg
+            ssook-*-macOS.zip
 
   release:
     needs: [build-windows, build-macos]
@@ -158,9 +164,9 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/windows-build/ssook-Windows-portable.zip
-            artifacts/windows-build/ssook-Windows.msi
-            artifacts/macos-build/ssook-macOS.dmg
-            artifacts/macos-build/ssook-macOS.zip
+            artifacts/windows-build/ssook-*-Windows-portable.zip
+            artifacts/windows-build/ssook-*-Windows.msi
+            artifacts/macos-build/ssook-*-macOS.dmg
+            artifacts/macos-build/ssook-*-macOS.zip
           generate_release_notes: true
           fail_on_unmatched_files: false
