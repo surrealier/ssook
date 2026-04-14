@@ -79,13 +79,13 @@ Tabs['model-compare'] = {
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
             <div>
               <div class="form-group"><label class="form-label">${t('cmp.model_a')}</label>
-                <div style="display:flex;gap:0.5rem;"><input type="text" class="form-input input-normal" style="flex:1;" readonly id="cmp-a" value="${G.model}"><button class="btn btn-secondary btn-sm" onclick="pickModel('cmp-a')">${t('browse')}</button></div>
+                <div style="display:flex;gap:0.5rem;"><input type="text" class="form-input input-normal" style="flex:1;"  id="cmp-a" value="${G.model}"><button class="btn btn-secondary btn-sm" onclick="pickModel('cmp-a')">${t('browse')}</button></div>
               </div>
               ${_modelTypeSelect('cmp-type-a')}
             </div>
             <div>
               <div class="form-group"><label class="form-label">${t('cmp.model_b')}</label>
-                <div style="display:flex;gap:0.5rem;"><input type="text" class="form-input input-normal" style="flex:1;" readonly id="cmp-b"><button class="btn btn-secondary btn-sm" onclick="pickModel('cmp-b')">${t('browse')}</button></div>
+                <div style="display:flex;gap:0.5rem;"><input type="text" class="form-input input-normal" style="flex:1;"  id="cmp-b"><button class="btn btn-secondary btn-sm" onclick="pickModel('cmp-b')">${t('browse')}</button></div>
               </div>
               ${_modelTypeSelect('cmp-type-b')}
             </div>
@@ -516,14 +516,14 @@ Tabs.clip = {
           <div class="form-group">
             <label class="form-label">${t('clip.img_enc')}</label>
             <div style="display:flex;gap:0.5rem;">
-              <input type="text" class="form-input input-normal" style="flex:1;" readonly id="clip-img-enc">
+              <input type="text" class="form-input input-normal" style="flex:1;"  id="clip-img-enc">
               <button class="btn btn-secondary btn-sm" onclick="pickFile('clip-img-enc','ONNX (*.onnx)')">${t('browse')}</button>
             </div>
           </div>
           <div class="form-group">
             <label class="form-label">${t('clip.txt_enc')}</label>
             <div style="display:flex;gap:0.5rem;">
-              <input type="text" class="form-input input-normal" style="flex:1;" readonly id="clip-txt-enc">
+              <input type="text" class="form-input input-normal" style="flex:1;"  id="clip-txt-enc">
               <button class="btn btn-secondary btn-sm" onclick="pickFile('clip-txt-enc','ONNX (*.onnx)')">${t('browse')}</button>
             </div>
           </div>
@@ -1114,7 +1114,7 @@ Tabs.leaky = {
     const dirInput = (id, label) => `<div class="form-group">
       <label class="form-label">${label}</label>
       <div style="display:flex;gap:0.5rem;">
-        <input type="text" class="form-input input-normal" style="flex:1;" readonly id="${id}">
+        <input type="text" class="form-input input-normal" style="flex:1;"  id="${id}">
         <button class="btn btn-secondary btn-sm" onclick="pickDir('${id}')">${t('browse')}</button>
       </div></div>`;
     return `
@@ -1175,7 +1175,7 @@ Tabs.similarity = {
         <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('sim.title')}</h3>
         ${imgDirInput('sim-img')}
         <div class="form-group" style="margin-top:0.75rem;"><label class="form-label">${t('sim.query')}</label>
-          <div style="display:flex;gap:0.5rem;"><input type="text" class="form-input input-normal" style="flex:1;" readonly id="sim-query"><button class="btn btn-secondary btn-sm" onclick="pickFile('sim-query','Images (*.jpg *.png)')">${t('browse')}</button></div></div>
+          <div style="display:flex;gap:0.5rem;"><input type="text" class="form-input input-normal" style="flex:1;"  id="sim-query"><button class="btn btn-secondary btn-sm" onclick="pickFile('sim-query','Images (*.jpg *.png)')">${t('browse')}</button></div></div>
         <div class="form-group"><label class="form-label">${t('sim.topk')}</label><input type="number" class="form-input input-normal" id="sim-k" value="10" min="1" max="100"></div>
         <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.similarity.run()">${t('sim.build')}</button>
         <div style="margin-top:0.5rem;"><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="sim-prog" style="width:0%;height:100%;"></div><span id="sim-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>

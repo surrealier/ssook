@@ -1399,7 +1399,7 @@ Tabs.analysis = {
             <div class="form-group">
               <label class="form-label">Image</label>
               <div style="display:flex;gap:0.5rem;">
-                <input type="text" class="form-input input-normal" style="flex:1;" readonly id="ana-img">
+                <input type="text" class="form-input input-normal" style="flex:1;"  id="ana-img">
                 <button class="btn btn-secondary btn-sm" onclick="pickFile('ana-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
               </div>
             </div>
