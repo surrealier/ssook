@@ -20,3 +20,6 @@ PyYAML>=6.0.0
 
 # Optional: CUDA acceleration (replace onnxruntime above)
 # onnxruntime-gpu>=1.17.0
+
+# Optional: HuggingFace Hub model download
+# huggingface-hub>=0.20.0

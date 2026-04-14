@@ -108,20 +108,51 @@ def _get_layer_profiles(path: str, input_feed: dict) -> list[LayerProfile]:
         return []
 
 
-def profile_model(path: str, num_runs: int = 20, warmup: int = 3) -> ProfileResult:
-    """Profile an ONNX model: latency stats + layer-level timing."""
-    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+def _resolve_dynamic_dim(dim, axis: int, ndim: int) -> int:
+    """Resolve a dynamic/symbolic dimension to a concrete size."""
+    if isinstance(dim, int) and dim > 0:
+        return dim
+    # Use dimension name hints if available
+    name = str(dim).lower() if dim is not None else ""
+    if "batch" in name:
+        return 1
+    if "height" in name or "width" in name:
+        return 640
+    if "sequence" in name or "seq" in name or "length" in name:
+        return 64
+    if "channel" in name:
+        return 3
+    # Positional heuristics for common tensor layouts
+    if ndim == 4:  # (B, C, H, W) or (B, H, W, C)
+        return [1, 3, 640, 640][axis] if axis < 4 else 64
+    if ndim == 3:  # (B, seq, dim)
+        return [1, 64, 256][axis] if axis < 3 else 64
+    if ndim == 2:  # (B, dim)
+        return 1 if axis == 0 else 256
+    return 1 if axis == 0 else 64
 
-    # Build dummy input
-    input_feed = {}
+
+def _build_dummy_feed(sess) -> dict:
+    """Build dummy input feed with smart dynamic dimension resolution."""
+    feed = {}
     for inp in sess.get_inputs():
-        shape = [s if isinstance(s, int) and s > 0 else 1 for s in inp.shape]
+        ndim = len(inp.shape)
+        shape = [_resolve_dynamic_dim(s, i, ndim) for i, s in enumerate(inp.shape)]
         dtype = np.float32
         if "int64" in (inp.type or ""):
             dtype = np.int64
         elif "int32" in (inp.type or ""):
             dtype = np.int32
-        input_feed[inp.name] = np.random.randn(*shape).astype(dtype)
+        feed[inp.name] = np.random.randn(*shape).astype(dtype)
+    return feed
+
+
+def profile_model(path: str, num_runs: int = 20, warmup: int = 3) -> ProfileResult:
+    """Profile an ONNX model: latency stats + layer-level timing."""
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+
+    # Build dummy input with smart dimension resolution
+    input_feed = _build_dummy_feed(sess)
 
     # Warmup
     t0 = time.perf_counter()

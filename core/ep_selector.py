@@ -173,14 +173,19 @@ def select_and_activate() -> str:
         ep_path = _resolve_ep_path(selected)
         if ep_path not in sys.path:
             sys.path.insert(0, ep_path)
-        # Windows: add DLL search paths for CUDA/TensorRT libs
+        # Windows: add DLL search paths for CUDA/TensorRT/DirectML libs
         if sys.platform == "win32":
-            for libs_name in ["onnxruntime.libs", "onnxruntime_gpu.libs"]:
+            for libs_name in ["onnxruntime.libs", "onnxruntime_gpu.libs", "onnxruntime_directml.libs"]:
                 libs = Path(ep_path) / libs_name
                 if not libs.is_dir():
                     libs = _BASE / selected / libs_name
                 if libs.is_dir():
                     os.add_dll_directory(str(libs))
+            # DirectML: also add the site-packages dir itself (DirectML.dll may live there)
+            if selected == "directml":
+                ort_pkg = Path(ep_path) / "onnxruntime" / "capi"
+                if ort_pkg.is_dir():
+                    os.add_dll_directory(str(ort_pkg))
         ep_result["selected"] = selected
         ep_result["provider"] = _EP_PROVIDER_MAP.get(selected, "CPUExecutionProvider")
         print(f"[EP Selector] selected: {selected} -> {ep_path}")

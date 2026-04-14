@@ -11,7 +11,7 @@ Tabs.viewer = {
     return `
       <div style="display:flex;gap:0.75rem;height:100%;">
         <!-- Left: file browser -->
-        <div style="width:220px;display:flex;flex-direction:column;gap:0.75rem;overflow-y:auto;flex-shrink:0;">
+        <div style="width:220px;display:flex;flex-direction:column;gap:0.75rem;overflow-y:auto;overflow-x:hidden;flex-shrink:0;">
           <div class="card-flat" style="padding:0.75rem;">
             <div style="display:flex;gap:0.25rem;align-items:center;margin-bottom:0.4rem;">
               <label class="form-label" style="font-size:10px;margin:0;white-space:nowrap;">${t('settings.model_type')}</label>
@@ -28,12 +28,21 @@ Tabs.viewer = {
               </div>
               <input type="range" min="1" max="99" step="1" value="25" id="v-conf-slider" style="width:100%;accent-color:var(--action-link-05);" oninput="Tabs.viewer._onConfChange()">
             </div>
+            <div id="v-tracker-row" style="display:flex;gap:0.25rem;align-items:center;margin-top:0.4rem;">
+              <label class="form-label" style="font-size:10px;margin:0;white-space:nowrap;">Tracker</label>
+              <select class="form-input input-normal" id="v-tracker-type" style="flex:1;height:26px;font-size:10px;min-width:0;padding:0 6px;">
+                <option value="none">None</option>
+                <option value="bytetrack">ByteTrack</option>
+                <option value="sort">SORT</option>
+              </select>
+            </div>
           </div>
           <div class="card-flat" style="padding:0.75rem;">
             <div class="text-label" style="margin-bottom:0.5rem;">${t('settings.model')}</div>
             <div style="display:flex;gap:0.25rem;margin-bottom:0.5rem;">
-              <input type="text" class="form-input input-normal" style="flex:1;font-size:11px;height:28px;" id="v-model-path" placeholder="Model path" value="${G.model}" onchange="Tabs.viewer.selectModel(this.value)">
+              <input type="text" class="form-input input-normal" style="flex:1;font-size:11px;height:28px;min-width:0;" id="v-model-path" placeholder="Model path" value="${G.model}" onchange="Tabs.viewer.selectModel(this.value)">
               <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseModel()">${t('browse')}</button>
+              <button class="btn btn-ghost btn-sm" onclick="showHFBrowser('v-model-path')" title="HuggingFace Hub">🤗</button>
               <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshModels()" title="Refresh">↻</button>
             </div>
             <div id="v-model-list" style="flex:1;overflow-y:auto;font-size:12px;" class="text-secondary">${t('viewer.loading')}</div>
@@ -41,7 +50,7 @@ Tabs.viewer = {
           <div class="card-flat" style="padding:0.75rem;flex:1;display:flex;flex-direction:column;">
             <div class="text-label" style="margin-bottom:0.5rem;">${t('viewer.video_image')}</div>
             <div style="display:flex;gap:0.25rem;margin-bottom:0.5rem;">
-              <input type="text" class="form-input input-normal" style="flex:1;font-size:11px;height:28px;" id="v-video-path" placeholder="Video/Image path" value="${G.videoPath||''}" onchange="Tabs.viewer.selectVideo(this.value)">
+              <input type="text" class="form-input input-normal" style="flex:1;font-size:11px;height:28px;min-width:0;" id="v-video-path" placeholder="Video/Image path" value="${G.videoPath||''}" onchange="Tabs.viewer.selectVideo(this.value)">
               <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseVideo()">${t('browse')}</button>
               <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseImageFolder()" title="Open image folder">📁</button>
               <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshVideos()" title="Refresh">↻</button>
@@ -57,17 +66,17 @@ Tabs.viewer = {
           <div id="v-text-panel" class="card-flat" style="padding:0.75rem;display:none;">
             <div class="text-label" style="margin-bottom:0.35rem;font-size:11px;">Text Input</div>
             <div id="v-clip-inputs" style="display:none;">
-              <input type="text" class="form-input input-normal" style="font-size:11px;height:28px;margin-bottom:0.35rem;" id="v-clip-labels" placeholder="Labels (comma separated): dog, cat, bird">
+              <input type="text" class="form-input input-normal" style="width:100%;box-sizing:border-box;font-size:11px;height:28px;margin-bottom:0.35rem;" id="v-clip-labels" placeholder="Labels (comma separated): dog, cat, bird">
               <div class="form-group" style="margin-bottom:0.35rem;">
                 <label class="form-label" style="font-size:10px;">Text Encoder</label>
                 <div style="display:flex;gap:0.25rem;">
-                  <input type="text" class="form-input input-normal" style="flex:1;font-size:11px;height:28px;" id="v-clip-txt-enc" placeholder="Text encoder .onnx">
+                  <input type="text" class="form-input input-normal" style="flex:1;font-size:11px;height:28px;min-width:0;" id="v-clip-txt-enc" placeholder="Text encoder .onnx">
                   <button class="btn btn-secondary btn-sm" onclick="pickFile('v-clip-txt-enc','ONNX (*.onnx)')" style="font-size:10px;">📂</button>
                 </div>
               </div>
             </div>
             <div id="v-vlm-inputs" style="display:none;">
-              <textarea class="form-input input-normal" style="font-size:11px;height:60px;resize:vertical;" id="v-vlm-prompt" placeholder="Enter prompt / question..."></textarea>
+              <textarea class="form-input input-normal" style="width:100%;box-sizing:border-box;font-size:11px;height:60px;resize:vertical;" id="v-vlm-prompt" placeholder="Enter prompt / question..."></textarea>
             </div>
           </div>
         </div>
@@ -141,7 +150,7 @@ Tabs.viewer = {
           mt.innerHTML = '';
           const groups = {
             'Detection': [], 'Classification': [], 'Segmentation': [],
-            'Pose': [], 'Instance Seg': [], 'Tracking': [],
+            'Pose': [], 'Instance Seg': [],
             'CLIP': [], 'Embedder': [], 'VLM': [], 'Custom': []
           };
           for (const [key, label] of Object.entries(c.model_types)) {
@@ -151,7 +160,7 @@ Tabs.viewer = {
             else if (key.startsWith('emb_')) groups['Embedder'].push([key, label]);
             else if (key.startsWith('pose_')) groups['Pose'].push([key, label]);
             else if (key.startsWith('instseg_')) groups['Instance Seg'].push([key, label]);
-            else if (key.startsWith('track_')) groups['Tracking'].push([key, label]);
+            else if (key.startsWith('track_')) continue; // Tracker is now a viewer option
             else if (key.startsWith('vlm_')) groups['VLM'].push([key, label]);
             else if (key.startsWith('custom:')) groups['Custom'].push([key, label]);
             else groups['Detection'].push([key, label]);
@@ -258,6 +267,12 @@ Tabs.viewer = {
       textPanel.style.display = ''; clipInputs.style.display = 'none'; vlmInputs.style.display = '';
     } else {
       textPanel.style.display = 'none';
+    }
+    // Show tracker option only for detection-type models
+    const trackerRow = document.getElementById('v-tracker-row');
+    if (trackerRow) {
+      const isDet = !v.startsWith('cls_') && !v.startsWith('seg_') && !v.startsWith('clip_') && !v.startsWith('emb_') && !v.startsWith('vlm_') && !v.startsWith('pose_') && !v.startsWith('instseg_');
+      trackerRow.style.display = isDet ? 'flex' : 'none';
     }
   },
   async _onBatchChange() {
@@ -447,7 +462,8 @@ Tabs.viewer = {
     try {
       const conf = this._getConf();
       const r = await API.post('/api/viewer/start', {
-        model_path: G.model, video_path: G.videoPath, conf
+        model_path: G.model, video_path: G.videoPath, conf,
+        tracker_type: document.getElementById('v-tracker-type')?.value || 'none'
       });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       this._streamSessionId = r.session_id;
@@ -550,8 +566,11 @@ Tabs.settings = {
               <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 Detection (YOLO11n)</a>
               <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-cls.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 Classification (YOLO11n-cls)</a>
               <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-seg.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 Segmentation (YOLO11n-seg)</a>
+              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 Pose (YOLO11n-pose)</a>
               <a href="https://huggingface.co/Xenova/clip-vit-base-patch32/tree/main/onnx" target="_blank" class="btn btn-secondary btn-sm">📥 CLIP (ViT-B/32 ONNX)</a>
               <a href="https://huggingface.co/immich-app/ViT-B-32__openai/tree/main" target="_blank" class="btn btn-secondary btn-sm">📥 Embedder (ViT-B/32 ONNX)</a>
+              <a href="https://huggingface.co/Xenova/vilt-b32-finetuned-vqa/tree/main/onnx" target="_blank" class="btn btn-secondary btn-sm">📥 VLM — VQA (ViLT)</a>
+              <a href="https://huggingface.co/Xenova/blip-image-captioning-base/tree/main/onnx" target="_blank" class="btn btn-secondary btn-sm">📥 VLM — Caption (BLIP)</a>
             </div>
             <h4 class="text-heading-h3" style="margin:1.25rem 0 0.75rem;font-size:14px;">${t('settings.test_data_dl')}</h4>
             <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">

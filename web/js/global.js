@@ -411,3 +411,119 @@ function _closeHelp() {
     window._helpKeyHandler = null;
   }
 }
+
+
+/* ── HuggingFace Hub Browser ────────────────────────── */
+function showHFBrowser(targetInputId) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;';
+  const modal = document.createElement('div');
+  modal.style.cssText = 'background:var(--background-tint-00);border-radius:12px;width:620px;max-height:75vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
+  modal.innerHTML = `
+    <div style="padding:1rem 1.25rem;border-bottom:1px solid var(--border-01);display:flex;align-items:center;justify-content:space-between;">
+      <strong>🤗 HuggingFace Hub — ONNX Models</strong>
+      <button class="btn btn-ghost btn-sm" id="hf-close">✕</button>
+    </div>
+    <div style="padding:0.75rem 1.25rem;display:flex;gap:0.5rem;border-bottom:1px solid var(--border-01);">
+      <input type="text" class="form-input input-normal" id="hf-query" style="flex:1;font-size:12px;" placeholder="Search models (e.g. yolov8, vit, blip)">
+      <select class="form-input input-normal" id="hf-task" style="width:160px;font-size:12px;">
+        <option value="">All Tasks</option>
+        <option value="object-detection">Detection</option>
+        <option value="image-classification">Classification</option>
+        <option value="image-segmentation">Segmentation</option>
+        <option value="zero-shot-image-classification">CLIP/Zero-shot</option>
+        <option value="visual-question-answering">VQA</option>
+        <option value="image-to-text">Captioning</option>
+        <option value="feature-extraction">Embedder</option>
+      </select>
+      <button class="btn btn-primary btn-sm" id="hf-search-btn">Search</button>
+    </div>
+    <div id="hf-results" style="flex:1;overflow-y:auto;padding:0.5rem;min-height:200px;max-height:50vh;">
+      <div class="text-secondary" style="padding:2rem;text-align:center;">Search for ONNX models on HuggingFace Hub</div>
+    </div>
+    <div style="padding:0.5rem 1.25rem;border-top:1px solid var(--border-01);display:flex;gap:0.5rem;justify-content:space-between;align-items:center;">
+      <button class="btn btn-secondary btn-sm" id="hf-cached-btn">📦 Cached Models</button>
+      <button class="btn btn-secondary btn-sm" id="hf-cancel">Cancel</button>
+    </div>`;
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  const resultsEl = modal.querySelector('#hf-results');
+  const close = () => overlay.remove();
+  modal.querySelector('#hf-close').onclick = close;
+  modal.querySelector('#hf-cancel').onclick = close;
+  overlay.onclick = (e) => { if (e.target === overlay) close(); };
+
+  modal.querySelector('#hf-search-btn').onclick = async () => {
+    const q = modal.querySelector('#hf-query').value.trim();
+    if (!q) return;
+    resultsEl.innerHTML = '<div class="text-secondary" style="padding:2rem;text-align:center;">Searching...</div>';
+    try {
+      const r = await API.post('/api/hf/search', { query: q, task: modal.querySelector('#hf-task').value });
+      if (r.error) { resultsEl.innerHTML = `<div style="padding:1rem;color:var(--action-danger-05);">${r.error}</div>`; return; }
+      if (!r.results.length) { resultsEl.innerHTML = '<div class="text-secondary" style="padding:2rem;text-align:center;">No results</div>'; return; }
+      resultsEl.innerHTML = '';
+      for (const m of r.results) {
+        const row = document.createElement('div');
+        row.style.cssText = 'padding:0.5rem;border-radius:8px;cursor:pointer;border-bottom:1px solid var(--border-01);';
+        row.onmouseenter = () => row.style.background = 'var(--background-tint-01)';
+        row.onmouseleave = () => row.style.background = '';
+        const onnxBadge = m.has_onnx ? '<span style="background:#10b981;color:#fff;padding:1px 6px;border-radius:4px;font-size:10px;margin-left:4px;">ONNX</span>' : '';
+        row.innerHTML = `<div style="font-size:13px;font-weight:500;">${m.repo_id}${onnxBadge}</div>
+          <div style="font-size:11px;color:var(--text-02);margin-top:2px;">${m.task || '—'} · ⬇ ${(m.downloads||0).toLocaleString()}${m.ssook_type ? ' · ssook: '+m.ssook_type : ''}</div>`;
+        row.onclick = () => _hfShowFiles(m.repo_id, resultsEl, targetInputId, close);
+        resultsEl.appendChild(row);
+      }
+    } catch(e) { resultsEl.innerHTML = `<div style="padding:1rem;color:var(--action-danger-05);">Error: ${e.message}</div>`; }
+  };
+  modal.querySelector('#hf-query').addEventListener('keydown', (e) => { if (e.key === 'Enter') modal.querySelector('#hf-search-btn').click(); });
+
+  modal.querySelector('#hf-cached-btn').onclick = async () => {
+    resultsEl.innerHTML = '<div class="text-secondary" style="padding:2rem;text-align:center;">Loading cached...</div>';
+    try {
+      const r = await API.get('/api/hf/cached');
+      if (!r.models || !r.models.length) { resultsEl.innerHTML = '<div class="text-secondary" style="padding:2rem;text-align:center;">No cached models</div>'; return; }
+      resultsEl.innerHTML = '';
+      for (const m of r.models) {
+        const row = document.createElement('div');
+        row.style.cssText = 'padding:0.5rem;border-radius:8px;cursor:pointer;border-bottom:1px solid var(--border-01);display:flex;align-items:center;gap:0.5rem;';
+        row.onmouseenter = () => row.style.background = 'var(--background-tint-01)';
+        row.onmouseleave = () => row.style.background = '';
+        row.innerHTML = `<span style="flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${m.name}</span><span style="font-size:11px;color:var(--text-02);">${m.size_mb} MB</span>`;
+        row.onclick = () => { const el = document.getElementById(targetInputId); if (el) { el.value = m.path; setModel(m.path); } close(); };
+        resultsEl.appendChild(row);
+      }
+    } catch(e) { resultsEl.innerHTML = `<div style="padding:1rem;color:var(--action-danger-05);">Error: ${e.message}</div>`; }
+  };
+}
+
+async function _hfShowFiles(repoId, container, targetInputId, closeFn) {
+  container.innerHTML = `<div class="text-secondary" style="padding:2rem;text-align:center;">Loading ONNX files from ${repoId}...</div>`;
+  try {
+    const r = await API.post('/api/hf/files', { repo_id: repoId });
+    if (r.error) { container.innerHTML = `<div style="padding:1rem;color:var(--action-danger-05);">${r.error}</div>`; return; }
+    if (!r.files.length) { container.innerHTML = `<div class="text-secondary" style="padding:2rem;text-align:center;">No .onnx files found in ${repoId}</div>`; return; }
+    container.innerHTML = `<div style="padding:0.5rem;font-size:12px;font-weight:600;color:var(--text-03);">${repoId} — Select ONNX file:</div>`;
+    for (const f of r.files) {
+      const row = document.createElement('div');
+      row.style.cssText = 'padding:0.5rem 0.75rem;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:0.5rem;border-bottom:1px solid var(--border-01);';
+      row.onmouseenter = () => row.style.background = 'var(--background-tint-01)';
+      row.onmouseleave = () => row.style.background = '';
+      row.innerHTML = `<span style="flex:1;font-size:12px;">📄 ${f}</span><button class="btn btn-primary btn-sm" style="font-size:11px;">Download</button>`;
+      row.querySelector('button').onclick = async (e) => {
+        e.stopPropagation();
+        row.querySelector('button').disabled = true;
+        row.querySelector('button').textContent = 'Downloading...';
+        try {
+          const dl = await API.post('/api/hf/download', { repo_id: repoId, filename: f });
+          if (dl.error) { App.setStatus('Download error: ' + dl.error); return; }
+          const el = document.getElementById(targetInputId);
+          if (el) { el.value = dl.path; setModel(dl.path); }
+          App.setStatus(`Downloaded: ${f}`);
+          closeFn();
+        } catch(err) { App.setStatus('Download error: ' + err.message); row.querySelector('button').disabled = false; row.querySelector('button').textContent = 'Download'; }
+      };
+      container.appendChild(row);
+    }
+  } catch(e) { container.innerHTML = `<div style="padding:1rem;color:var(--action-danger-05);">Error: ${e.message}</div>`; }
+}

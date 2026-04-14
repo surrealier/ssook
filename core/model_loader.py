@@ -70,9 +70,7 @@ MODEL_TYPES = {
     "instseg_yolo":    "YOLO-Seg Instance (v8/v11)",
     "instseg_maskrcnn":"Mask R-CNN",
     "instseg_custom":  "Custom Instance Seg",
-    # Tracking (2)
-    "track_bytetrack": "ByteTrack",
-    "track_sort":      "SORT",
+    # Tracking — now integrated as Viewer option (ByteTrack / SORT)
     # VLM (3)
     "vlm_vqa":         "VLM — VQA",
     "vlm_caption":     "VLM — Captioning",
@@ -105,18 +103,27 @@ def _build_providers() -> list:
 
 
 def _create_session(path: str, session_options=None) -> ort.InferenceSession:
+    providers = _build_providers()
     if session_options is None:
         import os
         session_options = ort.SessionOptions()
         session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        session_options.enable_mem_pattern = True
         session_options.enable_cpu_mem_arena = True
+        # DML requires mem_pattern disabled
+        is_dml = any("Dml" in str(p) for p in providers)
+        session_options.enable_mem_pattern = not is_dml
         # 노트북 환경 최적화: 물리 코어 수 기반 스레드 제한
         phys_cores = os.cpu_count() or 4
         intra = max(2, phys_cores // 2)
         session_options.intra_op_num_threads = intra
         session_options.inter_op_num_threads = max(1, intra // 2)
-    return ort.InferenceSession(path, sess_options=session_options, providers=_build_providers())
+    try:
+        return ort.InferenceSession(path, sess_options=session_options, providers=providers)
+    except Exception as e:
+        if providers != ["CPUExecutionProvider"]:
+            print(f"[ModelLoader] {providers[0]} failed ({e}), falling back to CPU")
+            return ort.InferenceSession(path, sess_options=session_options, providers=["CPUExecutionProvider"])
+        raise
 
 
 def _get_names_from_onnx(session: ort.InferenceSession) -> dict:

@@ -835,6 +835,7 @@ class VideoStartRequest(BaseModel):
     video_path: str
     conf: float = 0.25
     stream_max_height: int = 0  # 0=원본, 720/480 등 지정 시 다운스케일
+    tracker_type: str = "none"  # none / bytetrack / sort
 
 
 @app.post("/api/viewer/start")
@@ -868,6 +869,10 @@ async def viewer_start(req: VideoStartRequest):
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         sid = str(uuid.uuid4())[:8]
+        tracker = None
+        if req.tracker_type and req.tracker_type != "none":
+            from core.tracking import create_tracker
+            tracker = create_tracker(req.tracker_type)
         _video_sessions[sid] = {
             "cap": cap, "model": _loaded_model, "conf": req.conf,
             "playing": True, "paused": False,
@@ -881,6 +886,7 @@ async def viewer_start(req: VideoStartRequest):
             "video_path": req.video_path,
             "last_access": time.time(),
             "stream_max_height": req.stream_max_height,
+            "tracker": tracker,
         }
         return {"session_id": sid, "fps": fps,
                 "total_frames": _video_sessions[sid]["total"]}
@@ -968,25 +974,58 @@ async def viewer_stream(session_id: str):
                     sess["last_frame"] = frame.copy()
                     sess["last_result"] = result
 
+                    # Tracker integration
+                    tracker = sess.get("tracker")
+                    tracks = None
+                    if tracker and len(result.boxes) > 0:
+                        import numpy as _np
+                        tracks = tracker.update(
+                            _np.array(result.boxes), _np.array(result.scores), _np.array(result.class_ids)
+                        )
+
                     thickness = cfg.box_thickness
                     label_size = cfg.label_size
                     total_cls = len(names)
-                    for box, score, cid in zip(result.boxes, result.scores, result.class_ids):
-                        cid_int = int(cid)
-                        style = cfg.get_class_style(cid_int)
-                        if not style.enabled:
-                            continue
-                        x1, y1, x2, y2 = map(int, box)
-                        t_val = style.thickness or thickness
-                        color = _get_color(style, cid_int, total_cls)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, t_val)
-                        parts = []
-                        if cfg.show_labels:
-                            parts.append(names.get(cid_int, str(cid_int)))
-                        if cfg.show_confidence:
-                            parts.append(f"{score:.2f}")
-                        if parts:
+
+                    if tracks:
+                        for tr in tracks:
+                            cid_int = int(tr.class_id)
+                            style = cfg.get_class_style(cid_int)
+                            if not style.enabled:
+                                continue
+                            x1, y1, x2, y2 = map(int, tr.box)
+                            t_val = style.thickness or thickness
+                            color = _get_color(style, cid_int, total_cls)
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, t_val)
+                            parts = [f"ID:{tr.id}"]
+                            if cfg.show_labels:
+                                parts.append(names.get(cid_int, str(cid_int)))
+                            if cfg.show_confidence:
+                                parts.append(f"{tr.score:.2f}")
                             _draw_label(frame, " ".join(parts), x1, y1, color, label_size, max(1, t_val - 1), cfg.show_label_bg)
+                            # Draw trajectory
+                            if len(tr.trajectory) > 1:
+                                for j in range(1, len(tr.trajectory)):
+                                    p1 = (int(tr.trajectory[j-1][0]), int(tr.trajectory[j-1][1]))
+                                    p2 = (int(tr.trajectory[j][0]), int(tr.trajectory[j][1]))
+                                    cv2.line(frame, p1, p2, color, max(1, t_val - 1))
+                    else:
+                        for box, score, cid in zip(result.boxes, result.scores, result.class_ids):
+                            cid_int = int(cid)
+                            style = cfg.get_class_style(cid_int)
+                            if not style.enabled:
+                                continue
+                            x1, y1, x2, y2 = map(int, box)
+                            t_val = style.thickness or thickness
+                            color = _get_color(style, cid_int, total_cls)
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, t_val)
+                            parts = []
+                            if cfg.show_labels:
+                                parts.append(names.get(cid_int, str(cid_int)))
+                            if cfg.show_confidence:
+                                parts.append(f"{score:.2f}")
+                            if parts:
+                                _draw_label(frame, " ".join(parts), x1, y1, color, label_size, max(1, t_val - 1), cfg.show_label_bg)
                     _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
                 # 스트리밍 다운스케일 (노트북 최적화)
                 if max_h > 0 and buf is not None:
@@ -3865,6 +3904,49 @@ async def api_tracking_reset(req: dict):
         _trackers[tid].reset()
         return {"status": "ok"}
     return {"error": "Tracker not found"}
+
+
+# ── HuggingFace Hub API ────────────────────────────────
+
+@app.post("/api/hf/search")
+async def hf_search(req: dict):
+    try:
+        from core.hf_downloader import search_models
+        results = search_models(req.get("query", ""), req.get("task", ""), req.get("limit", 20))
+        return {"results": results}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/hf/files")
+async def hf_files(req: dict):
+    try:
+        from core.hf_downloader import list_onnx_files
+        files = list_onnx_files(req.get("repo_id", ""))
+        return {"files": files}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/hf/download")
+async def hf_download(req: dict):
+    try:
+        from core.hf_downloader import download_model
+        path = await asyncio.get_event_loop().run_in_executor(
+            _executor, download_model, req["repo_id"], req["filename"]
+        )
+        return {"path": path}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/hf/cached")
+async def hf_cached():
+    try:
+        from core.hf_downloader import list_cached
+        return {"models": list_cached()}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ── Launch ──────────────────────────────────────────────
