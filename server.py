@@ -1497,27 +1497,11 @@ class BrowseRequest(BaseModel):
 @app.post("/api/fs/browse")
 async def browse_fs(req: BrowseRequest):
     """Web-based filesystem browser: returns dirs + files for a given path."""
-    import platform as _plat
     if not req.path:
-        # Return drives on Windows, / on Unix
-        if _plat.system() == "Windows" or os.path.exists("/mnt/c"):
-            # WSL or Windows
-            drives = []
-            if os.path.exists("/mnt"):
-                for d in sorted(os.listdir("/mnt")):
-                    dp = f"/mnt/{d}"
-                    if os.path.isdir(dp) and len(d) == 1:
-                        drives.append({"name": f"{d.upper()}:", "path": dp, "type": "drive"})
-            if not drives:
-                for letter in "CDEFGHIJ":
-                    dp = f"{letter}:\\"
-                    if os.path.isdir(dp):
-                        drives.append({"name": f"{letter}:", "path": dp, "type": "drive"})
-            if not drives:
-                drives.append({"name": "/", "path": "/", "type": "drive"})
-            return {"current": "", "entries": drives}
-        else:
-            return {"current": "/", "entries": _list_entries("/", req.exts, req.mode)}
+        # Default: server working directory (where exe/script was launched)
+        cwd = str(ROOT)
+        return {"current": cwd, "parent": str(Path(cwd).parent),
+                "entries": _list_entries(cwd, req.exts, req.mode)}
 
     p = Path(req.path).resolve()
     if not p.is_dir():

@@ -30,7 +30,7 @@ function modelInput(id) {
   return `<div class="form-group">
     <label class="form-label">${t('settings.model')}</label>
     <div style="display:flex;gap:0.5rem;">
-      <input type="text" class="form-input input-normal" style="flex:1;" readonly id="${id}" data-bind="model" value="${G.model}">
+      <input type="text" class="form-input input-normal" style="flex:1;" id="${id}" data-bind="model" value="${G.model}" onchange="setModel(this.value)">
       <button class="btn btn-secondary btn-sm" onclick="pickModel('${id}')">
         ${t('browse')}
       </button>
@@ -41,7 +41,7 @@ function imgDirInput(id) {
   return `<div class="form-group">
     <label class="form-label">${t('explorer.img_dir')}</label>
     <div style="display:flex;gap:0.5rem;">
-      <input type="text" class="form-input input-normal" style="flex:1;" readonly id="${id}" data-bind="imgDir" value="${G.imgDir}">
+      <input type="text" class="form-input input-normal" style="flex:1;" id="${id}" data-bind="imgDir" value="${G.imgDir}" onchange="setImgDir(this.value)">
       <button class="btn btn-secondary btn-sm" onclick="pickImgDir('${id}')">
         ${t('browse')}
       </button>
@@ -52,7 +52,7 @@ function lblDirInput(id) {
   return `<div class="form-group">
     <label class="form-label">${t('explorer.lbl_dir')}</label>
     <div style="display:flex;gap:0.5rem;">
-      <input type="text" class="form-input input-normal" style="flex:1;" readonly id="${id}" data-bind="lblDir" value="${G.lblDir}">
+      <input type="text" class="form-input input-normal" style="flex:1;" id="${id}" data-bind="lblDir" value="${G.lblDir}" onchange="setLblDir(this.value)">
       <button class="btn btn-secondary btn-sm" onclick="pickLblDir('${id}')">
         ${t('browse')}
       </button>
@@ -63,7 +63,7 @@ function outDirInput(id) {
   return `<div class="form-group">
     <label class="form-label">${t('splitter.output')}</label>
     <div style="display:flex;gap:0.5rem;">
-      <input type="text" class="form-input input-normal" style="flex:1;" readonly id="${id}">
+      <input type="text" class="form-input input-normal" style="flex:1;" id="${id}" onchange="this.value=this.value.trim()">
       <button class="btn btn-secondary btn-sm" onclick="pickDir('${id}')">
         ${t('browse')}
       </button>
@@ -99,7 +99,7 @@ function _showFileBrowser(mode, exts, callback) {
     </div>
     <div style="padding:0.5rem 1.25rem;display:flex;gap:0.5rem;align-items:center;border-bottom:1px solid var(--border-01);">
       <button class="btn btn-ghost btn-sm" id="fb-up">⬆</button>
-      <input type="text" class="form-input input-normal" id="fb-path" style="flex:1;font-size:12px;" readonly>
+      <input type="text" class="form-input input-normal" id="fb-path" style="flex:1;font-size:12px;" placeholder="Paste path and press Enter">
     </div>
     <div id="fb-list" style="flex:1;overflow-y:auto;padding:0.5rem;min-height:200px;max-height:50vh;"></div>
     <div style="padding:0.75rem 1.25rem;border-top:1px solid var(--border-01);display:flex;gap:0.5rem;justify-content:flex-end;">
@@ -155,6 +155,13 @@ function _showFileBrowser(mode, exts, callback) {
   };
   const selDirBtn = modal.querySelector('#fb-select-dir');
   if (selDirBtn) selDirBtn.onclick = () => { if (currentPath) { cleanup(); callback(currentPath); } };
+
+  pathEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const v = pathEl.value.trim();
+      if (v) navigate(v);
+    }
+  });
 
   navigate('');
 }
