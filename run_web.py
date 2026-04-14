@@ -111,7 +111,22 @@ def main():
             import logging
             logging.getLogger("pywebview").setLevel(logging.DEBUG)
             ico = str(ROOT / "assets" / ("icon.ico" if sys.platform == "win32" else "icon.png"))
-            webview.create_window("ssook", url, width=1400, height=900, min_size=(1024, 600))
+            window = webview.create_window("ssook", url, width=1400, height=900, min_size=(1024, 600),
+                                           text_select=True)
+
+            def _on_loaded():
+                """Fix keyboard focus in PyInstaller frozen exe (console=False)."""
+                try:
+                    window.evaluate_js('document.body.focus();')
+                    if sys.platform == 'win32':
+                        import ctypes
+                        hwnd = ctypes.windll.user32.GetForegroundWindow()
+                        if hwnd:
+                            ctypes.windll.user32.SetFocus(hwnd)
+                except Exception:
+                    pass
+
+            window.events.loaded += _on_loaded
             webview.start(icon=ico, debug=False)
             return
         except ImportError as e:
