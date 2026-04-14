@@ -1006,6 +1006,18 @@ Tabs.benchmark = {
             <div class="form-group"><label class="form-label">${t('bench.input_size')}</label><select class="form-input input-normal" id="bench-size"><option>640</option><option>320</option><option>1280</option></select></div>
             <div class="form-group"><label class="form-label">${t('bench.warmup')}</label><span class="form-input" style="background:var(--background-neutral-02);color:var(--text-03);">${t('bench.fixed')}</span></div>
           </div>
+          <div style="margin-top:0.75rem;">
+            <label class="form-label" style="margin-bottom:0.35rem;">Codec Test</label>
+            <div style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center;">
+              <label style="font-size:12px;display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" value="none" id="bench-codec-none" checked> None (raw)</label>
+              <label style="font-size:12px;display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" value="jpeg" class="bench-codec"> JPEG</label>
+              <label style="font-size:12px;display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" value="png" class="bench-codec"> PNG</label>
+              <label style="font-size:12px;display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" value="webp" class="bench-codec"> WebP</label>
+              <label style="font-size:12px;display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" value="h264" class="bench-codec"> H.264</label>
+              <label style="font-size:12px;display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" value="h265" class="bench-codec"> H.265</label>
+            </div>
+            <div class="text-secondary" style="font-size:10px;margin-top:0.25rem;">Select codecs to pre-encode frames; decode time is included in benchmark results</div>
+          </div>
           <div style="display:flex;gap:0.5rem;margin-top:1rem;">
             <button class="btn btn-primary" id="bench-run" onclick="Tabs.benchmark.run()">${t('bench.run')}</button>
             <button class="btn btn-danger btn-sm" id="bench-stop" disabled onclick="Tabs.benchmark.stop()">${t('stop')}</button>
@@ -1020,11 +1032,11 @@ Tabs.benchmark = {
             <h3 class="text-heading-h3">${t('bench.results')}</h3>
             <div style="display:flex;gap:0.5rem;">
               <button class="btn btn-secondary btn-sm" onclick="Tabs.benchmark.exportResults()">${t('export')}</button>
-              <button class="btn btn-ghost btn-sm" onclick="document.getElementById('bench-results').innerHTML='<tr><td colspan=13 class=text-secondary style=text-align:center;padding:2rem>${t('bench.run_hint')}</td></tr>'">${t('reset')}</button>
+              <button class="btn btn-ghost btn-sm" onclick="document.getElementById('bench-results').innerHTML='<tr><td colspan=15 class=text-secondary style=text-align:center;padding:2rem>${t('bench.run_hint')}</td></tr>'">${t('reset')}</button>
             </div>
           </div>
-          <div class="table-container"><table><thead><tr><th>Model</th><th>Provider</th><th>FPS</th><th>Avg(ms)</th><th>Pre(ms)</th><th>Infer(ms)</th><th>Post(ms)</th><th title="${t('bench.p50_tip')}">P50(ms)</th><th title="${t('bench.p95_tip')}">P95(ms)</th><th title="${t('bench.p99_tip')}">P99(ms)</th><th>CPU%</th><th>RAM(MB)</th><th>GPU%</th></tr></thead>
-          <tbody id="bench-results"><tr><td colspan="13" class="text-secondary" style="text-align:center;padding:2rem;">${t('bench.run_hint')}</td></tr></tbody></table></div>
+          <div class="table-container"><table><thead><tr><th>Model</th><th>Codec</th><th>Provider</th><th>FPS</th><th>Avg(ms)</th><th>Dec(ms)</th><th>Pre(ms)</th><th>Infer(ms)</th><th>Post(ms)</th><th title="${t('bench.p50_tip')}">P50(ms)</th><th title="${t('bench.p95_tip')}">P95(ms)</th><th title="${t('bench.p99_tip')}">P99(ms)</th><th>CPU%</th><th>RAM(MB)</th><th>GPU%</th></tr></thead>
+          <tbody id="bench-results"><tr><td colspan="15" class="text-secondary" style="text-align:center;padding:2rem;">${t('bench.run_hint')}</td></tr></tbody></table></div>
         </div>
       </div>`;
   },
@@ -1040,7 +1052,11 @@ Tabs.benchmark = {
     try {
       const r = await API.post('/api/benchmark/run', {
         models, iterations: +document.getElementById('bench-iters').value,
-        input_size: +document.getElementById('bench-size').value
+        input_size: +document.getElementById('bench-size').value,
+        codecs: [
+          ...(document.getElementById('bench-codec-none')?.checked ? ['none'] : []),
+          ...[...document.querySelectorAll('.bench-codec:checked')].map(c => c.value)
+        ]
       });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       // Poll for results
@@ -1060,10 +1076,10 @@ Tabs.benchmark = {
       if (s.results && s.results.length) {
         const tb = document.getElementById('bench-results');
         tb.innerHTML = s.results.map((x, i) => {
-          if (x.error) return `<tr><td colspan="13" style="color:var(--action-danger-05);">${x.error}</td></tr>`;
+          if (x.error) return `<tr><td colspan="15" style="color:var(--action-danger-05);">${x.error}</td></tr>`;
           const hl = i === 0 ? ' style="background:var(--status-success-01);font-weight:600;"' : '';
           const gpu = x.gpu_pct != null ? `${x.gpu_pct}%` : 'N/A';
-          return `<tr${hl}><td>${x.name||'—'}</td><td>${x.provider||'—'}</td><td>${x.fps||'—'}</td><td>${x.avg||'—'}</td><td>${x.pre_ms||'—'}</td><td>${x.infer_ms||'—'}</td><td>${x.post_ms||'—'}</td><td>${x.p50||'—'}</td><td>${x.p95||'—'}</td><td>${x.p99||'—'}</td><td>${x.cpu_pct||'—'}</td><td>${x.ram_mb||'—'}</td><td>${gpu}</td></tr>`;
+          return `<tr${hl}><td>${x.name||'—'}</td><td>${x.codec||'—'}</td><td>${x.provider||'—'}</td><td>${x.fps||'—'}</td><td>${x.avg||'—'}</td><td>${x.decode_ms||'—'}</td><td>${x.pre_ms||'—'}</td><td>${x.infer_ms||'—'}</td><td>${x.post_ms||'—'}</td><td>${x.p50||'—'}</td><td>${x.p95||'—'}</td><td>${x.p99||'—'}</td><td>${x.cpu_pct||'—'}</td><td>${x.ram_mb||'—'}</td><td>${gpu}</td></tr>`;
         }).join('');
       }
       if (s.running) {
