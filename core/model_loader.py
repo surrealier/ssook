@@ -1,9 +1,10 @@
 """PT / ONNX 모델 로드 및 names 추출"""
 import ast
 import os
-from dataclasses import dataclass
-from typing import Literal, Optional
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional
 
+import numpy as np
 import onnxruntime as ort
 
 _DARKNET_DEFAULT_NAMES = {
@@ -24,6 +25,7 @@ class ModelInfo:
     task_type: str = "detection"         # "detection" | "classification"
     batch_size: int = 1                  # 고정 배치 크기 (1=단일, 4=4배치 등)
     custom_type_name: str = ""           # custom 모델 타입 이름 (model_type=="custom" 시)
+    _batch_buf: Any = field(default=None, repr=False)  # 배치 텐서 캐시 (inference.py에서 사용)
 
 
 # 지원 모델 타입 목록

@@ -192,3 +192,93 @@ def evaluate_map50_95(gt_data, pred_data):
         aps = ap_per_thresh[iou_t]
         thresh_maps.append(float(np.mean(aps)) if aps else 0.0)
     return float(np.mean(thresh_maps)) if thresh_maps else 0.0
+
+
+# ── Segmentation Metrics ────────────────────────────────
+
+def evaluate_segmentation(pred_mask, gt_mask, num_classes):
+    """Per-class IoU/Dice from pred_mask and gt_mask (H×W integer arrays)."""
+    results = {}
+    for c in range(num_classes):
+        pred_c = (pred_mask == c)
+        gt_c = (gt_mask == c)
+        inter = int((pred_c & gt_c).sum())
+        union = int((pred_c | gt_c).sum())
+        iou = inter / (union + 1e-9) if union > 0 else float('nan')
+        dice = 2.0 * inter / (int(pred_c.sum()) + int(gt_c.sum()) + 1e-9)
+        results[c] = {"iou": iou, "dice": dice, "pred_px": int(pred_c.sum()), "gt_px": int(gt_c.sum())}
+    valid = [v["iou"] for v in results.values() if not np.isnan(v["iou"]) and v["gt_px"] > 0]
+    valid_dice = [v["dice"] for v in results.values() if v["gt_px"] > 0]
+    results["__overall__"] = {
+        "mIoU": float(np.mean(valid)) if valid else 0.0,
+        "mDice": float(np.mean(valid_dice)) if valid_dice else 0.0,
+    }
+    return results
+
+
+# ── Classification Metrics ──────────────────────────────
+
+def evaluate_classification(gt_data, pred_data):
+    """Classification eval. gt_data: {stem: class_id}, pred_data: {stem: (class_id, conf)}."""
+    if not gt_data or not pred_data:
+        return {}
+    y_true, y_pred = [], []
+    for stem in gt_data:
+        if stem in pred_data:
+            y_true.append(gt_data[stem])
+            y_pred.append(pred_data[stem][0] if isinstance(pred_data[stem], (list, tuple)) else pred_data[stem])
+    if not y_true:
+        return {}
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    accuracy = float((y_true == y_pred).mean())
+    results = {}
+    for cid in sorted(set(y_true.tolist() + y_pred.tolist())):
+        tp = int(((y_true == cid) & (y_pred == cid)).sum())
+        fp = int(((y_true != cid) & (y_pred == cid)).sum())
+        fn = int(((y_true == cid) & (y_pred != cid)).sum())
+        prec = tp / (tp + fp + 1e-9)
+        rec = tp / (tp + fn + 1e-9)
+        f1 = 2 * prec * rec / (prec + rec + 1e-9)
+        results[cid] = {"precision": prec, "recall": rec, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
+    results["__overall__"] = {
+        "accuracy": accuracy,
+        "precision": float(np.mean([v["precision"] for v in results.values() if isinstance(v, dict) and "precision" in v])),
+        "recall": float(np.mean([v["recall"] for v in results.values() if isinstance(v, dict) and "recall" in v])),
+        "f1": float(np.mean([v["f1"] for v in results.values() if isinstance(v, dict) and "f1" in v])),
+    }
+    return results
+
+
+# ── Embedder Metrics ────────────────────────────────────
+
+def evaluate_embedder(query_embeddings, gallery_embeddings, query_labels, gallery_labels, top_k=5):
+    """Retrieval evaluation: Retrieval@1, Retrieval@K, mean cosine similarity."""
+    if len(query_embeddings) == 0 or len(gallery_embeddings) == 0:
+        return {}
+    q = np.array(query_embeddings, dtype=np.float32)
+    g = np.array(gallery_embeddings, dtype=np.float32)
+    # Normalize
+    q = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-9)
+    g = g / (np.linalg.norm(g, axis=1, keepdims=True) + 1e-9)
+    sim = q @ g.T  # (Q, G)
+
+    r1_correct = 0
+    rk_correct = 0
+    for i in range(len(q)):
+        ranked = np.argsort(-sim[i])
+        top1_label = gallery_labels[ranked[0]]
+        topk_labels = [gallery_labels[j] for j in ranked[:top_k]]
+        if top1_label == query_labels[i]:
+            r1_correct += 1
+        if query_labels[i] in topk_labels:
+            rk_correct += 1
+
+    n = len(q)
+    return {
+        "retrieval_at_1": r1_correct / n,
+        "retrieval_at_k": rk_correct / n,
+        "top_k": top_k,
+        "mean_cosine_sim": float(sim.max(axis=1).mean()),
+        "num_queries": n,
+        "num_gallery": len(g),
+    }

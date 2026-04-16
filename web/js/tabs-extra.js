@@ -1486,11 +1486,13 @@ Tabs['profiler'] = {
         </div>
         <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.profiler.run()">${t('profiler.run')}</button>
       </div>
-      <div class="card" style="padding:1.5rem;" id="prof-result">
-        <span class="text-secondary">${t('profiler.hint')}</span>
+      <div id="prof-result">
+        <div class="card" style="padding:1.5rem;"><span class="text-secondary">${t('profiler.hint')}</span></div>
       </div>
     </div>`;
   },
+  _sevColor(s) { return s==='high'?'#ef4444':s==='medium'?'#f59e0b':'#22c55e'; },
+  _fmtNum(n) { return n>=1e9?(n/1e9).toFixed(2)+'G':n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(n); },
   async run() {
     const path = document.getElementById('prof-model')?.value || G.model;
     if (!path) { App.setStatus(t('select_model')); return; }
@@ -1498,30 +1500,113 @@ Tabs['profiler'] = {
     try {
       const r = await API.post('/api/profiler/run', {path, num_runs: parseInt(document.getElementById('prof-runs').value)||20});
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
-      let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">';
-      // Latency stats
+      const P = this;
+      let html = '';
+
+      // Row 1: Latency + Model Info + Memory
+      html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem;">';
       html += `<div class="card-flat" style="padding:1rem;">
         <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.latency')}</div>
         <table style="width:100%;font-size:12px;">
           <tr><td class="text-secondary">Avg</td><td><strong>${r.avg_infer_ms} ms</strong></td></tr>
-          <tr><td class="text-secondary">Min</td><td>${r.min_infer_ms} ms</td></tr>
-          <tr><td class="text-secondary">Max</td><td>${r.max_infer_ms} ms</td></tr>
-          <tr><td class="text-secondary">P50</td><td>${r.p50_ms} ms</td></tr>
-          <tr><td class="text-secondary">P95</td><td>${r.p95_ms} ms</td></tr>
-          <tr><td class="text-secondary">P99</td><td>${r.p99_ms} ms</td></tr>
-          <tr><td class="text-secondary">Runs</td><td>${r.num_runs}</td></tr>
+          <tr><td class="text-secondary">Min / Max</td><td>${r.min_infer_ms} / ${r.max_infer_ms} ms</td></tr>
+          <tr><td class="text-secondary">P50 / P95 / P99</td><td>${r.p50_ms} / ${r.p95_ms} / ${r.p99_ms}</td></tr>
+          <tr><td class="text-secondary">FPS</td><td><strong>${r.avg_infer_ms > 0 ? (1000/r.avg_infer_ms).toFixed(1) : '—'}</strong></td></tr>
         </table></div>`;
-      // Model info
       html += `<div class="card-flat" style="padding:1rem;">
         <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.model_info')}</div>
         <table style="width:100%;font-size:12px;">
-          <tr><td class="text-secondary">Parameters</td><td>${r.num_parameters ? r.num_parameters.toLocaleString() : '—'}</td></tr>
-          <tr><td class="text-secondary">Est. FLOPs</td><td>${r.estimated_flops ? (r.estimated_flops/1e9).toFixed(2)+' G' : '—'}</td></tr>
-          <tr><td class="text-secondary">FPS (avg)</td><td>${r.avg_infer_ms > 0 ? (1000/r.avg_infer_ms).toFixed(1) : '—'}</td></tr>
+          <tr><td class="text-secondary">Parameters</td><td>${r.num_parameters ? P._fmtNum(r.num_parameters) : '—'}</td></tr>
+          <tr><td class="text-secondary">FLOPs</td><td>${r.estimated_flops ? P._fmtNum(r.estimated_flops) : '—'}</td></tr>
+          <tr><td class="text-secondary">MACs</td><td>${r.total_macs ? P._fmtNum(r.total_macs) : '—'}</td></tr>
+          <tr><td class="text-secondary">${t('profiler.graph_depth')}</td><td>${r.graph_depth || '—'}</td></tr>
         </table></div>`;
-      // Bottlenecks
+      html += `<div class="card-flat" style="padding:1rem;">
+        <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.memory')}</div>
+        <table style="width:100%;font-size:12px;">
+          <tr><td class="text-secondary">${t('profiler.weights')}</td><td>${r.weight_memory_mb || 0} MB</td></tr>
+          <tr><td class="text-secondary">${t('profiler.peak_act')}</td><td>${r.peak_activation_mb || 0} MB</td></tr>
+          <tr><td class="text-secondary">${t('profiler.total')}</td><td><strong>${r.total_memory_mb || 0} MB</strong></td></tr>
+        </table></div>`;
+      html += '</div>';
+
+      // Row 2: I/O info
+      if (r.input_info && r.input_info.length) {
+        html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:1rem;">';
+        html += `<div class="card-flat" style="padding:1rem;"><div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.inputs')}</div>`;
+        r.input_info.forEach(i => { html += `<div style="font-size:11px;margin-bottom:0.25rem;"><strong>${i.name}</strong> [${i.shape.join('×')}] <span class="text-secondary">${i.type}</span></div>`; });
+        html += '</div>';
+        html += `<div class="card-flat" style="padding:1rem;"><div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.outputs')}</div>`;
+        (r.output_info||[]).forEach(o => { html += `<div style="font-size:11px;margin-bottom:0.25rem;"><strong>${o.name}</strong> [${o.shape.join('×')}] <span class="text-secondary">${o.type}</span></div>`; });
+        html += '</div></div>';
+      }
+
+      // Row 3: Op Distribution (bar chart via CSS)
+      if (r.op_type_summary && r.op_type_summary.length) {
+        html += `<div class="card-flat" style="padding:1rem;margin-top:1rem;">
+          <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.op_dist')}</div>
+          <div style="display:flex;flex-direction:column;gap:4px;max-height:300px;overflow-y:auto;">`;
+        r.op_type_summary.slice(0, 15).forEach(op => {
+          html += `<div style="display:grid;grid-template-columns:100px 1fr 60px 50px;align-items:center;font-size:11px;gap:8px;">
+            <span style="font-weight:600;">${op.op_type}</span>
+            <div style="background:var(--bg-02);border-radius:4px;height:16px;overflow:hidden;">
+              <div style="width:${Math.max(op.time_pct,1)}%;height:100%;background:var(--accent);border-radius:4px;"></div>
+            </div>
+            <span class="text-secondary">${op.time_pct}%</span>
+            <span class="text-secondary">×${op.count}</span>
+          </div>`;
+        });
+        html += '</div></div>';
+      }
+
+      // Row 4: Quantization Readiness
+      html += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:1rem;">`;
+      const qPct = Math.round((r.quantizable_ratio||0)*100);
+      const qColor = qPct > 70 ? '#22c55e' : qPct > 40 ? '#f59e0b' : '#ef4444';
+      html += `<div class="card-flat" style="padding:1rem;">
+        <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.quant_ready')}</div>
+        <div style="display:flex;align-items:center;gap:1rem;">
+          <div style="width:60px;height:60px;border-radius:50%;border:4px solid ${qColor};display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:${qColor};">${qPct}%</div>
+          <div style="font-size:12px;">
+            <div>Est. INT8 Speedup: <strong>${r.estimated_int8_speedup||1}x</strong></div>
+            ${r.non_quantizable_ops && r.non_quantizable_ops.length ? `<div class="text-secondary" style="margin-top:0.25rem;">${t('profiler.non_quant')}: ${r.non_quantizable_ops.join(', ')}</div>` : ''}
+          </div>
+        </div></div>`;
+
+      // Optimization Suggestions
+      html += `<div class="card-flat" style="padding:1rem;">
+        <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.opt_suggest')}</div>`;
+      if (r.optimization_suggestions && r.optimization_suggestions.length) {
+        r.optimization_suggestions.forEach(s => {
+          html += `<div style="font-size:11px;padding:0.4rem 0.6rem;margin-bottom:0.25rem;background:var(--bg-02);border-radius:6px;border-left:3px solid var(--accent);">💡 ${s}</div>`;
+        });
+      } else { html += `<span class="text-secondary" style="font-size:12px;">${t('profiler.no_suggest')}</span>`; }
+      html += '</div></div>';
+
+      // Row 5: Bottleneck Diagnosis
+      if (r.bottleneck_diagnosis && r.bottleneck_diagnosis.length) {
+        html += `<div class="card-flat" style="padding:1rem;margin-top:1rem;">
+          <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.diagnosis')}</div>
+          <div style="display:flex;flex-direction:column;gap:0.5rem;max-height:400px;overflow-y:auto;">`;
+        r.bottleneck_diagnosis.slice(0, 10).forEach(d => {
+          html += `<div style="padding:0.6rem;background:var(--bg-02);border-radius:8px;border-left:4px solid ${P._sevColor(d.severity)};">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span style="font-size:12px;font-weight:600;">${d.op_type} <span class="text-secondary" style="font-weight:400;">${d.layer}</span></span>
+              <div style="display:flex;gap:0.5rem;align-items:center;">
+                <span style="font-size:10px;padding:2px 6px;border-radius:4px;background:${P._sevColor(d.severity)}20;color:${P._sevColor(d.severity)};font-weight:600;">${d.severity.toUpperCase()}</span>
+                <span style="font-size:11px;font-weight:600;">${d.time_us} μs</span>
+                <span style="font-size:10px;padding:2px 6px;border-radius:4px;background:var(--bg-03);">${d.category}</span>
+              </div>
+            </div>
+            ${d.suggestion ? `<div style="font-size:11px;color:var(--text-04);margin-top:0.3rem;">→ ${d.suggestion}</div>` : ''}
+          </div>`;
+        });
+        html += '</div></div>';
+      }
+
+      // Row 6: Top Bottleneck Layers table
       if (r.top_bottlenecks && r.top_bottlenecks.length) {
-        html += `<div class="card-flat" style="padding:1rem;grid-column:span 2;">
+        html += `<div class="card-flat" style="padding:1rem;margin-top:1rem;">
           <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.bottlenecks')}</div>
           <div class="table-container"><table><thead><tr><th>Layer</th><th>Op</th><th>Time (μs)</th></tr></thead><tbody>`;
         r.top_bottlenecks.forEach(l => {
@@ -1529,10 +1614,133 @@ Tabs['profiler'] = {
         });
         html += '</tbody></table></div></div>';
       }
-      html += '</div>';
+
       document.getElementById('prof-result').innerHTML = html;
       App.setStatus(t('profiler.done'));
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  }
+};
+
+/* ── Calibration / Quantization Tab ─────────────────── */
+Tabs['calibration'] = {
+  title: true,
+  _timer: null,
+  render() {
+    return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
+      <div class="card" style="padding:1.5rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('calib.title')}</h3>
+        ${modelInput('calib-model')}
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:0.75rem;">
+          <div class="form-group"><label class="form-label">${t('calib.method')}</label>
+            <select class="form-input input-normal" id="calib-method" onchange="Tabs['calibration']._onMethod()">
+              <option value="dynamic">${t('calib.dynamic')}</option>
+              <option value="static">${t('calib.static')}</option>
+              <option value="fp16">${t('calib.fp16')}</option>
+            </select></div>
+          <div class="form-group"><label class="form-label">${t('calib.output')}</label>
+            <div style="display:flex;gap:0.5rem;"><input type="text" class="form-input input-normal" style="flex:1;" id="calib-out" placeholder="${t('calib.auto_name')}"><button class="btn btn-secondary btn-sm" onclick="pickDir('calib-out')">${t('browse')}</button></div></div>
+        </div>
+        <div id="calib-static-opts" style="display:none;margin-top:0.75rem;">
+          ${imgDirInput('calib-img')}
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-top:0.75rem;">
+            <div class="form-group"><label class="form-label">${t('calib.max_images')}</label>
+              <input type="number" class="form-input input-normal" id="calib-max" value="100" min="10" max="1000"></div>
+            <div class="form-group"><label class="form-label">${t('calib.weight_type')}</label>
+              <select class="form-input input-normal" id="calib-wt"><option value="int8">INT8</option><option value="uint8" selected>UINT8</option></select></div>
+            <div class="form-group"><label class="form-label">${t('calib.act_type')}</label>
+              <select class="form-input input-normal" id="calib-at"><option value="uint8" selected>UINT8</option><option value="int8">INT8</option></select></div>
+            <div class="form-group"><label class="form-label">${t('calib.format')}</label>
+              <select class="form-input input-normal" id="calib-fmt"><option value="QDQ" selected>QDQ</option><option value="QOperator">QOperator</option></select></div>
+          </div>
+          <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="calib-perchan" checked> ${t('calib.per_channel')}</label>
+        </div>
+        <div id="calib-dynamic-opts" style="margin-top:0.75rem;">
+          <div class="form-group" style="max-width:200px;"><label class="form-label">${t('calib.weight_type')}</label>
+            <select class="form-input input-normal" id="calib-dyn-wt"><option value="uint8" selected>UINT8</option><option value="int8">INT8</option></select></div>
+        </div>
+        <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs['calibration'].run()">${t('calib.run')}</button>
+      </div>
+      <div><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="calib-prog" style="width:0%;height:100%;"></div><span id="calib-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
+        <span class="text-secondary" id="calib-msg" style="margin-top:0.25rem;display:block;">${t('ready')}</span></div>
+      <div class="card" id="calib-result" style="padding:1.5rem;display:none;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('calib.result')}</h3>
+        <div id="calib-result-body"></div>
+      </div>
+    </div>`;
+  },
+  _onMethod() {
+    const m = document.getElementById('calib-method').value;
+    document.getElementById('calib-static-opts').style.display = m === 'static' ? '' : 'none';
+    document.getElementById('calib-dynamic-opts').style.display = m === 'dynamic' ? '' : 'none';
+  },
+  async run() {
+    const path = document.getElementById('calib-model')?.value || G.model;
+    if (!path) { App.setStatus(t('select_model')); return; }
+    const method = document.getElementById('calib-method').value;
+    const body = { model_path: path, method, output_path: document.getElementById('calib-out').value || '' };
+    if (method === 'static') {
+      body.calibration_dir = document.getElementById('calib-img')?.value || '';
+      body.max_images = parseInt(document.getElementById('calib-max').value) || 100;
+      body.weight_type = document.getElementById('calib-wt').value;
+      body.activation_type = document.getElementById('calib-at').value;
+      body.quant_format = document.getElementById('calib-fmt').value;
+      body.per_channel = document.getElementById('calib-perchan').checked;
+      if (!body.calibration_dir) { App.setStatus(t('calib.need_img')); return; }
+    } else if (method === 'dynamic') {
+      body.weight_type = document.getElementById('calib-dyn-wt').value;
+    }
+    const r = await API.post('/api/quantize', body);
+    if (r.error) { App.setStatus('Error: ' + r.error); return; }
+    App.setStatus(t('calib.started'));
+    document.getElementById('calib-result').style.display = 'none';
+    this._poll();
+  },
+  _poll() {
+    if (this._timer) clearInterval(this._timer);
+    this._timer = setInterval(async () => {
+      const s = await API.get('/api/quantize/status');
+      const prog = s.total > 0 ? Math.round(s.progress / s.total * 100) : 0;
+      const el = document.getElementById('calib-prog');
+      if (el) el.style.width = (s.running ? Math.max(prog, 5) : (s.msg === 'Complete' ? 100 : 0)) + '%';
+      const pt = document.getElementById('calib-prog-text');
+      if (pt) pt.textContent = s.running ? prog + '%' : (s.msg === 'Complete' ? '100%' : '');
+      const msg = document.getElementById('calib-msg');
+      if (msg) msg.textContent = s.msg || '';
+      if (!s.running) {
+        clearInterval(this._timer); this._timer = null;
+        if (s.results && s.results.output_path) {
+          const res = s.results;
+          let html = `<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+            <div><span class="text-secondary">${t('calib.method')}</span><br><strong>${res.method.toUpperCase()}</strong></div>
+            <div><span class="text-secondary">${t('calib.output')}</span><br><strong style="word-break:break-all;font-size:12px;">${res.output_path}</strong></div>
+            <div><span class="text-secondary">${t('calib.orig_size')}</span><br><strong>${res.original_size_mb} MB</strong></div>
+            <div><span class="text-secondary">${t('calib.new_size')}</span><br><strong>${res.quantized_size_mb} MB</strong></div>
+            <div><span class="text-secondary">${t('calib.ratio')}</span><br><strong>${res.compression_ratio}x</strong></div>
+            ${res.calibration_images ? `<div><span class="text-secondary">${t('calib.cal_images')}</span><br><strong>${res.calibration_images}</strong></div>` : ''}
+          </div>
+          <button class="btn btn-secondary" style="margin-top:1rem;" onclick="Tabs['calibration']._openInBenchmark('${res.output_path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}')">${t('calib.compare_bench')}</button>`;
+          document.getElementById('calib-result-body').innerHTML = html;
+          document.getElementById('calib-result').style.display = '';
+          App.setStatus(t('calib.done'));
+        } else if (s.msg && s.msg.startsWith('Error')) {
+          App.setStatus(s.msg);
+        }
+      }
+    }, 500);
+  },
+  _openInBenchmark(outputPath) {
+    const modelEl = document.getElementById('calib-model');
+    const origPath = modelEl ? modelEl.value || G.model : G.model;
+    App.switchTab('benchmark');
+    setTimeout(() => {
+      const slots = document.querySelectorAll('.bench-model-input');
+      if (slots[0]) slots[0].value = origPath;
+      if (slots.length > 1) { slots[1].value = outputPath; }
+      else {
+        const addBtn = document.querySelector('[onclick*="addModelSlot"], .bench-add-slot');
+        if (addBtn) { addBtn.click(); setTimeout(() => { const s2 = document.querySelectorAll('.bench-model-input'); if(s2[1]) s2[1].value = outputPath; }, 100); }
+      }
+    }, 200);
   }
 };
 

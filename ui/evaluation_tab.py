@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QPushButton,
     QLabel, QLineEdit, QDoubleSpinBox, QProgressBar, QFileDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QTextEdit,
-    QComboBox, QTabWidget, QDialog,
+    QComboBox, QTabWidget, QDialog, QCheckBox,
 )
 
 from core.model_loader import ModelInfo, load_model
@@ -26,43 +26,114 @@ class _PseudoWorker(QThread):
     finished_ok = Signal(str)
     error = Signal(str)
 
-    def __init__(self, model_info, img_dir, out_dir, conf):
+    def __init__(self, model_info, src_path, out_dir, conf,
+                 source_type="image", frame_interval=1, save_frames=False):
         super().__init__()
         self.model_info = model_info
-        self.img_dir = img_dir
+        self.src_path = src_path
         self.out_dir = out_dir
         self.conf = conf
+        self.source_type = source_type      # "image" or "video"
+        self.frame_interval = max(1, frame_interval)
+        self.save_frames = save_frames
+
+    def _write_label(self, txt_path, res, h, w):
+        with open(txt_path, "w") as f:
+            for box, score, cid in zip(res.boxes, res.scores, res.class_ids):
+                x1, y1, x2, y2 = box
+                cx = ((x1 + x2) / 2) / w
+                cy = ((y1 + y2) / 2) / h
+                bw = (x2 - x1) / w
+                bh = (y2 - y1) / h
+                f.write(f"{int(cid)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+
+    def _infer(self, frame):
+        res = run_inference(self.model_info, frame, self.conf)
+        if self.model_info.model_type == "darknet":
+            res = convert_darknet_to_unified(res)
+        return res
+
+    def _run_images(self):
+        exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+        files = []
+        for e in exts:
+            files.extend(glob.glob(os.path.join(self.src_path, e)))
+        files.sort()
+        if not files:
+            self.error.emit("이미지가 없습니다.")
+            return
+        os.makedirs(self.out_dir, exist_ok=True)
+        for i, fp in enumerate(files):
+            frame = cv2.imread(fp)
+            if frame is None:
+                continue
+            h, w = frame.shape[:2]
+            res = self._infer(frame)
+            txt_path = os.path.join(self.out_dir, os.path.splitext(os.path.basename(fp))[0] + ".txt")
+            self._write_label(txt_path, res, h, w)
+            self.progress.emit(i + 1, len(files))
+        self.finished_ok.emit(self.out_dir)
+
+    def _run_video(self):
+        vid_exts = (".mp4", ".avi", ".mkv", ".mov", ".wmv")
+        # src_path가 폴더면 내부 비디오 수집, 파일이면 단일 처리
+        if os.path.isdir(self.src_path):
+            videos = sorted(
+                f for f in glob.glob(os.path.join(self.src_path, "*"))
+                if os.path.splitext(f)[1].lower() in vid_exts
+            )
+        else:
+            videos = [self.src_path]
+        if not videos:
+            self.error.emit("비디오 파일이 없습니다.")
+            return
+
+        # 전체 프레임 수 사전 계산 (진행률용)
+        total_frames = 0
+        for vp in videos:
+            cap = cv2.VideoCapture(vp)
+            total_frames += int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) // self.frame_interval
+            cap.release()
+        if total_frames <= 0:
+            total_frames = 1
+
+        os.makedirs(self.out_dir, exist_ok=True)
+        img_dir = os.path.join(self.out_dir, "images") if self.save_frames else None
+        lbl_dir = os.path.join(self.out_dir, "labels")
+        os.makedirs(lbl_dir, exist_ok=True)
+        if img_dir:
+            os.makedirs(img_dir, exist_ok=True)
+
+        processed = 0
+        for vp in videos:
+            cap = cv2.VideoCapture(vp)
+            if not cap.isOpened():
+                continue
+            vid_name = os.path.splitext(os.path.basename(vp))[0]
+            idx = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if idx % self.frame_interval == 0:
+                    h, w = frame.shape[:2]
+                    res = self._infer(frame)
+                    fname = f"{vid_name}_{idx:06d}"
+                    self._write_label(os.path.join(lbl_dir, fname + ".txt"), res, h, w)
+                    if img_dir:
+                        cv2.imwrite(os.path.join(img_dir, fname + ".jpg"), frame)
+                    processed += 1
+                    self.progress.emit(processed, total_frames)
+                idx += 1
+            cap.release()
+        self.finished_ok.emit(self.out_dir)
 
     def run(self):
         try:
-            exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
-            files = []
-            for e in exts:
-                files.extend(glob.glob(os.path.join(self.img_dir, e)))
-            files.sort()
-            if not files:
-                self.error.emit("이미지가 없습니다.")
-                return
-            os.makedirs(self.out_dir, exist_ok=True)
-            for i, fp in enumerate(files):
-                frame = cv2.imread(fp)
-                if frame is None:
-                    continue
-                h, w = frame.shape[:2]
-                res = run_inference(self.model_info, frame, self.conf)
-                if self.model_info.model_type == "darknet":
-                    res = convert_darknet_to_unified(res)
-                txt_path = os.path.join(self.out_dir, os.path.splitext(os.path.basename(fp))[0] + ".txt")
-                with open(txt_path, "w") as f:
-                    for box, score, cid in zip(res.boxes, res.scores, res.class_ids):
-                        x1, y1, x2, y2 = box
-                        cx = ((x1 + x2) / 2) / w
-                        cy = ((y1 + y2) / 2) / h
-                        bw = (x2 - x1) / w
-                        bh = (y2 - y1) / h
-                        f.write(f"{int(cid)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
-                self.progress.emit(i + 1, len(files))
-            self.finished_ok.emit(self.out_dir)
+            if self.source_type == "video":
+                self._run_video()
+            else:
+                self._run_images()
         except Exception as e:
             self.error.emit(str(e))
 
@@ -679,13 +750,34 @@ class EvaluationTab(QWidget):
         g1.addLayout(row_model)
 
         row_img = QHBoxLayout()
-        row_img.addWidget(QLabel("이미지 폴더:"))
+        row_img.addWidget(QLabel("소스:"))
+        self._combo_source = QComboBox()
+        self._combo_source.addItems(["이미지 폴더", "비디오"])
+        self._combo_source.currentIndexChanged.connect(self._on_source_changed)
+        row_img.addWidget(self._combo_source)
         self._le_img_dir = QLineEdit()
         row_img.addWidget(self._le_img_dir, 1)
-        btn_img = QPushButton("찾아보기")
-        btn_img.clicked.connect(lambda: self._browse_dir(self._le_img_dir))
-        row_img.addWidget(btn_img)
+        self._btn_browse_src = QPushButton("찾아보기")
+        self._btn_browse_src.clicked.connect(self._browse_pseudo_src)
+        row_img.addWidget(self._btn_browse_src)
         g1.addLayout(row_img)
+
+        # 비디오 옵션 행
+        self._row_vid_opts = QHBoxLayout()
+        self._row_vid_opts.addWidget(QLabel("프레임 간격:"))
+        self._spin_interval = QDoubleSpinBox()
+        self._spin_interval.setDecimals(0)
+        self._spin_interval.setRange(1, 9999)
+        self._spin_interval.setValue(30)
+        self._spin_interval.setToolTip("N프레임마다 1장 추출 (예: 30 = 1초당 1장 @30fps)")
+        self._row_vid_opts.addWidget(self._spin_interval)
+        self._chk_save_frames = QCheckBox("프레임 이미지 저장")
+        self._chk_save_frames.setChecked(True)
+        self._row_vid_opts.addWidget(self._chk_save_frames)
+        self._row_vid_opts.addStretch()
+        g1.addLayout(self._row_vid_opts)
+        # 초기 상태: 비디오 옵션 숨김
+        self._set_vid_opts_visible(False)
 
         row_out = QHBoxLayout()
         row_out.addWidget(QLabel("출력 폴더:"))
@@ -838,23 +930,59 @@ class EvaluationTab(QWidget):
         if d:
             le.setText(d)
 
+    def _set_vid_opts_visible(self, visible):
+        for i in range(self._row_vid_opts.count()):
+            w = self._row_vid_opts.itemAt(i).widget()
+            if w:
+                w.setVisible(visible)
+
+    def _on_source_changed(self, idx):
+        is_video = idx == 1
+        self._set_vid_opts_visible(is_video)
+
+    def _browse_pseudo_src(self):
+        if self._combo_source.currentIndex() == 0:
+            self._browse_dir(self._le_img_dir)
+        else:
+            # 비디오: 파일 또는 폴더 선택
+            from PySide6.QtWidgets import QMenu
+            menu = QMenu(self)
+            act_file = menu.addAction("비디오 파일 선택")
+            act_dir = menu.addAction("비디오 폴더 선택")
+            action = menu.exec(self._btn_browse_src.mapToGlobal(self._btn_browse_src.rect().bottomLeft()))
+            if action == act_file:
+                path, _ = QFileDialog.getOpenFileName(
+                    self, "비디오 선택", "",
+                    "Video (*.mp4 *.avi *.mkv *.mov *.wmv)")
+                if path:
+                    self._le_img_dir.setText(path)
+            elif action == act_dir:
+                self._browse_dir(self._le_img_dir)
+
     # ---- pseudo labeling ----
     def _run_pseudo(self):
         if not self._model_info or not self._model_info.session:
             QMessageBox.warning(self, "알림", "모델을 먼저 선택하세요.")
             return
-        img_dir = self._le_img_dir.text()
-        if not img_dir or not os.path.isdir(img_dir):
-            QMessageBox.warning(self, "알림", "이미지 폴더를 선택하세요.")
+        src_path = self._le_img_dir.text()
+        if not src_path or not os.path.exists(src_path):
+            QMessageBox.warning(self, "알림", "소스 경로를 선택하세요.")
             return
         out_dir = self._le_out_dir.text()
         if not out_dir:
-            out_dir = os.path.join(os.path.dirname(img_dir), "labels")
+            parent = os.path.dirname(src_path) if os.path.isfile(src_path) else os.path.dirname(src_path)
+            out_dir = os.path.join(parent, "pseudo_labels")
             self._le_out_dir.setText(out_dir)
 
+        is_video = self._combo_source.currentIndex() == 1
         self._btn_pseudo.setEnabled(False)
-        self._worker = _PseudoWorker(self._model_info, img_dir, out_dir, self._spin_conf.value())
-        self._worker.progress.connect(lambda c, t: self._prog.setValue(int(c / t * 100)))
+        self._worker = _PseudoWorker(
+            self._model_info, src_path, out_dir, self._spin_conf.value(),
+            source_type="video" if is_video else "image",
+            frame_interval=int(self._spin_interval.value()) if is_video else 1,
+            save_frames=self._chk_save_frames.isChecked() if is_video else False,
+        )
+        self._worker.progress.connect(lambda c, t: self._prog.setValue(int(c / t * 100) if t else 0))
         self._worker.finished_ok.connect(self._on_pseudo_done)
         self._worker.error.connect(lambda e: (QMessageBox.critical(self, "오류", e), self._btn_pseudo.setEnabled(True)))
         self._prog.setValue(0)

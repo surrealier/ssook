@@ -291,11 +291,18 @@ _eval_state = {"running": False, "progress": 0, "total": 0, "msg": "",
 class EvalAsyncRequest(BaseModel):
     models: list                       # [{path, model_type, class_mapping?}, ...]
     img_dir: str
-    label_dir: str
+    label_dir: str = ""
     conf: float = 0.25
     class_mapping: Optional[dict] = None  # {gt_id: name, ...}
     per_model_mappings: Optional[dict] = None  # {model_name: {model_cls_id: gt_cls_id}}
     mapped_only: bool = True
+    task: str = "detection"            # detection | classification | segmentation | clip | embedder
+    num_classes: int = 80              # for segmentation
+    gt_mask_dir: str = ""              # for segmentation
+    text_encoder_path: str = ""        # for clip
+    prompts: list = []                 # for clip
+    query_dir: str = ""                # for embedder
+    top_k: int = 5                     # for embedder
 
 
 @app.post("/api/evaluation/run-async")
@@ -313,6 +320,16 @@ async def run_evaluation_async(req: EvalAsyncRequest):
         from core.evaluation import evaluate_dataset, evaluate_map50_95
 
         try:
+            # Task routing
+            if req.task == "classification":
+                return _run_classification_eval()
+            elif req.task == "segmentation":
+                return _run_segmentation_eval()
+            elif req.task == "clip":
+                return _run_clip_eval()
+            elif req.task == "embedder":
+                return _run_embedder_eval()
+
             _eval_state.update(progress=0, msg="Loading images...")
 
             exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
@@ -342,7 +359,8 @@ async def run_evaluation_async(req: EvalAsyncRequest):
             _eval_state["total"] = total_work
             done = 0
 
-            # 이미지 캐시: 첫 번째 모델 평가 시 로드, 이후 모델에서 재사용
+            # 이미지 캐시: 첫 번째 모델 평가 시 로드, 이후 모델에서 재사용 (최대 500장)
+            _IMG_CACHE_LIMIT = 500
             _img_cache = {}
 
             for entry in req.models:
@@ -379,7 +397,7 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                         frame = _img_cache[fp]
                     else:
                         frame = _imread(fp)
-                        if frame is not None:
+                        if frame is not None and len(_img_cache) < _IMG_CACHE_LIMIT:
                             _img_cache[fp] = frame
                     if frame is None:
                         done += 1
@@ -435,6 +453,267 @@ async def run_evaluation_async(req: EvalAsyncRequest):
         except Exception as e:
             _eval_state.update(running=False, msg=f"Error: {e}")
 
+    def _run_classification_eval():
+        import glob
+        from core.model_loader import load_model as _load_model
+        from core.inference import run_classification, ClassificationResult
+        from core.evaluation import evaluate_classification
+        try:
+            exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+            img_files = []
+            for e in exts:
+                img_files.extend(glob.glob(os.path.join(req.img_dir, e)))
+            img_files.sort()
+            if not img_files:
+                _eval_state.update(running=False, msg="No images found"); return
+
+            # GT: label_dir에 stem.txt (한 줄에 class_id)
+            gt_data = {}
+            for fp in img_files:
+                stem = os.path.splitext(os.path.basename(fp))[0]
+                txt = os.path.join(req.label_dir, stem + ".txt")
+                if os.path.isfile(txt):
+                    with open(txt) as f:
+                        line = f.readline().strip()
+                        if line.isdigit():
+                            gt_data[stem] = int(line)
+
+            total_work = len(img_files) * len(req.models)
+            _eval_state["total"] = total_work
+            done = 0
+
+            for entry in req.models:
+                model_path = entry if isinstance(entry, str) else entry.get("path", "")
+                model_type = "yolo" if isinstance(entry, str) else entry.get("model_type", "yolo")
+                name = os.path.basename(model_path)
+                _eval_state["model_name"] = name
+                try:
+                    mi = _load_model(model_path, model_type=model_type)
+                except Exception as exc:
+                    _eval_state["results"].append({"name": name, "error": str(exc)})
+                    done += len(img_files); _eval_state["progress"] = done; continue
+
+                pred_data = {}
+                for fp in img_files:
+                    frame = _imread(fp)
+                    if frame is None: done += 1; continue
+                    stem = os.path.splitext(os.path.basename(fp))[0]
+                    cls_res = run_classification(mi, frame)
+                    if cls_res and cls_res.class_id is not None:
+                        pred_data[stem] = (cls_res.class_id, cls_res.confidence)
+                    done += 1; _eval_state.update(progress=done, msg=f"{name}: {done}/{total_work}")
+
+                metrics = evaluate_classification(gt_data, pred_data)
+                ov = metrics.get("__overall__", {})
+                detail = {str(k): v for k, v in metrics.items() if k != "__overall__"}
+                _eval_state["results"].append({
+                    "name": name, "task": "classification",
+                    "accuracy": round(ov.get("accuracy", 0) * 100, 4),
+                    "precision": round(ov.get("precision", 0) * 100, 4),
+                    "recall": round(ov.get("recall", 0) * 100, 4),
+                    "f1": round(ov.get("f1", 0) * 100, 4),
+                    "detail": detail,
+                })
+            _eval_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _eval_state.update(running=False, msg=f"Error: {e}")
+
+    def _run_segmentation_eval():
+        import glob
+        from core.model_loader import load_model as _load_model
+        from core.evaluation import evaluate_segmentation
+        try:
+            exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+            img_files = []
+            for e in exts:
+                img_files.extend(glob.glob(os.path.join(req.img_dir, e)))
+            img_files.sort()
+            if not img_files:
+                _eval_state.update(running=False, msg="No images found"); return
+
+            total_work = len(img_files) * len(req.models)
+            _eval_state["total"] = total_work
+            done = 0
+            nc = req.num_classes
+
+            for entry in req.models:
+                model_path = entry if isinstance(entry, str) else entry.get("path", "")
+                model_type = "yolo" if isinstance(entry, str) else entry.get("model_type", "yolo")
+                name = os.path.basename(model_path)
+                _eval_state["model_name"] = name
+                try:
+                    mi = _load_model(model_path, model_type=model_type)
+                except Exception as exc:
+                    _eval_state["results"].append({"name": name, "error": str(exc)})
+                    done += len(img_files); _eval_state["progress"] = done; continue
+
+                from core.inference import run_segmentation
+                agg_pred, agg_gt = [], []
+                for fp in img_files:
+                    frame = _imread(fp)
+                    if frame is None: done += 1; continue
+                    stem = os.path.splitext(os.path.basename(fp))[0]
+                    # GT mask
+                    gt_path = os.path.join(req.gt_mask_dir or req.label_dir, stem + ".png")
+                    if not os.path.isfile(gt_path):
+                        done += 1; continue
+                    gt_mask = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
+                    if gt_mask is None: done += 1; continue
+                    # Predict
+                    seg_res = run_segmentation(mi, frame)
+                    if seg_res and seg_res.mask is not None:
+                        pred_mask = seg_res.mask
+                        if pred_mask.shape != gt_mask.shape:
+                            pred_mask = cv2.resize(pred_mask.astype(np.uint8), (gt_mask.shape[1], gt_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+                        agg_pred.append(pred_mask)
+                        agg_gt.append(gt_mask)
+                    done += 1; _eval_state.update(progress=done, msg=f"{name}: {done}/{total_work}")
+
+                if agg_pred:
+                    all_pred = np.concatenate([m.flatten() for m in agg_pred])
+                    all_gt = np.concatenate([m.flatten() for m in agg_gt])
+                    metrics = evaluate_segmentation(all_pred, all_gt, nc)
+                    ov = metrics.get("__overall__", {})
+                    detail = {str(k): v for k, v in metrics.items() if k != "__overall__"}
+                    _eval_state["results"].append({
+                        "name": name, "task": "segmentation",
+                        "mIoU": round(ov.get("mIoU", 0) * 100, 4),
+                        "mDice": round(ov.get("mDice", 0) * 100, 4),
+                        "detail": detail,
+                    })
+                else:
+                    _eval_state["results"].append({"name": name, "task": "segmentation", "error": "No valid predictions"})
+            _eval_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _eval_state.update(running=False, msg=f"Error: {e}")
+
+    def _run_clip_eval():
+        import glob
+        from core.clip_inference import CLIPModel
+        try:
+            exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+            img_files = []
+            for e in exts:
+                img_files.extend(glob.glob(os.path.join(req.img_dir, e)))
+            img_files.sort()
+            if not img_files:
+                _eval_state.update(running=False, msg="No images found"); return
+            prompts = req.prompts or []
+            if not prompts:
+                _eval_state.update(running=False, msg="Error: no prompts provided"); return
+            gt_data = {}
+            for fp in img_files:
+                stem = os.path.splitext(os.path.basename(fp))[0]
+                txt = os.path.join(req.label_dir, stem + ".txt")
+                if os.path.isfile(txt):
+                    with open(txt) as f:
+                        line = f.readline().strip()
+                        if line.isdigit(): gt_data[stem] = int(line)
+            total_work = len(img_files) * len(req.models)
+            _eval_state.update(total=total_work)
+            done = 0
+            for entry in req.models:
+                model_path = entry if isinstance(entry, str) else entry.get("path", "")
+                name = os.path.basename(model_path)
+                _eval_state["model_name"] = name
+                try:
+                    clip = CLIPModel(model_path, req.text_encoder_path)
+                except Exception as exc:
+                    _eval_state["results"].append({"name": name, "error": str(exc)})
+                    done += len(img_files); _eval_state["progress"] = done; continue
+                top1 = 0; top5 = 0; total = 0
+                for fp in img_files:
+                    stem = os.path.splitext(os.path.basename(fp))[0]
+                    if stem not in gt_data: done += 1; continue
+                    frame = _imread(fp)
+                    if frame is None: done += 1; continue
+                    scores = clip.zero_shot_classify(frame, prompts)
+                    ranked = sorted(range(len(scores)), key=lambda i: -scores[i])
+                    gt_cls = gt_data[stem]
+                    if ranked[0] == gt_cls: top1 += 1
+                    if gt_cls in ranked[:5]: top5 += 1
+                    total += 1; done += 1
+                    _eval_state.update(progress=done, msg=f"{name}: {done}/{total_work}")
+                _eval_state["results"].append({
+                    "name": name, "task": "clip",
+                    "top1_acc": round(top1 / max(total, 1) * 100, 4),
+                    "top5_acc": round(top5 / max(total, 1) * 100, 4),
+                })
+            _eval_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _eval_state.update(running=False, msg=f"Error: {e}")
+
+    def _run_embedder_eval():
+        import glob
+        from core.model_loader import load_model as _load_model
+        from core.inference import run_embedding
+        try:
+            exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+            gallery_files, query_files = [], []
+            for e in exts:
+                gallery_files.extend(glob.glob(os.path.join(req.img_dir, e)))
+            gallery_files.sort()
+            q_dir = req.query_dir or req.img_dir
+            for e in exts:
+                query_files.extend(glob.glob(os.path.join(q_dir, e)))
+            query_files.sort()
+            if not gallery_files or not query_files:
+                _eval_state.update(running=False, msg="No images found"); return
+            def _labels(files):
+                out = {}
+                for fp in files:
+                    stem = os.path.splitext(os.path.basename(fp))[0]
+                    txt = os.path.join(req.label_dir, stem + ".txt")
+                    if os.path.isfile(txt):
+                        with open(txt) as f:
+                            line = f.readline().strip()
+                            if line.isdigit(): out[stem] = int(line)
+                return out
+            gt_g = _labels(gallery_files); gt_q = _labels(query_files)
+            total_work = (len(gallery_files) + len(query_files)) * len(req.models)
+            _eval_state.update(total=total_work); done = 0
+            for entry in req.models:
+                model_path = entry if isinstance(entry, str) else entry.get("path", "")
+                model_type = "yolo" if isinstance(entry, str) else entry.get("model_type", "yolo")
+                name = os.path.basename(model_path)
+                _eval_state["model_name"] = name
+                try:
+                    mi = _load_model(model_path, model_type=model_type)
+                except Exception as exc:
+                    _eval_state["results"].append({"name": name, "error": str(exc)})
+                    done += len(gallery_files) + len(query_files); _eval_state["progress"] = done; continue
+                g_embs, g_labels, q_embs, q_labels = [], [], [], []
+                for fp in gallery_files:
+                    stem = os.path.splitext(os.path.basename(fp))[0]
+                    frame = _imread(fp)
+                    if frame is not None:
+                        res = run_embedding(mi, frame)
+                        if res and res.embedding is not None:
+                            g_embs.append(res.embedding); g_labels.append(gt_g.get(stem, -1))
+                    done += 1; _eval_state.update(progress=done, msg=f"{name}: gallery")
+                for fp in query_files:
+                    stem = os.path.splitext(os.path.basename(fp))[0]
+                    frame = _imread(fp)
+                    if frame is not None:
+                        res = run_embedding(mi, frame)
+                        if res and res.embedding is not None:
+                            q_embs.append(res.embedding); q_labels.append(gt_q.get(stem, -1))
+                    done += 1; _eval_state.update(progress=done, msg=f"{name}: query")
+                if q_embs and g_embs:
+                    from core.evaluation import evaluate_embedder
+                    m = evaluate_embedder(q_embs, g_embs, q_labels, g_labels, req.top_k)
+                    _eval_state["results"].append({
+                        "name": name, "task": "embedder",
+                        "retrieval_at_1": round(m.get("retrieval_at_1", 0) * 100, 4),
+                        "retrieval_at_k": round(m.get("retrieval_at_k", 0) * 100, 4),
+                        "mean_cosine_sim": round(m.get("mean_cosine_sim", 0), 4),
+                    })
+                else:
+                    _eval_state["results"].append({"name": name, "task": "embedder", "error": "No valid embeddings"})
+            _eval_state.update(running=False, msg="Complete")
+        except Exception as e:
+            _eval_state.update(running=False, msg=f"Error: {e}")
+
     _executor.submit(_run)
     return {"ok": True}
 
@@ -478,7 +757,6 @@ def _load_model_sync(req: ModelLoadRequest):
             cmt = cfg.custom_model_types.get(custom_name)
             if cmt and cmt.class_names:
                 info.names = cmt.class_names
-        _loaded_model = info
         inp = info.session.get_inputs()[0]
         out = info.session.get_outputs()[0]
         meta = {
@@ -494,7 +772,9 @@ def _load_model_sync(req: ModelLoadRequest):
             "model_type": info.model_type or "",
             "batch_size": info.batch_size,
         }
-        _loaded_model_meta = meta
+        with _model_lock:
+            _loaded_model = info
+            _loaded_model_meta = meta
         return meta
     except Exception as e:
         return {"error": str(e)}
@@ -569,6 +849,7 @@ async def infer_shapes(req: ModelLoadRequest):
 # ── Shared model state ──────────────────────────────────
 _loaded_model = None      # ModelInfo object
 _loaded_model_meta = None  # dict for JSON response
+_model_lock = threading.Lock()  # _loaded_model 읽기/쓰기 보호
 
 
 # ── Auto-load default model on startup (#11) ────────────
@@ -587,10 +868,9 @@ async def _auto_load_default_model():
                 if model_type.startswith("custom:"):
                     model_type = "custom"
                 info = _load(p, model_type=model_type)
-                _loaded_model = info
                 inp = info.session.get_inputs()[0]
                 out = info.session.get_outputs()[0]
-                _loaded_model_meta = {
+                meta = {
                     "ok": True, "name": os.path.basename(p),
                     "input_shape": str(inp.shape), "output_shape": str(out.shape),
                     "input_size": list(info.input_size), "num_classes": len(info.names or {}),
@@ -598,6 +878,9 @@ async def _auto_load_default_model():
                     "layout": info.output_layout or "", "model_type": info.model_type or "",
                     "batch_size": info.batch_size,
                 }
+                with _model_lock:
+                    _loaded_model = info
+                    _loaded_model_meta = meta
                 print(f"[Startup] Default model loaded: {os.path.basename(p)}")
         except Exception as e:
             print(f"[Startup] Default model load failed: {e}")
@@ -633,22 +916,25 @@ def _infer_image_sync(req: InferRequest):
         if model_type.startswith("custom:"):
             custom_name = model_type.split(":", 1)[1]
             model_type = "custom"
-        if _loaded_model is None or _loaded_model.path != req.model_path or _loaded_model.model_type != model_type:
-            _loaded_model = _load(req.model_path, model_type=model_type)
-            if custom_name:
-                _loaded_model.custom_type_name = custom_name
-                cmt = cfg.custom_model_types.get(custom_name)
-                if cmt and cmt.class_names:
-                    _loaded_model.names = cmt.class_names
-            _loaded_model_meta = {"name": os.path.basename(req.model_path)}
+        with _model_lock:
+            if _loaded_model is None or _loaded_model.path != req.model_path or _loaded_model.model_type != model_type:
+                info = _load(req.model_path, model_type=model_type)
+                if custom_name:
+                    info.custom_type_name = custom_name
+                    cmt = cfg.custom_model_types.get(custom_name)
+                    if cmt and cmt.class_names:
+                        info.names = cmt.class_names
+                _loaded_model = info
+                _loaded_model_meta = {"name": os.path.basename(req.model_path)}
+            model = _loaded_model
 
         frame = _imread(req.image_path)
         if frame is None:
             return {"error": "Cannot read image"}
 
-        names = _loaded_model.names or {}
+        names = model.names or {}
 
-        if _loaded_model.task_type == "embedding":
+        if model.task_type == "embedding":
             # CLIP zero-shot classification or embedding visualization
             from core.clip_inference import CLIPModel, simple_tokenize
             import time as _time
@@ -681,9 +967,9 @@ def _infer_image_sync(req: InferRequest):
                     "infer_ms": round(infer_ms, 2), "classes": {},
                 }
 
-        if _loaded_model.task_type == "pose":
+        if model.task_type == "pose":
             from core.inference import run_pose
-            result = run_pose(_loaded_model, frame, cfg.conf_threshold)
+            result = run_pose(model, frame, cfg.conf_threshold)
             vis = frame.copy()
             _SKELETON = [(0,1),(0,2),(1,3),(2,4),(5,6),(5,7),(7,9),(6,8),(8,10),
                          (5,11),(6,12),(11,12),(11,13),(13,15),(12,14),(14,16)]
@@ -706,9 +992,9 @@ def _infer_image_sync(req: InferRequest):
                 "infer_ms": round(result.infer_ms, 2), "classes": {},
             }
 
-        if _loaded_model.task_type == "instance_segmentation":
+        if model.task_type == "instance_segmentation":
             from core.inference import run_instance_seg
-            result = run_instance_seg(_loaded_model, frame, cfg.conf_threshold)
+            result = run_instance_seg(model, frame, cfg.conf_threshold)
             vis = frame.copy()
             colors = _generate_palette(max(len(result.masks), 1))
             for i, mask in enumerate(result.masks):
@@ -729,7 +1015,7 @@ def _infer_image_sync(req: InferRequest):
                 "infer_ms": round(result.infer_ms, 2), "classes": {},
             }
 
-        if _loaded_model.task_type == "vlm":
+        if model.task_type == "vlm":
             vis = frame.copy()
             prompt = req.vlm_prompt or "Describe this image."
             cv2.putText(vis, f"VLM: {prompt[:60]}", (10, 30),
@@ -741,8 +1027,8 @@ def _infer_image_sync(req: InferRequest):
                 "infer_ms": 0, "classes": {},
             }
 
-        if _loaded_model.task_type == "classification":
-            result = run_classification(_loaded_model, frame)
+        if model.task_type == "classification":
+            result = run_classification(model, frame)
             top_k = result.top_k[:5]
             y = 30
             vis = frame.copy()
@@ -761,8 +1047,8 @@ def _infer_image_sync(req: InferRequest):
                 "classes": {},
             }
 
-        if _loaded_model.task_type == "segmentation":
-            result = run_segmentation(_loaded_model, frame)
+        if model.task_type == "segmentation":
+            result = run_segmentation(model, frame)
             vis = _overlay_segmentation(frame, result.mask)
             _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
             unique_cls = [int(c) for c in np.unique(result.mask) if c > 0]
@@ -775,7 +1061,7 @@ def _infer_image_sync(req: InferRequest):
             }
 
         # Detection
-        result = run_inference(_loaded_model, frame, cfg.conf_threshold)
+        result = run_inference(model, frame, cfg.conf_threshold)
         thickness = cfg.box_thickness
         label_size = cfg.label_size
         total_cls = len(names)
@@ -811,16 +1097,19 @@ def _infer_image_sync(req: InferRequest):
 # ── Video streaming (MJPEG) ─────────────────────────────
 _video_sessions = {}  # session_id -> dict with state
 _SESSION_TIMEOUT = 300  # 5분 무활동 시 세션 자동 정리
+_SESSION_TIMEOUT_PLAYING = 600  # playing 세션도 10분 무응답 시 정리
 
 
 def _cleanup_stale_sessions():
-    """타임아웃된 비디오 세션 정리"""
+    """타임아웃된 비디오 세션 정리 (playing 세션 포함)"""
     now = time.time()
     stale = [sid for sid, s in _video_sessions.items()
-             if not s.get("playing") and now - s.get("last_access", 0) > _SESSION_TIMEOUT]
+             if (not s.get("playing") and now - s.get("last_access", 0) > _SESSION_TIMEOUT)
+             or (s.get("playing") and now - s.get("last_access", 0) > _SESSION_TIMEOUT_PLAYING)]
     for sid in stale:
         sess = _video_sessions.pop(sid, None)
         if sess:
+            sess["playing"] = False
             try:
                 sess["cap"].release()
             except Exception:
@@ -851,16 +1140,19 @@ async def viewer_start(req: VideoStartRequest):
         if model_type.startswith("custom:"):
             custom_name = model_type.split(":", 1)[1]
             model_type = "custom"
-        if _loaded_model is None or _loaded_model.path != req.model_path or _loaded_model.model_type != model_type:
-            _loaded_model = _load(req.model_path, model_type=model_type)
-            if custom_name:
-                _loaded_model.custom_type_name = custom_name
-                cmt = cfg.custom_model_types.get(custom_name)
-                if cmt and cmt.class_names:
-                    _loaded_model.names = cmt.class_names
-            _loaded_model_meta = {"name": os.path.basename(req.model_path)}
+        with _model_lock:
+            if _loaded_model is None or _loaded_model.path != req.model_path or _loaded_model.model_type != model_type:
+                info = _load(req.model_path, model_type=model_type)
+                if custom_name:
+                    info.custom_type_name = custom_name
+                    cmt = cfg.custom_model_types.get(custom_name)
+                    if cmt and cmt.class_names:
+                        info.names = cmt.class_names
+                _loaded_model = info
+                _loaded_model_meta = {"name": os.path.basename(req.model_path)}
+            model = _loaded_model
 
-        if _loaded_model.task_type == "embedding":
+        if model.task_type == "embedding":
             return {"error": "CLIP/Embedder 모델은 뷰어에서 사용할 수 없습니다."}
 
         cap = cv2.VideoCapture(req.video_path)
@@ -874,7 +1166,7 @@ async def viewer_start(req: VideoStartRequest):
             from core.tracking import create_tracker
             tracker = create_tracker(req.tracker_type)
         _video_sessions[sid] = {
-            "cap": cap, "model": _loaded_model, "conf": req.conf,
+            "cap": cap, "model": model, "conf": req.conf,
             "playing": True, "paused": False,
             "fps": fps, "speed": 1.0,
             "total": int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
@@ -1029,7 +1321,7 @@ async def viewer_stream(session_id: str):
                     _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
                 # 스트리밍 다운스케일 (노트북 최적화)
                 if max_h > 0 and buf is not None:
-                    out_frame = vis if model.task_type == "classification" else frame
+                    out_frame = vis if model.task_type in ("classification", "segmentation") else frame
                     oh, ow = out_frame.shape[:2]
                     if oh > max_h:
                         scale = max_h / oh
@@ -1194,23 +1486,26 @@ async def infer_save_crops(req: InferRequest):
         if model_type.startswith("custom:"):
             custom_name = model_type.split(":", 1)[1]
             model_type = "custom"
-        if _loaded_model is None or _loaded_model.path != req.model_path or _loaded_model.model_type != model_type:
-            _loaded_model = _load(req.model_path, model_type=model_type)
-            if custom_name:
-                _loaded_model.custom_type_name = custom_name
-                cmt = cfg.custom_model_types.get(custom_name)
-                if cmt and cmt.class_names:
-                    _loaded_model.names = cmt.class_names
-            _loaded_model_meta = {"name": os.path.basename(req.model_path)}
+        with _model_lock:
+            if _loaded_model is None or _loaded_model.path != req.model_path or _loaded_model.model_type != model_type:
+                info = _load(req.model_path, model_type=model_type)
+                if custom_name:
+                    info.custom_type_name = custom_name
+                    cmt = cfg.custom_model_types.get(custom_name)
+                    if cmt and cmt.class_names:
+                        info.names = cmt.class_names
+                _loaded_model = info
+                _loaded_model_meta = {"name": os.path.basename(req.model_path)}
+            model = _loaded_model
         frame = _imread(req.image_path)
         if frame is None:
             return {"error": "Cannot read image"}
-        if _loaded_model.task_type != "detection":
+        if model.task_type != "detection":
             return {"error": "Crop save is only for detection models"}
-        result = run_inference(_loaded_model, frame, cfg.conf_threshold)
+        result = run_inference(model, frame, cfg.conf_threshold)
         if len(result.boxes) == 0:
             return {"error": "No detections"}
-        names = _loaded_model.names or {}
+        names = model.names or {}
         from datetime import datetime
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = os.path.join("snapshots", f"crops_{ts}")
@@ -1514,7 +1809,7 @@ async def run_benchmark(req: BenchmarkRequest):
                 if buf and isinstance(buf, str) and os.path.isfile(buf):
                     try: os.remove(buf)
                     except: pass
-            if _bench_state["msg"] != "Error":
+            if not _bench_state["msg"].startswith("Error"):
                 _bench_state["msg"] = "Complete"
 
     _executor.submit(_run)
@@ -3852,6 +4147,69 @@ async def batch_augmentation(req: dict):
         return {"original": original, "augmented": augmented, "file": os.path.basename(fp)}
     except Exception as e:
         return {"error": str(e)}
+
+
+# ── Calibration / Quantization API ─────────────────────
+class QuantizeRequest(BaseModel):
+    model_path: str
+    method: str = "dynamic"          # dynamic | static | fp16
+    output_path: str = ""
+    calibration_dir: str = ""
+    max_images: int = 100
+    weight_type: str = "uint8"       # uint8 | int8
+    activation_type: str = "uint8"
+    quant_format: str = "QDQ"        # QDQ | QOperator
+    per_channel: bool = True
+
+_quant_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": {}}
+_all_states["quantize"] = _quant_state
+
+@app.post("/api/quantize")
+async def run_quantize(req: QuantizeRequest):
+    if _quant_state["running"]:
+        return {"error": "Quantization already running"}
+    if not req.model_path or not os.path.isfile(req.model_path):
+        return {"error": "Model file not found"}
+
+    out = req.output_path
+    if not out:
+        base, ext = os.path.splitext(req.model_path)
+        out = f"{base}_{req.method}{ext}"
+
+    _quant_state.update(running=True, progress=0, total=0, msg="Starting...", results={})
+
+    def _run():
+        try:
+            from core.quantizer import quantize_dynamic, quantize_static, convert_fp16
+            if req.method == "dynamic":
+                _quant_state["msg"] = "Dynamic quantization..."
+                result = quantize_dynamic(req.model_path, out, req.weight_type)
+            elif req.method == "static":
+                if not req.calibration_dir or not os.path.isdir(req.calibration_dir):
+                    _quant_state.update(running=False, msg="Error: calibration directory not found")
+                    return
+                def _prog(cur, tot):
+                    _quant_state.update(progress=cur, total=tot, msg=f"Calibrating {cur}/{tot}...")
+                result = quantize_static(
+                    req.model_path, out, req.calibration_dir, req.max_images,
+                    req.per_channel, req.weight_type, req.activation_type,
+                    req.quant_format, on_progress=_prog)
+            elif req.method == "fp16":
+                _quant_state["msg"] = "FP16 conversion..."
+                result = convert_fp16(req.model_path, out)
+            else:
+                _quant_state.update(running=False, msg=f"Error: unknown method {req.method}")
+                return
+            _quant_state.update(running=False, msg="Complete", results=result)
+        except Exception as e:
+            _quant_state.update(running=False, msg=f"Error: {e}")
+
+    _executor.submit(_run)
+    return {"ok": True, "output_path": out}
+
+@app.get("/api/quantize/status")
+async def quantize_status():
+    return dict(_quant_state)
 
 
 # ── Phase 1: Model Inspector API ───────────────────────

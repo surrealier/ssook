@@ -1,4 +1,5 @@
 """YOLO 추론 파이프라인: letterbox → preprocess → run → postprocess"""
+import threading
 import time
 from dataclasses import dataclass
 
@@ -66,8 +67,16 @@ class PreprocessBuffer:
         return self._padded, self._rgb, self._tensor
 
 
-# 모듈 레벨 싱글톤 버퍼 (단일 스레드 추론용)
-_preproc_buf = PreprocessBuffer()
+# 스레드별 독립 버퍼 (ThreadPoolExecutor 동시 추론 안전)
+_thread_local = threading.local()
+
+
+def _get_preproc_buf() -> PreprocessBuffer:
+    buf = getattr(_thread_local, 'preproc_buf', None)
+    if buf is None:
+        buf = PreprocessBuffer()
+        _thread_local.preproc_buf = buf
+    return buf
 
 
 def letterbox(img: np.ndarray, new_shape: tuple) -> tuple:
@@ -93,8 +102,9 @@ def preprocess(frame: np.ndarray, input_size: tuple) -> np.ndarray:
 
 
 def _padded_to_tensor(padded: np.ndarray, input_size: tuple) -> np.ndarray:
-    """letterbox 결과 → NCHW float32 [0,1] (버퍼 재사용, 내부용)"""
-    _, rgb_buf, tensor_buf = _preproc_buf.get_buffers(input_size)
+    """letterbox 결과 → NCHW float32 [0,1] (스레드별 버퍼 재사용)"""
+    buf = _get_preproc_buf()
+    _, rgb_buf, tensor_buf = buf.get_buffers(input_size)
     cv2.cvtColor(padded, cv2.COLOR_BGR2RGB, dst=rgb_buf)
     np.divide(rgb_buf.transpose(2, 0, 1), 255.0, out=tensor_buf[0])
     return tensor_buf

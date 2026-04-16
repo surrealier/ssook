@@ -5,9 +5,9 @@ const App = {
   /* Sidebar definition: [section_i18n_key, [[tab_id, icon_fn, nav_i18n_key], ...]] */
   _nav: [
     ['sec.inference',  [['viewer','viewer'],['settings','settings']]],
-    ['sec.evaluation', [['evaluation','evaluation'],['benchmark','benchmark'],['segmentation','segmentation'],['clip','clip'],['embedder','embedder']]],
+    ['sec.evaluation', [['evaluation','evaluation'],['benchmark','benchmark']]],
     ['sec.analysis',   [['analysis','analysis'],['model-compare','compare'],['error-analyzer','errorAnalyzer'],['conf-optimizer','confOptimizer'],['embedding-viewer','embeddingViewer']]],
-    ['sec.tools',      [['inspector','inspector'],['profiler','profiler']]],
+    ['sec.tools',      [['calibration','calibration'],['inspector','inspector'],['profiler','profiler']]],
     ['sec.data',       [['explorer','explorer'],['splitter','splitter'],['converter','converter'],['remapper','remapper'],['merger','merger'],['sampler','sampler'],['augmentation','augmentation']]],
     ['sec.quality',    [['anomaly','anomaly'],['quality','quality'],['duplicate','duplicate'],['leaky','leaky'],['similarity','similarity']]],
   ],

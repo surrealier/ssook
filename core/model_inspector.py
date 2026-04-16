@@ -30,6 +30,7 @@ class ModelInspection:
     available_eps: list[str]
     compatible_eps: list[str]  # EPs that can actually run this model
     num_parameters: Optional[int]
+    ep_compatibility: dict = None  # {ep: {supported_ops, fallback_ops, supported_ratio}}
 
 
 def _count_parameters(path: str) -> Optional[int]:
@@ -110,13 +111,35 @@ def inspect_model(path: str) -> ModelInspection:
     # Parameters
     num_params = _count_parameters(path)
 
-    # EP compatibility
+    # EP compatibility — which EPs can load + op-level fallback analysis
     available_eps = ort.get_available_providers()
     compatible_eps = []
+    ep_compat = {}
+    all_ops = set(op_counts.keys())
+    total_ops = num_nodes
+
     for ep in available_eps:
         try:
             test_sess = ort.InferenceSession(path, providers=[ep])
             compatible_eps.append(ep)
+            # Check which ops ran on this EP vs CPU fallback
+            try:
+                # ORT doesn't expose per-node EP assignment directly,
+                # so we use known EP op support lists as heuristic
+                ep_supported = _get_ep_supported_ops(ep)
+                if ep_supported is not None:
+                    supported = all_ops & ep_supported
+                    fallback = all_ops - ep_supported
+                    supported_count = sum(op_counts.get(op, 0) for op in supported)
+                    ep_compat[ep] = {
+                        "supported_ops": sorted(supported),
+                        "fallback_ops": sorted(fallback),
+                        "supported_ratio": round(supported_count / max(total_ops, 1), 3),
+                    }
+                else:
+                    ep_compat[ep] = {"supported_ops": [], "fallback_ops": [], "supported_ratio": 1.0}
+            except Exception:
+                ep_compat[ep] = {"supported_ops": [], "fallback_ops": [], "supported_ratio": 1.0}
             del test_sess
         except Exception:
             pass
@@ -137,7 +160,49 @@ def inspect_model(path: str) -> ModelInspection:
         available_eps=available_eps,
         compatible_eps=compatible_eps,
         num_parameters=num_params,
+        ep_compatibility=ep_compat,
     )
+
+
+# Known EP op support (heuristic — not exhaustive)
+_EP_OPS = {
+    "CUDAExecutionProvider": {
+        "Conv", "ConvTranspose", "MatMul", "Gemm", "Relu", "Sigmoid", "Tanh",
+        "Add", "Sub", "Mul", "Div", "Pow", "Sqrt", "Exp", "Log",
+        "BatchNormalization", "InstanceNormalization", "LayerNormalization",
+        "MaxPool", "AveragePool", "GlobalAveragePool", "GlobalMaxPool",
+        "Softmax", "LogSoftmax", "Concat", "Reshape", "Transpose", "Flatten",
+        "Squeeze", "Unsqueeze", "Gather", "Slice", "Split", "Pad", "Resize",
+        "Upsample", "ReduceMean", "ReduceSum", "ReduceMax", "ReduceMin",
+        "Clip", "Cast", "Where", "Tile", "Expand", "Shape", "NonZero",
+        "TopK", "ScatterND", "GatherND", "Attention", "SkipLayerNormalization",
+    },
+    "TensorrtExecutionProvider": {
+        "Conv", "ConvTranspose", "MatMul", "Gemm", "Relu", "Sigmoid", "Tanh",
+        "Add", "Sub", "Mul", "Div", "BatchNormalization", "MaxPool", "AveragePool",
+        "GlobalAveragePool", "Softmax", "Concat", "Reshape", "Transpose", "Flatten",
+        "Squeeze", "Unsqueeze", "Gather", "Slice", "Pad", "Resize", "Clip", "Cast",
+        "ReduceMean", "ReduceSum", "TopK",
+    },
+    "OpenVINOExecutionProvider": {
+        "Conv", "ConvTranspose", "MatMul", "Gemm", "Relu", "Sigmoid", "Tanh",
+        "Add", "Sub", "Mul", "Div", "BatchNormalization", "MaxPool", "AveragePool",
+        "GlobalAveragePool", "Softmax", "Concat", "Reshape", "Transpose", "Flatten",
+        "Squeeze", "Unsqueeze", "Gather", "Slice", "Pad", "Resize", "Clip", "Cast",
+        "ReduceMean", "Interpolate", "Split",
+    },
+    "DmlExecutionProvider": {
+        "Conv", "ConvTranspose", "MatMul", "Gemm", "Relu", "Sigmoid", "Tanh",
+        "Add", "Sub", "Mul", "Div", "BatchNormalization", "MaxPool", "AveragePool",
+        "GlobalAveragePool", "Softmax", "Concat", "Reshape", "Transpose", "Flatten",
+        "Squeeze", "Unsqueeze", "Gather", "Slice", "Pad", "Resize", "Clip", "Cast",
+    },
+}
+
+
+def _get_ep_supported_ops(ep_name: str):
+    """Return set of supported ops for an EP, or None if unknown."""
+    return _EP_OPS.get(ep_name)
 
 
 def inspection_to_dict(info: ModelInspection) -> dict:
@@ -158,4 +223,5 @@ def inspection_to_dict(info: ModelInspection) -> dict:
         "available_eps": info.available_eps,
         "compatible_eps": info.compatible_eps,
         "num_parameters": info.num_parameters,
+        "ep_compatibility": info.ep_compatibility or {},
     }

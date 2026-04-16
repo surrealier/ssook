@@ -39,8 +39,8 @@ Tabs.viewer = {
           </div>
           <div class="card-flat" style="padding:0.75rem;">
             <div class="text-label" style="margin-bottom:0.5rem;">${t('settings.model')}</div>
+            <input type="text" class="form-input input-normal" style="width:100%;box-sizing:border-box;font-size:11px;height:28px;margin-bottom:0.35rem;" id="v-model-path" placeholder="Model path" value="${G.model}" onchange="Tabs.viewer.selectModel(this.value)">
             <div style="display:flex;gap:0.25rem;margin-bottom:0.5rem;">
-              <input type="text" class="form-input input-normal" style="flex:1;font-size:11px;height:28px;min-width:0;" id="v-model-path" placeholder="Model path" value="${G.model}" onchange="Tabs.viewer.selectModel(this.value)">
               <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseModel()">${t('browse')}</button>
               <button class="btn btn-ghost btn-sm" onclick="showHFBrowser('v-model-path')" title="HuggingFace Hub">🤗</button>
               <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshModels()" title="Refresh">↻</button>
@@ -49,8 +49,8 @@ Tabs.viewer = {
           </div>
           <div class="card-flat" style="padding:0.75rem;flex:1;display:flex;flex-direction:column;">
             <div class="text-label" style="margin-bottom:0.5rem;">${t('viewer.video_image')}</div>
+            <input type="text" class="form-input input-normal" style="width:100%;box-sizing:border-box;font-size:11px;height:28px;margin-bottom:0.35rem;" id="v-video-path" placeholder="Video/Image path" value="${G.videoPath||''}" onchange="Tabs.viewer.selectVideo(this.value)">
             <div style="display:flex;gap:0.25rem;margin-bottom:0.5rem;">
-              <input type="text" class="form-input input-normal" style="flex:1;font-size:11px;height:28px;min-width:0;" id="v-video-path" placeholder="Video/Image path" value="${G.videoPath||''}" onchange="Tabs.viewer.selectVideo(this.value)">
               <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseVideo()">${t('browse')}</button>
               <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseImageFolder()" title="Open image folder">📁</button>
               <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshVideos()" title="Refresh">↻</button>
@@ -1116,6 +1116,16 @@ Tabs.evaluation = {
       <div style="display:flex;flex-direction:column;gap:1.5rem;">
         <div class="card" style="padding:1.5rem;">
           <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('eval.setup')}</h3>
+          <div class="form-group" style="margin-bottom:0.75rem;">
+            <label class="form-label">${t('eval.task')}</label>
+            <select class="form-input input-normal" id="eval-task" onchange="Tabs.evaluation._onTaskChange()" style="width:auto;">
+              <option value="detection">Detection (mAP/P/R/F1)</option>
+              <option value="classification">Classification (Accuracy/P/R/F1)</option>
+              <option value="segmentation">Segmentation (mIoU/mDice)</option>
+              <option value="clip">CLIP Zero-Shot (Top-1/Top-5 Acc)</option>
+              <option value="embedder">Embedder (Retrieval@K, Cosine Sim)</option>
+            </select>
+          </div>
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem;">
             <h3 class="text-heading-h3">${t('bench.models')}</h3>
             <button class="btn btn-secondary btn-sm" onclick="Tabs.evaluation._addModel()">${t('add_model')}</button>
@@ -1123,17 +1133,41 @@ Tabs.evaluation = {
           <div id="eval-model-slots" style="display:flex;flex-direction:column;gap:0.5rem;">
             <div class="text-secondary" style="padding:1rem;text-align:center;" id="eval-slots-hint">${t('bench.add_hint')}</div>
           </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:0.75rem;">
-            <div class="form-group">
-              <label class="form-label">${t('common.confidence')}</label>
-              <input type="number" class="form-input input-normal" value="0.25" min="0.01" max="1.0" step="0.05" id="eval-conf" style="width:100px;">
+          <div id="eval-det-opts">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:0.75rem;">
+              <div class="form-group">
+                <label class="form-label">${t('common.confidence')}</label>
+                <input type="number" class="form-input input-normal" value="0.25" min="0.01" max="1.0" step="0.05" id="eval-conf" style="width:100px;">
+              </div>
             </div>
           </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:0.75rem;">
             ${imgDirInput('eval-img')}
             ${lblDirInput('eval-lbl')}
           </div>
-          <div class="form-group" style="margin-top:0.75rem;">
+          <div id="eval-seg-opts" style="display:none;margin-top:0.75rem;">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+              <div class="form-group"><label class="form-label">${t('eval.gt_mask_dir')}</label>
+                <div style="display:flex;gap:0.5rem;"><input type="text" class="form-input input-normal" style="flex:1;" id="eval-mask-dir"><button class="btn btn-secondary btn-sm" onclick="pickDir('eval-mask-dir')">${t('browse')}</button></div></div>
+              <div class="form-group"><label class="form-label">${t('eval.num_classes')}</label>
+                <input type="number" class="form-input input-normal" id="eval-nclass" value="21" min="2" max="256" style="width:100px;"></div>
+            </div>
+          </div>
+          <div id="eval-clip-opts" style="display:none;margin-top:0.75rem;">
+            <div class="form-group"><label class="form-label">${t('eval.text_encoder')}</label>
+              <div style="display:flex;gap:0.5rem;"><input type="text" class="form-input input-normal" style="flex:1;" id="eval-text-enc" placeholder="CLIP text encoder .onnx"><button class="btn btn-secondary btn-sm" onclick="pickModel('eval-text-enc')">${t('browse')}</button></div></div>
+            <div class="form-group" style="margin-top:0.5rem;"><label class="form-label">${t('eval.prompts')}</label>
+              <textarea class="form-input" id="eval-prompts" rows="3" style="font-size:12px;" placeholder="a photo of a cat&#10;a photo of a dog&#10;a photo of a bird"></textarea></div>
+          </div>
+          <div id="eval-embed-opts" style="display:none;margin-top:0.75rem;">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+              <div class="form-group"><label class="form-label">${t('eval.query_dir')}</label>
+                <div style="display:flex;gap:0.5rem;"><input type="text" class="form-input input-normal" style="flex:1;" id="eval-query-dir"><button class="btn btn-secondary btn-sm" onclick="pickDir('eval-query-dir')">${t('browse')}</button></div></div>
+              <div class="form-group"><label class="form-label">${t('eval.top_k')}</label>
+                <input type="number" class="form-input input-normal" id="eval-topk" value="5" min="1" max="100" style="width:80px;"></div>
+            </div>
+          </div>
+          <div class="form-group" style="margin-top:0.75rem;" id="eval-classmap-group">
             <label class="form-label">${t('eval.gt_classmap')}</label>
             <textarea class="form-input" id="eval-classmap" rows="4" style="font-size:12px;font-family:monospace;" placeholder="0: person&#10;1: car&#10;2: bicycle"></textarea>
           </div>
@@ -1150,11 +1184,32 @@ Tabs.evaluation = {
         </div>
         <div class="card" style="padding:1.5rem;">
           <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('eval.results')}</h3>
-          <div class="table-container"><table><thead><tr><th>Model</th><th>mAP@50</th><th>mAP@50:95</th><th>Precision</th><th>Recall</th><th>F1</th><th></th></tr></thead>
+          <div class="table-container" id="eval-table-wrap"><table><thead><tr id="eval-thead"><th>Model</th><th>mAP@50</th><th>mAP@50:95</th><th>Precision</th><th>Recall</th><th>F1</th><th></th></tr></thead>
           <tbody id="eval-results"><tr><td colspan="7" class="text-secondary" style="text-align:center;padding:2rem;">${t('eval.run_hint')}</td></tr></tbody></table></div>
         </div>
         <div id="eval-detail-container"></div>
       </div>`;
+  },
+  _onTaskChange() {
+    const task = document.getElementById('eval-task')?.value || 'detection';
+    const detOpts = document.getElementById('eval-det-opts');
+    const segOpts = document.getElementById('eval-seg-opts');
+    const clipOpts = document.getElementById('eval-clip-opts');
+    const embedOpts = document.getElementById('eval-embed-opts');
+    const cmGroup = document.getElementById('eval-classmap-group');
+    if (detOpts) detOpts.style.display = task === 'detection' ? '' : 'none';
+    if (segOpts) segOpts.style.display = task === 'segmentation' ? '' : 'none';
+    if (clipOpts) clipOpts.style.display = task === 'clip' ? '' : 'none';
+    if (embedOpts) embedOpts.style.display = task === 'embedder' ? '' : 'none';
+    if (cmGroup) cmGroup.style.display = (task === 'segmentation' || task === 'clip' || task === 'embedder') ? 'none' : '';
+    const thead = document.getElementById('eval-thead');
+    if (thead) {
+      if (task === 'detection') thead.innerHTML = '<th>Model</th><th>mAP@50</th><th>mAP@50:95</th><th>Precision</th><th>Recall</th><th>F1</th><th></th>';
+      else if (task === 'classification') thead.innerHTML = '<th>Model</th><th>Accuracy</th><th>Precision</th><th>Recall</th><th>F1</th><th></th>';
+      else if (task === 'segmentation') thead.innerHTML = '<th>Model</th><th>mIoU</th><th>mDice</th><th></th>';
+      else if (task === 'clip') thead.innerHTML = '<th>Model</th><th>Top-1 Acc</th><th>Top-5 Acc</th><th></th>';
+      else if (task === 'embedder') thead.innerHTML = '<th>Model</th><th>R@1</th><th>R@K</th><th>Cosine Sim</th><th></th>';
+    }
   },
   async init() {
     // 캐시된 결과가 있으면 복원
@@ -1239,6 +1294,13 @@ Tabs.evaluation = {
         models, img_dir: imgDir, label_dir: lblDir, conf,
         per_model_mappings: result.mappings,
         mapped_only: result.mapped_only,
+        task: document.getElementById('eval-task')?.value || 'detection',
+        num_classes: parseInt(document.getElementById('eval-nclass')?.value || '21'),
+        gt_mask_dir: document.getElementById('eval-mask-dir')?.value || '',
+        text_encoder_path: document.getElementById('eval-text-enc')?.value || '',
+        prompts: (document.getElementById('eval-prompts')?.value || '').split('\n').filter(x=>x.trim()),
+        query_dir: document.getElementById('eval-query-dir')?.value || '',
+        top_k: parseInt(document.getElementById('eval-topk')?.value || '5'),
       });
       if (r.error) { App.setStatus('Error: ' + r.error); document.getElementById('eval-run-btn').disabled = false; return; }
       this._polling = true;
@@ -1503,9 +1565,20 @@ Tabs.evaluation = {
   _renderResults(results) {
     const tb = document.getElementById('eval-results');
     if (!tb) return;
+    const task = document.getElementById('eval-task')?.value || 'detection';
     tb.innerHTML = results.map((x, i) => {
       if (x.error) return '<tr><td>' + (x.name||'') + '</td><td colspan="6" style="color:var(--action-danger-05);">' + x.error + '</td></tr>';
       const detBtn = x.detail ? '<button class="btn btn-ghost btn-sm" onclick="Tabs.evaluation.showDetail('+i+')">' + t('detail') + '</button>' : '';
+      const rTask = x.task || task;
+      if (rTask === 'classification') {
+        return '<tr><td>'+(x.name||'')+'</td><td>'+(x.accuracy?.toFixed(4)||0)+'%</td><td>'+(x.precision?.toFixed(4)||0)+'%</td><td>'+(x.recall?.toFixed(4)||0)+'%</td><td>'+(x.f1?.toFixed(4)||0)+'%</td><td>'+detBtn+'</td></tr>';
+      } else if (rTask === 'segmentation') {
+        return '<tr><td>'+(x.name||'')+'</td><td>'+(x.mIoU?.toFixed(4)||0)+'%</td><td>'+(x.mDice?.toFixed(4)||0)+'%</td><td>'+detBtn+'</td></tr>';
+      } else if (rTask === 'clip') {
+        return '<tr><td>'+(x.name||'')+'</td><td>'+(x.top1_acc?.toFixed(4)||0)+'%</td><td>'+(x.top5_acc?.toFixed(4)||0)+'%</td><td>'+detBtn+'</td></tr>';
+      } else if (rTask === 'embedder') {
+        return '<tr><td>'+(x.name||'')+'</td><td>'+(x.retrieval_at_1?.toFixed(4)||0)+'%</td><td>'+(x.retrieval_at_k?.toFixed(4)||0)+'%</td><td>'+(x.mean_cosine_sim?.toFixed(4)||0)+'</td><td>'+detBtn+'</td></tr>';
+      }
       return '<tr><td>'+(x.name||'')+'</td><td>'+(x.map50?.toFixed(4)||0)+'%</td><td>'+(x.map5095?.toFixed(4)||0)+'%</td><td>'+(x.precision?.toFixed(4)||0)+'%</td><td>'+(x.recall?.toFixed(4)||0)+'%</td><td>'+(x.f1?.toFixed(4)||0)+'%</td><td>'+detBtn+'</td></tr>';
     }).join('');
   },
@@ -1519,11 +1592,20 @@ Tabs.evaluation = {
     if (!r || !r.detail) { App.setStatus(t('eval.no_detail')); return; }
     const c = document.getElementById('eval-detail-container');
     const keys = Object.keys(r.detail).filter(k => k !== '__overall__').sort((a,b) => +a - +b);
-    let rows = keys.map(cid => {
-      const v = r.detail[cid];
-      return '<tr><td>'+cid+'</td><td>'+(v.ap*100).toFixed(4)+'%</td><td>'+(v.precision*100).toFixed(4)+'%</td><td>'+(v.recall*100).toFixed(4)+'%</td><td>'+(v.f1*100).toFixed(4)+'%</td><td>'+v.tp+'</td><td>'+v.fp+'</td><td>'+v.fn+'</td></tr>';
-    }).join('');
-    c.innerHTML = '<div class="card" style="padding:1.5rem;"><h3 class="text-heading-h3" style="margin-bottom:1rem;">' + t('eval.per_class', {name: r.name}) + '</h3><div class="table-container"><table><thead><tr><th>Class</th><th>AP@50</th><th>Precision</th><th>Recall</th><th>F1</th><th>TP</th><th>FP</th><th>FN</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+    const rTask = r.task || document.getElementById('eval-task')?.value || 'detection';
+    let header, rowFn;
+    if (rTask === 'classification') {
+      header = '<th>Class</th><th>Precision</th><th>Recall</th><th>F1</th><th>TP</th><th>FP</th><th>FN</th>';
+      rowFn = (cid, v) => `<tr><td>${cid}</td><td>${(v.precision*100).toFixed(4)}%</td><td>${(v.recall*100).toFixed(4)}%</td><td>${(v.f1*100).toFixed(4)}%</td><td>${v.tp||0}</td><td>${v.fp||0}</td><td>${v.fn||0}</td></tr>`;
+    } else if (rTask === 'segmentation') {
+      header = '<th>Class</th><th>IoU</th><th>Dice</th><th>Pred px</th><th>GT px</th>';
+      rowFn = (cid, v) => `<tr><td>${cid}</td><td>${(v.iou*100).toFixed(4)}%</td><td>${(v.dice*100).toFixed(4)}%</td><td>${v.pred_px||0}</td><td>${v.gt_px||0}</td></tr>`;
+    } else {
+      header = '<th>Class</th><th>AP@50</th><th>Precision</th><th>Recall</th><th>F1</th><th>TP</th><th>FP</th><th>FN</th>';
+      rowFn = (cid, v) => `<tr><td>${cid}</td><td>${(v.ap*100).toFixed(4)}%</td><td>${(v.precision*100).toFixed(4)}%</td><td>${(v.recall*100).toFixed(4)}%</td><td>${(v.f1*100).toFixed(4)}%</td><td>${v.tp||0}</td><td>${v.fp||0}</td><td>${v.fn||0}</td></tr>`;
+    }
+    const rows = keys.map(cid => rowFn(cid, r.detail[cid])).join('');
+    c.innerHTML = `<div class="card" style="padding:1.5rem;"><h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('eval.per_class', {name: r.name})}</h3><div class="table-container"><table><thead><tr>${header}</tr></thead><tbody>${rows}</tbody></table></div></div>`;
   },
   exportCSV() { window.open('/api/evaluation/export-csv', '_blank'); },
 };
