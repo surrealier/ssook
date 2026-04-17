@@ -80,7 +80,7 @@ _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ssook-bg")
 
 # ── Client heartbeat & auto-shutdown ────────────────────
 _last_heartbeat = time.time()
-_HEARTBEAT_TIMEOUT = 30  # seconds without heartbeat before shutdown
+_HEARTBEAT_TIMEOUT = 120  # seconds without heartbeat before shutdown
 
 
 @app.post("/api/heartbeat")
@@ -1587,29 +1587,42 @@ def _check_gpu_available():
             _gpu_available = False
     return _gpu_available
 
+_gpu_cache = None
+_gpu_cache_time = 0
+_GPU_CACHE_TTL = 5  # seconds
+
+
 @app.get("/api/system/hw")
 async def system_hw():
+    global _gpu_cache, _gpu_cache_time
     import psutil
     proc = psutil.Process(os.getpid())
     info = {
         "cpu": round(proc.cpu_percent(interval=0), 1),
         "ram_mb": round(proc.memory_info().rss / 1024 / 1024),
     }
+    now = time.time()
     if _check_gpu_available():
-        try:
-            import subprocess, sys as _sys
-            flags = 0x08000000 if _sys.platform == "win32" else 0
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
-                 "--format=csv,noheader,nounits"],
-                text=True, timeout=2, creationflags=flags,
-            )
-            parts = [p.strip() for p in out.strip().split(",")]
-            info.update(gpu_name=parts[0], gpu_util=int(parts[1]),
-                        gpu_mem_used=int(parts[2]), gpu_mem_total=int(parts[3]),
-                        gpu_temp=int(parts[4]))
-        except Exception:
-            info.update(gpu_name="N/A", gpu_util=0, gpu_mem_used=0, gpu_mem_total=0, gpu_temp=0)
+        if _gpu_cache is not None and now - _gpu_cache_time < _GPU_CACHE_TTL:
+            info.update(_gpu_cache)
+        else:
+            try:
+                import subprocess, sys as _sys
+                flags = 0x08000000 if _sys.platform == "win32" else 0
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+                     "--format=csv,noheader,nounits"],
+                    text=True, timeout=2, creationflags=flags,
+                )
+                parts = [p.strip() for p in out.strip().split(",")]
+                gpu_data = dict(gpu_name=parts[0], gpu_util=int(parts[1]),
+                                gpu_mem_used=int(parts[2]), gpu_mem_total=int(parts[3]),
+                                gpu_temp=int(parts[4]))
+                _gpu_cache = gpu_data
+                _gpu_cache_time = now
+                info.update(gpu_data)
+            except Exception:
+                info.update(gpu_name="N/A", gpu_util=0, gpu_mem_used=0, gpu_mem_total=0, gpu_temp=0)
     else:
         info.update(gpu_name="N/A", gpu_util=0, gpu_mem_used=0, gpu_mem_total=0, gpu_temp=0)
     # 메모리 자동 정리: RSS가 시스템 RAM의 50% 초과 시 캐시 정리

@@ -1,31 +1,31 @@
 # Web UI dependencies (for run_web.py)
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
+fastapi>=0.110.0,<1.0
+uvicorn[standard]>=0.29.0,<1.0
 
 # Core
-opencv-python>=4.10.0
-numpy>=1.26.0
-onnxruntime>=1.17.0
-psutil>=5.9.0
+opencv-python>=4.10.0,<5.0
+numpy>=1.26.0,<3.0
+onnxruntime>=1.17.0,<2.0
+psutil>=5.9.0,<7.0
 
 # Optional: ONNX model graph analysis, quantization, FP16 conversion
-# onnx>=1.15.0
-PyYAML>=6.0.0
+# onnx>=1.15.0,<2.0
+PyYAML>=6.0.0,<7.0
 
 # Optional: native desktop window
-# pywebview>=4.0
+# pywebview>=4.0,<6.0
 
 # Optional: charts, embedding visualization, Excel export
-# matplotlib>=3.8.0
-# scikit-learn>=1.4.0
-# openpyxl>=3.1.0
-# umap-learn>=0.5.0
+# matplotlib>=3.8.0,<4.0
+# scikit-learn>=1.4.0,<2.0
+# openpyxl>=3.1.0,<4.0
+# umap-learn>=0.5.0,<1.0
 
 # Optional: CUDA acceleration (replace onnxruntime above)
-# onnxruntime-gpu>=1.17.0
+# onnxruntime-gpu>=1.17.0,<2.0
 
 # Optional: FP16 model conversion
-# onnxconverter-common>=1.14.0
+# onnxconverter-common>=1.14.0,<2.0
 
 # Optional: HuggingFace Hub model download
-# huggingface-hub>=0.20.0
+# huggingface-hub>=0.20.0,<1.0

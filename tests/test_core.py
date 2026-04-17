@@ -69,60 +69,18 @@ class TestDetectionResult:
 
 
 # ============================================================
-# evaluation_tab.py — 순수 함수만 테스트 (PySide6 우회)
+# evaluation — core/evaluation.py 직접 import
 # ============================================================
-# PySide6 import 우회를 위해 직접 함수 복사
-def _compute_iou(box1, box2):
-    x1 = max(box1[0], box2[0]); y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2]); y2 = min(box1[3], box2[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    a1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    a2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    return inter / (a1 + a2 - inter + 1e-9)
+from core.evaluation import (
+    _compute_iou, _compute_ap, _yolo_to_xyxy,
+    evaluate_classification as _eval_cls_core,
+    evaluate_segmentation as _eval_seg_core,
+)
 
 
-def _compute_ap(recalls, precisions):
-    mrec = np.concatenate(([0.0], recalls, [1.0]))
-    mpre = np.concatenate(([1.0], precisions, [0.0]))
-    for i in range(len(mpre) - 2, -1, -1):
-        mpre[i] = max(mpre[i], mpre[i + 1])
-    ap = 0.0
-    for t in np.linspace(0, 1, 101):
-        p = mpre[mrec >= t]
-        ap += (p.max() if len(p) > 0 else 0.0)
-    return ap / 101.0
-
-
-def _yolo_to_xyxy(cx, cy, w, h):
-    return (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
-
-
-def evaluate_classification(gt_data, pred_data, num_classes):
-    if not gt_data or not pred_data:
-        return {}
-    y_true, y_pred = [], []
-    for stem in gt_data:
-        if stem in pred_data:
-            y_true.append(gt_data[stem])
-            y_pred.append(pred_data[stem][0])
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    accuracy = float((y_true == y_pred).mean())
-    results = {}
-    all_classes = sorted(set(y_true.tolist() + y_pred.tolist()))
-    for cid in all_classes:
-        tp = int(((y_true == cid) & (y_pred == cid)).sum())
-        fp = int(((y_true != cid) & (y_pred == cid)).sum())
-        fn = int(((y_true == cid) & (y_pred != cid)).sum())
-        prec = tp / (tp + fp + 1e-9)
-        rec = tp / (tp + fn + 1e-9)
-        f1 = 2 * prec * rec / (prec + rec + 1e-9)
-        results[cid] = {"precision": prec, "recall": rec, "f1": f1, "tp": tp, "fp": fp}
-    macro_p = np.mean([v["precision"] for v in results.values()])
-    macro_r = np.mean([v["recall"] for v in results.values()])
-    macro_f1 = np.mean([v["f1"] for v in results.values()])
-    results["__overall__"] = {"accuracy": accuracy, "precision": float(macro_p),
-                              "recall": float(macro_r), "f1": float(macro_f1)}
-    return results
+# evaluate_classification 래퍼 (테스트 시그니처 호환: num_classes 인자)
+def evaluate_classification(gt_data, pred_data, num_classes=0):
+    return _eval_cls_core(gt_data, pred_data)
 
 
 class TestIoU:
@@ -183,22 +141,10 @@ class TestClassificationEval:
 
 
 # ============================================================
-# segmentation — compute_seg_metrics (PySide6 우회를 위해 직접 구현)
+# segmentation — core/evaluation.py 직접 import
 # ============================================================
 def compute_seg_metrics(pred_mask, gt_mask, num_classes):
-    results = {}
-    for c in range(num_classes):
-        pred_c = (pred_mask == c)
-        gt_c = (gt_mask == c)
-        inter = (pred_c & gt_c).sum()
-        union = (pred_c | gt_c).sum()
-        iou = float(inter) / (float(union) + 1e-9) if union > 0 else float('nan')
-        dice = 2.0 * float(inter) / (float(pred_c.sum() + gt_c.sum()) + 1e-9)
-        results[c] = {"iou": iou, "dice": dice, "pred_px": int(pred_c.sum()), "gt_px": int(gt_c.sum())}
-    valid = [v["iou"] for v in results.values() if not np.isnan(v["iou"]) and v["gt_px"] > 0]
-    results["__overall__"] = {"mIoU": float(np.mean(valid)) if valid else 0.0,
-                              "mDice": float(np.mean([v["dice"] for v in results.values() if v["gt_px"] > 0])) if valid else 0.0}
-    return results
+    return _eval_seg_core(pred_mask, gt_mask, num_classes)
 
 
 class TestSegMetrics:
@@ -290,3 +236,115 @@ class TestModelInfo:
         mi = ModelInfo(path="t", format="onnx", names={}, input_size=(640, 640),
                        session=None, output_layout="v8", batch_size=4)
         assert mi.batch_size == 4
+
+
+# ============================================================
+# inference — postprocess_v8, postprocess_v5 단위 테스트
+# ============================================================
+from core.inference import postprocess_v8, postprocess_v5, _nms
+
+
+class TestPostprocessV8:
+    """YOLOv8 출력: (1, 4+N, 8400) 형태."""
+
+    def _make_output(self, n_classes, n_anchors, detections):
+        """detections: list of (cx, cy, w, h, class_id, score)"""
+        out = np.zeros((1, 4 + n_classes, n_anchors), dtype=np.float32)
+        for i, (cx, cy, w, h, cid, score) in enumerate(detections):
+            out[0, 0, i] = cx
+            out[0, 1, i] = cy
+            out[0, 2, i] = w
+            out[0, 3, i] = h
+            out[0, 4 + cid, i] = score
+        return out
+
+    def test_empty_no_detections(self):
+        out = np.zeros((1, 84, 8400), dtype=np.float32)
+        r = postprocess_v8(out, 0.5, 1.0, (0, 0), (640, 640))
+        assert len(r.boxes) == 0
+
+    def test_single_detection(self):
+        # 1 class, 1 anchor with high score at center
+        out = self._make_output(1, 100, [(320, 320, 100, 100, 0, 0.9)])
+        r = postprocess_v8(out, 0.5, 1.0, (0, 0), (640, 640))
+        assert len(r.boxes) == 1
+        assert r.scores[0] > 0.8
+        assert r.class_ids[0] == 0
+
+    def test_confidence_filter(self):
+        out = self._make_output(2, 100, [
+            (320, 320, 100, 100, 0, 0.9),
+            (100, 100, 50, 50, 1, 0.1),  # below threshold
+        ])
+        r = postprocess_v8(out, 0.5, 1.0, (0, 0), (640, 640))
+        assert len(r.boxes) == 1
+
+    def test_coordinate_unscale(self):
+        # ratio=0.5, pad=(0,0) → boxes should be 2x in original space
+        out = self._make_output(1, 100, [(160, 160, 50, 50, 0, 0.9)])
+        r = postprocess_v8(out, 0.5, 0.5, (0, 0), (640, 640))
+        assert len(r.boxes) == 1
+        # center at 160 with ratio 0.5 → original center at 320
+        cx = (r.boxes[0][0] + r.boxes[0][2]) / 2
+        assert abs(cx - 320) < 5
+
+
+class TestPostprocessV5:
+    """YOLOv5 출력: (1, 25200, 5+N) 형태."""
+
+    def _make_output(self, n_classes, n_anchors, detections):
+        """detections: list of (cx, cy, w, h, objectness, class_id, class_score)"""
+        out = np.zeros((1, n_anchors, 5 + n_classes), dtype=np.float32)
+        for i, (cx, cy, w, h, obj, cid, score) in enumerate(detections):
+            out[0, i, 0] = cx
+            out[0, i, 1] = cy
+            out[0, i, 2] = w
+            out[0, i, 3] = h
+            out[0, i, 4] = obj
+            out[0, i, 5 + cid] = score
+        return out
+
+    def test_empty(self):
+        out = np.zeros((1, 100, 85), dtype=np.float32)
+        r = postprocess_v5(out, 0.5, 1.0, (0, 0), (640, 640))
+        assert len(r.boxes) == 0
+
+    def test_single_detection(self):
+        out = self._make_output(80, 100, [(320, 320, 100, 100, 0.95, 0, 0.9)])
+        r = postprocess_v5(out, 0.5, 1.0, (0, 0), (640, 640))
+        assert len(r.boxes) == 1
+        assert r.class_ids[0] == 0
+
+    def test_objectness_filter(self):
+        out = self._make_output(2, 100, [
+            (320, 320, 100, 100, 0.9, 0, 0.9),   # obj*cls = 0.81
+            (100, 100, 50, 50, 0.1, 1, 0.9),      # obj*cls = 0.09 → filtered
+        ])
+        r = postprocess_v5(out, 0.5, 1.0, (0, 0), (640, 640))
+        assert len(r.boxes) == 1
+
+
+class TestNMS:
+    def test_empty(self):
+        assert _nms(np.zeros((0, 4)), np.zeros(0), np.zeros(0, dtype=np.int32), 0.5) == []
+
+    def test_no_overlap(self):
+        boxes = np.array([[0, 0, 10, 10], [20, 20, 30, 30]], dtype=np.float32)
+        scores = np.array([0.9, 0.8], dtype=np.float32)
+        cids = np.array([0, 0], dtype=np.int32)
+        keep = _nms(boxes, scores, cids, 0.5)
+        assert len(keep) == 2
+
+    def test_full_overlap(self):
+        boxes = np.array([[0, 0, 10, 10], [0, 0, 10, 10]], dtype=np.float32)
+        scores = np.array([0.9, 0.8], dtype=np.float32)
+        cids = np.array([0, 0], dtype=np.int32)
+        keep = _nms(boxes, scores, cids, 0.5)
+        assert len(keep) == 1
+
+    def test_different_classes(self):
+        boxes = np.array([[0, 0, 10, 10], [0, 0, 10, 10]], dtype=np.float32)
+        scores = np.array([0.9, 0.8], dtype=np.float32)
+        cids = np.array([0, 1], dtype=np.int32)
+        keep = _nms(boxes, scores, cids, 0.5)
+        assert len(keep) == 2  # different classes → both kept
