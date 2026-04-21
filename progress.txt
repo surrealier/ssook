@@ -1,0 +1,16 @@
+## Codebase Patterns
+
+- **pytest environment**: Use `/c/Users/82106/anaconda3/envs/torch251/python.exe -m pytest tests/ -v` — the base anaconda env lacks cv2, and the torch251 env lacked pytest initially (installed it). The torch251 env is the correct one for this project.
+- **analysis_routes.py imports**: File uses `base64` and `pathlib.Path` throughout but had neither imported — pattern to check when adding new code to this file.
+
+---
+
+<!-- ralph iteration 1 @ 2026-04-21 23:19:38 -->
+
+## 2026-04-21 - US-001
+- Added `import base64` and `from pathlib import Path` to server/analysis_routes.py import block
+- Files changed: server/analysis_routes.py
+- **Learnings for future iterations:**
+  - The torch251 conda env is the correct pytest environment
+  - analysis_routes.py used base64 at lines 124 and 486, Path at line 394 without importing them
+---

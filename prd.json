@@ -1,0 +1,77 @@
+{
+  "project": "ssook",
+  "branchName": "ralph/critical-fixes-and-improvements",
+  "goal": "Fix all 5 critical bugs and add high-priority improvements documented in docs/future-works.md",
+  "stories": [
+    {
+      "id": "US-001",
+      "title": "Fix analysis_routes.py missing imports",
+      "description": "server/analysis_routes.py uses base64 (line 124, line 486) and Path (line 394) but never imports them, causing crashes in Model Compare image loading and Embedding Viewer. Add 'import base64' and 'from pathlib import Path' to the import block at the top of the file. Run pytest to confirm nothing breaks.",
+      "priority": 1,
+      "passes": true
+    },
+    {
+      "id": "US-002",
+      "title": "Fix eval_routes.py eval_state variable shadowing",
+      "description": "server/eval_routes.py imports eval_state from server.state on line 15, then immediately re-declares it as a plain dict on line 21. This breaks force-stop: all_states['eval'] in server/state.py still points to the original TaskState, but the running eval updates the new local dict. Fix by removing the re-declaration (line 21-23) and using the imported TaskState directly. The TaskState already has the same default fields. Also add a force-stop endpoint GET /api/eval/stop that sets all_states['eval']['running'] = False. Add a corresponding GET /api/eval/status endpoint if one does not exist. Run pytest.",
+      "priority": 2,
+      "passes": false
+    },
+    {
+      "id": "US-003",
+      "title": "Fix data_routes.py dataset merger using MD5 instead of dHash",
+      "description": "server/data_routes.py merger endpoint (around line 470-490) accepts a dhash_threshold parameter but internally uses hashlib.md5 for deduplication instead of perceptual hashing. This means dhash_threshold is silently ignored and visually similar but not byte-identical images are not detected as duplicates. Replace the MD5 approach with a proper dHash (difference hash) implementation: compute an 8x8 greyscale image, compute row differences, flatten to a 64-bit hash, then compare using Hamming distance <= dhash_threshold. The implementation should use only opencv and numpy (no imagehash library). Run pytest.",
+      "priority": 3,
+      "passes": false
+    },
+    {
+      "id": "US-004",
+      "title": "Fix Leaky Split threshold input not being read",
+      "description": "In web/js/tabs-extra.js around line 1147, the Leaky Split run() method sends threshold: 10 hardcoded. The corresponding input element rendered around line 1128-1131 does not have an id attribute, so there is no way to read it from JavaScript. Add id='leaky-threshold' to the input element in the renderHTML string, then change the run() call to read +document.getElementById('leaky-threshold').value || 10 instead of the hardcoded 10. Verify the input is rendered with the id attribute in the HTML template string. Run pytest.",
+      "priority": 4,
+      "passes": false
+    },
+    {
+      "id": "US-005",
+      "title": "Add /api/benchmark/export-csv endpoint",
+      "description": "server/bench_routes.py (or equivalent benchmark route file - look in server/ directory) has no CSV export endpoint. Add GET /api/benchmark/export-csv that reads from bench_state['results'] and returns a CSV file as a download. The CSV should have columns: model_name, fps_mean, fps_p50, fps_p95, fps_p99, latency_ms_mean, preprocess_ms, inference_ms, postprocess_ms (include whichever fields actually exist in bench_state results). Use Python's csv module. Also add a small 'Export CSV' button in web/js/tabs.js in the benchmark results section that calls this endpoint and triggers a download. Run pytest.",
+      "priority": 5,
+      "passes": false
+    },
+    {
+      "id": "US-006",
+      "title": "Add benchmark server-side stop support",
+      "description": "The benchmark run can only be stopped on the client side by stopping polling. Add server-side stop: (1) in server/bench_routes.py add GET /api/benchmark/stop that sets bench_state['running'] = False; (2) in the benchmark background task loop, add a check at each iteration: if not bench_state['running']: break (look at how the benchmark loop is structured and add the check at a natural stopping point). In web/js/tabs.js add a Stop button that appears while the benchmark is running and calls /api/benchmark/stop. Run pytest.",
+      "priority": 6,
+      "passes": false
+    },
+    {
+      "id": "US-007",
+      "title": "Disable Run buttons during active operations to prevent double-execution",
+      "description": "Multiple tabs (eval, benchmark, analysis tools) allow the user to click Run multiple times, which can spawn duplicate background tasks. For the evaluation tab and benchmark tab in web/js/tabs.js: disable the Run button when a task starts (set disabled=true and add a visual indicator like 'Running...') and re-enable it when polling detects the task is complete or errored. Look at how the run() and poll() methods work in these tabs and add button state management. Do NOT modify more than 2-3 tabs to keep the scope manageable. Run pytest.",
+      "priority": 7,
+      "passes": false
+    },
+    {
+      "id": "US-008",
+      "title": "Improve polling error handling from silent catch to visible errors",
+      "description": "Many polling functions in web/js/tabs.js and tabs-extra.js have catch(e) {} that silently swallows errors, so users see no feedback when the server is unreachable or returns an error. Find the polling functions (look for setInterval or setTimeout polling loops with empty catch blocks) in the evaluation and benchmark tabs and change empty catch(e) {} to catch(e) { console.warn('poll error:', e); } plus optionally show an error message in the UI status area if one exists. This prevents silent failures. Scope: eval and benchmark polling only. Run pytest.",
+      "priority": 8,
+      "passes": false
+    },
+    {
+      "id": "US-009",
+      "title": "Add confusion matrix to multi-model detection evaluation",
+      "description": "The evaluation results for Detection task (mAP, precision, recall) do not include a confusion matrix. Add a confusion matrix: (1) in server/eval_routes.py, after computing per-image detections vs GT, accumulate a class x class confusion count matrix (true class as row, predicted class as column, plus a 'background' bucket for FP/FN). Return this as 'confusion_matrix' and 'confusion_classes' in the results. (2) In web/js/tabs.js, after the evaluation results table, render the confusion matrix as an HTML table with color-coded cells (darker = higher count). Only show this for detection tasks when confusion data is present. Run pytest to confirm evaluation logic still produces correct mAP.",
+      "priority": 9,
+      "passes": false
+    },
+    {
+      "id": "US-010",
+      "title": "Fix Dataset Explorer 5000-image limit and add statistics export",
+      "description": "server/data_routes.py Dataset Explorer endpoint caps results at 5000 images. Change this limit to be configurable via a 'limit' parameter (default 5000, max 50000). Also add GET /api/data/explorer/export-stats endpoint that returns a CSV of per-class image counts, total images, images with/without labels. In web/js/tabs-extra.js, add an 'Export Stats CSV' button in the Dataset Explorer results section. Run pytest.",
+      "priority": 10,
+      "passes": false
+    }
+  ]
+}
