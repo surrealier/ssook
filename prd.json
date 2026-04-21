@@ -43,7 +43,7 @@
       "title": "Add benchmark server-side stop support",
       "description": "The benchmark run can only be stopped on the client side by stopping polling. Add server-side stop: (1) in server/bench_routes.py add GET /api/benchmark/stop that sets bench_state['running'] = False; (2) in the benchmark background task loop, add a check at each iteration: if not bench_state['running']: break (look at how the benchmark loop is structured and add the check at a natural stopping point). In web/js/tabs.js add a Stop button that appears while the benchmark is running and calls /api/benchmark/stop. Run pytest.",
       "priority": 6,
-      "passes": false
+      "passes": true
     },
     {
       "id": "US-007",

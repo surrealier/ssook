@@ -65,3 +65,17 @@
 ---
 
 <!-- ralph iteration 6 @ 2026-04-21 -->
+
+<!-- ralph iteration 6 @ 2026-04-21 23:26:35 -->
+
+<!-- ralph iteration 7 @ 2026-04-21 23:26:47 -->
+
+## 2026-04-21 - US-006
+- Added `GET /api/benchmark/stop` endpoint to server/benchmark_routes.py that sets `bench_state['running'] = False`
+- Changed `is_stopped` lambda in `_run()` from `lambda: False` to `lambda: not bench_state['running']` so the core loop actually exits when stopped
+- Updated `Tabs.benchmark.stop()` in tabs.js to call `/api/benchmark/stop` before resetting UI state
+- Files changed: server/benchmark_routes.py, web/js/tabs.js
+- **Learnings for future iterations:**
+  - The Stop button (`bench-stop`) already existed in the UI — only needed to wire up the server call
+  - `run_benchmark_core` already accepts `is_stopped` callable; the fix was passing a real check instead of `lambda: False`
+---
