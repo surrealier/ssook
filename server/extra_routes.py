@@ -1,6 +1,8 @@
 """/api/clip/*, /api/embedder/*, /api/segmentation/*, /api/batch/*, /api/quantize/*, /api/inspector/*, /api/profiler/*, /api/tracking/*, /api/hf/*, /api/force-stop/* 라우터."""
 import os
 import time
+import uuid
+import asyncio
 
 import cv2
 import numpy as np
@@ -11,7 +13,7 @@ from typing import Optional
 from core.model_loader import load_model as _load_model
 from core.inference import run_inference, letterbox, preprocess, _padded_to_tensor, run_segmentation
 from server.state import clip_state, embedder_state, seg_state, quant_state, all_states, executor
-from server.utils import imread, encode_jpeg, glob_images, overlay_segmentation
+from server.utils import imread, encode_jpeg, glob_images, overlay_segmentation, generate_palette
 
 router = APIRouter()
 
@@ -125,7 +127,7 @@ async def run_embedder(req: EmbedderRequest):
     def _run():
         try:
             from core.model_loader import load_model as _load
-            mi = _load(req.model_path, model_type=req.model_type)
+            mi = _load_model(req.model_path, model_type=req.model_type)
             # 폴더 구조: img_dir/class_name/image.jpg (없으면 단일 클래스로 처리)
             class_dirs = [d for d in os.listdir(req.img_dir)
                           if os.path.isdir(os.path.join(req.img_dir, d))]
@@ -425,7 +427,7 @@ async def api_infer_pose(req: dict):
         frame = imread(image_path)
         if frame is None:
             return {"error": "Cannot read image"}
-        mi = _load(model_path, model_type=model_type)
+        mi = _load_model(model_path, model_type=model_type)
         from core.inference import run_pose, COCO_SKELETON, COCO_KPT_NAMES
         result = run_pose(mi, frame, conf)
         # Draw on image
@@ -469,12 +471,12 @@ async def api_infer_instance_seg(req: dict):
         frame = imread(image_path)
         if frame is None:
             return {"error": "Cannot read image"}
-        mi = _load(model_path, model_type=model_type)
+        mi = _load_model(model_path, model_type=model_type)
         from core.inference import run_instance_seg
         result = run_instance_seg(mi, frame, conf)
         # Draw masks on image
         vis = frame.copy()
-        colors = _generate_palette(max(len(result.masks), 1))
+        colors = generate_palette(max(len(result.masks), 1))
         for i in range(len(result.masks)):
             mask = result.masks[i]
             color = colors[i % len(colors)]
@@ -550,7 +552,7 @@ async def hf_files(req: dict):
 async def hf_download(req: dict):
     try:
         from core.hf_downloader import download_model
-        path = await asyncio.get_event_loop().run_inexecutor(
+        path = await asyncio.get_event_loop().run_in_executor(
             executor, download_model, req["repo_id"], req["filename"]
         )
         return {"path": path}

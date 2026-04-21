@@ -402,7 +402,7 @@ const I18n = {
     'common.confidence':    { en: 'Confidence',          ko: '신뢰도' },
     'common.select_dirs':   { en: 'Select directories',  ko: '디렉토리를 선택하세요' },
     // Phase 1: Pose Estimation
-    'pose.title':           { en: 'Pose Estimation',     ko: '포즈 추정' },
+    'pose.title':           { en: 'Pose Estimation <span class="badge-beta">beta</span>', ko: '포즈 추정 <span class="badge-beta">beta</span>' },
     'pose.model_type':      { en: 'Pose Model Type',     ko: '포즈 모델 타입' },
     'pose.run':             { en: 'Run Pose Estimation', ko: '포즈 추정 실행' },
     'pose.hint':            { en: 'Select a pose model and image to detect keypoints', ko: '포즈 모델과 이미지를 선택하여 키포인트를 검출하세요' },
@@ -411,7 +411,7 @@ const I18n = {
     'pose.persons':         { en: 'Persons detected',    ko: '검출된 사람 수' },
     'pose.infer_ms':        { en: 'Inference',           ko: '추론 시간' },
     // Phase 1: Instance Segmentation
-    'instseg.title':        { en: 'Instance Segmentation', ko: '인스턴스 세그멘테이션' },
+    'instseg.title':        { en: 'Instance Segmentation <span class="badge-beta">beta</span>', ko: '인스턴스 세그멘테이션 <span class="badge-beta">beta</span>' },
     'instseg.model_type':   { en: 'Instance Seg Model',  ko: '인스턴스 세그 모델' },
     'instseg.run':          { en: 'Run Instance Seg',    ko: '인스턴스 세그 실행' },
     'instseg.hint':         { en: 'Select a segmentation model and image for per-instance masks', ko: '세그멘테이션 모델과 이미지를 선택하여 인스턴스별 마스크를 생성하세요' },
@@ -420,7 +420,7 @@ const I18n = {
     'instseg.instances':    { en: 'Instances',           ko: '인스턴스 수' },
     'instseg.infer_ms':     { en: 'Inference',           ko: '추론 시간' },
     // Phase 1: Tracking
-    'tracking.title':       { en: 'Object Tracking (MOT)', ko: '객체 트래킹 (MOT)' },
+    'tracking.title':       { en: 'Object Tracking (MOT) <span class="badge-beta">beta</span>', ko: '객체 트래킹 (MOT) <span class="badge-beta">beta</span>' },
     'tracking.tracker_type':{ en: 'Tracker Type',        ko: '트래커 타입' },
     'tracking.desc':        { en: 'Create a tracker instance for video-based multi-object tracking. Use with Viewer for real-time tracking.', ko: '비디오 기반 다중 객체 트래킹을 위한 트래커 인스턴스를 생성합니다. 뷰어와 함께 사용하세요.' },
     'tracking.create':      { en: 'Create Tracker',      ko: '트래커 생성' },
@@ -490,7 +490,7 @@ const I18n = {
     'profiler.diagnosis':   { en: 'Bottleneck Diagnosis', ko: '병목 진단' },
     'profiler.graph_depth': { en: 'Graph Depth',         ko: '그래프 깊이' },
     // Phase 1: VLM
-    'vlm.title':            { en: 'Vision-Language Model (VLM)', ko: '비전-언어 모델 (VLM)' },
+    'vlm.title':            { en: 'Vision-Language Model (VLM) <span class="badge-wip">WIP</span>', ko: '비전-언어 모델 (VLM) <span class="badge-wip">WIP</span>' },
     'vlm.task':             { en: 'VLM Task',            ko: 'VLM 태스크' },
     'vlm.prompt':           { en: 'Prompt / Question',   ko: '프롬프트 / 질문' },
     'vlm.prompt_hint':      { en: 'Enter a question about the image...', ko: '이미지에 대한 질문을 입력하세요...' },

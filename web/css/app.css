@@ -95,3 +95,25 @@ a:hover { color: var(--action-link-04); }
 .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0; }
 .hidden { display: none !important; }
+
+/* ── Beta / WIP Badges ──────────────────────────────── */
+.badge-beta, .badge-wip {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: var(--border-radius-04);
+  vertical-align: middle;
+  margin-left: 6px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.badge-beta {
+  background: #f59e0b;
+  color: #fff;
+}
+.badge-wip {
+  background: #ef4444;
+  color: #fff;
+}
