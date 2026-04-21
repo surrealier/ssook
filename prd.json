@@ -29,7 +29,7 @@
       "title": "Fix Leaky Split threshold input not being read",
       "description": "In web/js/tabs-extra.js around line 1147, the Leaky Split run() method sends threshold: 10 hardcoded. The corresponding input element rendered around line 1128-1131 does not have an id attribute, so there is no way to read it from JavaScript. Add id='leaky-threshold' to the input element in the renderHTML string, then change the run() call to read +document.getElementById('leaky-threshold').value || 10 instead of the hardcoded 10. Verify the input is rendered with the id attribute in the HTML template string. Run pytest.",
       "priority": 4,
-      "passes": false
+      "passes": true
     },
     {
       "id": "US-005",
