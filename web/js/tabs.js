@@ -1719,9 +1719,13 @@ Tabs.explorer = {
     return `
       <div style="display:flex;flex-direction:column;gap:1.5rem;">
         <div class="card" style="padding:1.5rem;">
-          <div style="display:grid;grid-template-columns:1fr 1fr auto auto;gap:1rem;align-items:end;">
+          <div style="display:grid;grid-template-columns:1fr 1fr auto auto auto;gap:1rem;align-items:end;">
             ${imgDirInput('exp-img')}
             ${lblDirInput('exp-lbl')}
+            <div class="form-group" style="margin:0;">
+              <label class="form-label">Limit</label>
+              <input type="number" class="form-input input-normal" id="exp-limit" value="5000" min="1" max="50000" style="width:90px;">
+            </div>
             <button class="btn btn-primary" style="height:36px;" onclick="Tabs.explorer.load()">${t('explorer.load')}</button>
           </div>
           <div id="exp-pbar-wrap" style="display:none;margin-top:0.75rem;">
@@ -1764,6 +1768,7 @@ Tabs.explorer = {
             <div class="card-flat" style="padding:1rem;margin-top:0.75rem;">
               <div class="text-label" style="margin-bottom:0.5rem;">${t('explorer.stats')}</div>
               <div id="exp-stats" class="text-secondary">—</div>
+              <button class="btn btn-secondary btn-sm" style="width:100%;margin-top:0.75rem;" onclick="Tabs.explorer._exportStats()">Export Stats CSV</button>
             </div>
           </div>
           <div style="flex:1;">
@@ -1782,7 +1787,8 @@ Tabs.explorer = {
     const pbarWrap = document.getElementById('exp-pbar-wrap');
     if (pbarWrap) pbarWrap.style.display = 'block';
     try {
-      const r = await API.post('/api/data/explorer', { img_dir, label_dir });
+      const limit = Math.min(parseInt(document.getElementById('exp-limit')?.value || '5000', 10), 50000) || 5000;
+      const r = await API.post('/api/data/explorer', { img_dir, label_dir, limit });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       this._pollLoad();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
@@ -1975,6 +1981,9 @@ Tabs.explorer = {
       }).join('')}</div>`;
   },
   _filteredFiles: [],
+  _exportStats() {
+    window.open('/api/data/explorer/export-stats', '_blank');
+  },
   async _preview(idx) {
     const f = this._filteredFiles[idx];
     if (!f) return;

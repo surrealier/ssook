@@ -1,4 +1,6 @@
 """/api/data/* 라우터."""
+import csv
+import io
 import os
 import random
 import shutil
@@ -7,6 +9,7 @@ from typing import Optional
 import cv2
 import numpy as np
 from fastapi import APIRouter
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from server.state import explorer_state, splitter_state, converter_state, remapper_state, merger_state, sampler_state, executor
@@ -21,6 +24,7 @@ explorer_state = {"running": False, "progress": 0, "total": 0, "msg": "", "data"
 async def data_explorer(req: dict):
     img_dir = req.get("img_dir", "")
     lbl_dir = req.get("label_dir", "")
+    limit = min(int(req.get("limit", 5000)), 50000)
     if not img_dir or not os.path.isdir(img_dir):
         return {"error": "Invalid image directory"}
     if explorer_state["running"]:
@@ -38,7 +42,7 @@ async def data_explorer(req: dict):
             box_sizes = []  # (w, h) normalized
             aspect_ratios = []
             box_aspect_ratios = []
-            for i, fp in enumerate(imgs[:5000]):
+            for i, fp in enumerate(imgs[:limit]):
                 explorer_state["progress"] = i + 1
                 stem = os.path.splitext(os.path.basename(fp))[0]
                 txt = os.path.join(lbl_dir, stem + ".txt") if lbl_dir else ""
@@ -93,6 +97,35 @@ async def explorer_status():
     elif s["running"]:
         s.pop("data", None)
     return s
+
+@router.get("/api/data/explorer/export-stats")
+async def explorer_export_stats():
+    data = explorer_state.get("data")
+    if not data:
+        return Response(content="No data loaded", media_type="text/plain", status_code=400)
+    files = data.get("files", [])
+    class_counts = data.get("class_counts", {})
+    img_class_counts = data.get("img_class_counts", {})
+    total = data.get("total", len(files))
+    images_with_labels = sum(1 for f in files if f.get("boxes", 0) > 0)
+    images_without_labels = len(files) - images_with_labels
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["metric", "value"])
+    writer.writerow(["total_images", total])
+    writer.writerow(["images_scanned", len(files)])
+    writer.writerow(["images_with_labels", images_with_labels])
+    writer.writerow(["images_without_labels", images_without_labels])
+    writer.writerow([])
+    writer.writerow(["class_id", "box_count", "image_count"])
+    all_classes = sorted(set(list(class_counts.keys()) + list(img_class_counts.keys())), key=lambda x: int(x))
+    for cls in all_classes:
+        writer.writerow([cls, class_counts.get(cls, 0), img_class_counts.get(cls, 0)])
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=explorer_stats.csv"}
+    )
 
 @router.post("/api/data/explorer/preview")
 async def explorer_preview(req: dict):
