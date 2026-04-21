@@ -92,3 +92,17 @@
   - Must update textContent in ALL exit paths: `_poll()` completion, `stop()`, and error catch blocks
   - `t('eval.running')` = "Running..." (line 267 i18n.js), `t('bench.running')` = "Benchmark running..."
 ---
+
+<!-- ralph iteration 9 @ 2026-04-21 23:30:52 -->
+
+<!-- ralph iteration 10 @ 2026-04-21 23:31:07 -->
+
+## 2026-04-21 - US-008
+- Added `console.warn('poll error:', e)` to benchmark `_poll()` catch at line 1097
+- Added `console.warn('poll error:', e)` to eval `_poll()` catch at line 1569
+- Both catch blocks now also update the respective status DOM element with the error message
+- Files changed: web/js/tabs.js
+- **Learnings for future iterations:**
+  - Benchmark and eval _poll() catch blocks were not truly empty — they retried after 1s — but silently dropped the error
+  - bench-status and eval-status elements are the correct status areas for each tab
+---

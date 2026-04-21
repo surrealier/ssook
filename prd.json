@@ -57,7 +57,7 @@
       "title": "Improve polling error handling from silent catch to visible errors",
       "description": "Many polling functions in web/js/tabs.js and tabs-extra.js have catch(e) {} that silently swallows errors, so users see no feedback when the server is unreachable or returns an error. Find the polling functions (look for setInterval or setTimeout polling loops with empty catch blocks) in the evaluation and benchmark tabs and change empty catch(e) {} to catch(e) { console.warn('poll error:', e); } plus optionally show an error message in the UI status area if one exists. This prevents silent failures. Scope: eval and benchmark polling only. Run pytest.",
       "priority": 8,
-      "passes": false
+      "passes": true
     },
     {
       "id": "US-009",
