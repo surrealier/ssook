@@ -1094,7 +1094,7 @@ Tabs.benchmark = {
         const _bpt2 = document.getElementById('bench-progress-text'); if (_bpt2) _bpt2.textContent = '100%';
         App.setStatus(t('bench.complete'));
       }
-    } catch(e) { setTimeout(() => this._poll(), 1000); }
+    } catch(e) { console.warn('poll error:', e); document.getElementById('bench-status').textContent = 'Poll error: ' + e.message; setTimeout(() => this._poll(), 1000); }
   },
   stop() {
     this._polling = false;
@@ -1566,7 +1566,7 @@ Tabs.evaluation = {
         this._cachedHTML = document.getElementById('page-body').innerHTML;
         App.setStatus(t('eval.complete'));
       }
-    } catch(e) { setTimeout(() => this._poll(), 1000); }
+    } catch(e) { console.warn('poll error:', e); const _est = document.getElementById('eval-status'); if (_est) _est.textContent = 'Poll error: ' + e.message; setTimeout(() => this._poll(), 1000); }
   },
   _renderResults(results) {
     const tb = document.getElementById('eval-results');
