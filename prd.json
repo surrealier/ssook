@@ -64,7 +64,7 @@
       "title": "Add confusion matrix to multi-model detection evaluation",
       "description": "The evaluation results for Detection task (mAP, precision, recall) do not include a confusion matrix. Add a confusion matrix: (1) in server/eval_routes.py, after computing per-image detections vs GT, accumulate a class x class confusion count matrix (true class as row, predicted class as column, plus a 'background' bucket for FP/FN). Return this as 'confusion_matrix' and 'confusion_classes' in the results. (2) In web/js/tabs.js, after the evaluation results table, render the confusion matrix as an HTML table with color-coded cells (darker = higher count). Only show this for detection tasks when confusion data is present. Run pytest to confirm evaluation logic still produces correct mAP.",
       "priority": 9,
-      "passes": false
+      "passes": true
     },
     {
       "id": "US-010",

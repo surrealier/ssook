@@ -106,3 +106,23 @@
   - Benchmark and eval _poll() catch blocks were not truly empty — they retried after 1s — but silently dropped the error
   - bench-status and eval-status elements are the correct status areas for each tab
 ---
+
+<!-- ralph iteration 11 @ 2026-04-21 23:32:25 -->
+
+<!-- ralph iteration 12 @ 2026-04-21 23:32:37 -->
+
+<!-- ralph iteration 13 @ 2026-04-21 23:32:46 -->
+
+## 2026-04-21 - US-009
+- Added `_build_confusion_matrix()` helper to server/eval_routes.py (module-level)
+- Computes (n_classes+1)×(n_classes+1) matrix via greedy IoU matching (threshold 0.5); last index = background (FP/FN)
+- Added `confusion_matrix` and `confusion_classes` fields to each detection result in eval_state
+- Added `eval-confusion-container` div to eval tab HTML in tabs.js
+- Added `_renderConfusion()` method: renders per-model HTML tables with green (TP diagonal) / red (off-diagonal) color coding
+- `_renderResults()` calls `_renderConfusion()` automatically for detection task
+- Files changed: server/eval_routes.py, web/js/tabs.js
+- **Learnings for future iterations:**
+  - Confusion matrix rows = GT class, columns = predicted class; last row/col = background (FP/FN)
+  - Color-coded via rgba with alpha proportional to cell value / max value
+  - Private helpers from core.evaluation (_compute_iou_matrix) were not imported; used inline _iou() instead
+---
