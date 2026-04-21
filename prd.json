@@ -15,7 +15,7 @@
       "title": "Fix eval_routes.py eval_state variable shadowing",
       "description": "server/eval_routes.py imports eval_state from server.state on line 15, then immediately re-declares it as a plain dict on line 21. This breaks force-stop: all_states['eval'] in server/state.py still points to the original TaskState, but the running eval updates the new local dict. Fix by removing the re-declaration (line 21-23) and using the imported TaskState directly. The TaskState already has the same default fields. Also add a force-stop endpoint GET /api/eval/stop that sets all_states['eval']['running'] = False. Add a corresponding GET /api/eval/status endpoint if one does not exist. Run pytest.",
       "priority": 2,
-      "passes": false
+      "passes": true
     },
     {
       "id": "US-003",

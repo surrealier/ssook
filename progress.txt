@@ -14,3 +14,15 @@
   - The torch251 conda env is the correct pytest environment
   - analysis_routes.py used base64 at lines 124 and 486, Path at line 394 without importing them
 ---
+
+<!-- ralph iteration 2 @ 2026-04-21 23:21:35 -->
+
+## 2026-04-21 - US-002
+- Removed local `eval_state = {...}` re-declaration in eval_routes.py that shadowed the imported TaskState
+- Imported `all_states` from server.state
+- Added `GET /api/eval/stop` endpoint that sets `all_states["eval"]["running"] = False`
+- Files changed: server/eval_routes.py
+- **Learnings for future iterations:**
+  - `/api/evaluation/status` already existed — no need to add a new one
+  - TaskState (in server/state.py) is a dict subclass with the same default fields; removing the re-declaration was sufficient
+---
