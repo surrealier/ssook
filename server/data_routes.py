@@ -467,25 +467,45 @@ async def data_merger(req: MergerRequest):
 
     def _run():
         try:
-            import shutil, hashlib
+            import shutil
+            import cv2
+            import numpy as np
+
+            def compute_dhash(path: str) -> int | None:
+                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    return None
+                resized = cv2.resize(img, (9, 8), interpolation=cv2.INTER_AREA)
+                diff = resized[:, 1:] > resized[:, :-1]
+                bits = diff.flatten()
+                h = 0
+                for b in bits:
+                    h = (h << 1) | int(b)
+                return h
+
+            def hamming(a: int, b: int) -> int:
+                return bin(a ^ b).count("1")
+
             os.makedirs(os.path.join(req.output_dir, "images"), exist_ok=True)
             os.makedirs(os.path.join(req.output_dir, "labels"), exist_ok=True)
             all_imgs = []
             for d in req.datasets:
                 all_imgs.extend(glob_images(d, recursive=req.recursive))
             merger_state["total"] = len(all_imgs)
-            seen_hashes = set()
+            seen_hashes: list[int] = []
             copied = 0
             dupes = 0
             for i, fp in enumerate(all_imgs):
-                # Simple hash-based dedup
-                with open(fp, "rb") as f:
-                    h = hashlib.md5(f.read(8192)).hexdigest()
-                if h in seen_hashes:
+                h = compute_dhash(fp)
+                if h is None:
+                    merger_state["progress"] = i + 1
+                    continue
+                is_dupe = any(hamming(h, s) <= req.dhash_threshold for s in seen_hashes)
+                if is_dupe:
                     dupes += 1
                     merger_state["progress"] = i + 1
                     continue
-                seen_hashes.add(h)
+                seen_hashes.append(h)
                 dst = os.path.join(req.output_dir, "images", os.path.basename(fp))
                 if os.path.exists(dst):
                     name, ext = os.path.splitext(os.path.basename(fp))
