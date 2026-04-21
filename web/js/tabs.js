@@ -1044,6 +1044,7 @@ Tabs.benchmark = {
     const models = getSlotModels('bench-slots');
     if (!models.length) { App.setStatus(t('bench.no_models')); return; }
     document.getElementById('bench-run').disabled = true;
+    document.getElementById('bench-run').textContent = t('bench.running');
     document.getElementById('bench-stop').disabled = false;
     document.getElementById('bench-status').textContent = t('bench.running');
     document.getElementById('bench-progress').style.width = '0%';
@@ -1062,7 +1063,7 @@ Tabs.benchmark = {
       // Poll for results
       this._polling = true;
       this._poll();
-    } catch(e) { App.setStatus(`Error: ${e.message}`); document.getElementById('bench-run').disabled = false; }
+    } catch(e) { App.setStatus(`Error: ${e.message}`); document.getElementById('bench-run').disabled = false; document.getElementById('bench-run').textContent = t('bench.run'); }
   },
   _polling: false,
   async _poll() {
@@ -1087,6 +1088,7 @@ Tabs.benchmark = {
       } else {
         this._polling = false;
         document.getElementById('bench-run').disabled = false;
+        document.getElementById('bench-run').textContent = t('bench.run');
         document.getElementById('bench-stop').disabled = true;
         document.getElementById('bench-progress').style.width = '100%';
         const _bpt2 = document.getElementById('bench-progress-text'); if (_bpt2) _bpt2.textContent = '100%';
@@ -1099,6 +1101,7 @@ Tabs.benchmark = {
     API.get('/api/benchmark/stop').catch(() => {});
     App.setStatus(t('stopped'));
     document.getElementById('bench-run').disabled = false;
+    document.getElementById('bench-run').textContent = t('bench.run');
     document.getElementById('bench-stop').disabled = true;
   },
   exportResults() {
@@ -1286,6 +1289,7 @@ Tabs.evaluation = {
       if (!result) return; // 취소
 
       document.getElementById('eval-run-btn').disabled = true;
+      document.getElementById('eval-run-btn').textContent = t('eval.running');
       document.getElementById('eval-stop-btn').disabled = false;
       document.getElementById('eval-status').textContent = t('eval.running');
       document.getElementById('eval-prog').style.width = '0%';
@@ -1303,10 +1307,10 @@ Tabs.evaluation = {
         query_dir: document.getElementById('eval-query-dir')?.value || '',
         top_k: parseInt(document.getElementById('eval-topk')?.value || '5'),
       });
-      if (r.error) { App.setStatus('Error: ' + r.error); document.getElementById('eval-run-btn').disabled = false; return; }
+      if (r.error) { App.setStatus('Error: ' + r.error); document.getElementById('eval-run-btn').disabled = false; document.getElementById('eval-run-btn').textContent = t('eval.run'); return; }
       this._polling = true;
       this._poll();
-    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); document.getElementById('eval-run-btn').disabled = false; }
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); document.getElementById('eval-run-btn').disabled = false; document.getElementById('eval-run-btn').textContent = t('eval.run'); }
   },
   _savedMappings: {},
   _savedMappedOnly: true,
@@ -1554,6 +1558,7 @@ Tabs.evaluation = {
       else {
         this._polling = false;
         document.getElementById('eval-run-btn').disabled = false;
+        document.getElementById('eval-run-btn').textContent = t('eval.run');
         document.getElementById('eval-stop-btn').disabled = true;
         document.getElementById('eval-prog').style.width = '100%';
         const _ept2 = document.getElementById('eval-prog-text'); if (_ept2) _ept2.textContent = '100%';
@@ -1586,6 +1591,7 @@ Tabs.evaluation = {
   stop() {
     this._polling = false;
     document.getElementById('eval-run-btn').disabled = false;
+    document.getElementById('eval-run-btn').textContent = t('eval.run');
     document.getElementById('eval-stop-btn').disabled = true;
   },
   showDetail(idx) {
