@@ -126,3 +126,17 @@
   - Color-coded via rgba with alpha proportional to cell value / max value
   - Private helpers from core.evaluation (_compute_iou_matrix) were not imported; used inline _iou() instead
 ---
+
+<!-- ralph iteration 14 @ 2026-04-21 23:35:37 -->
+
+## 2026-04-21 - US-010
+- Made Dataset Explorer limit configurable via `limit` parameter (default 5000, max 50000) in `/api/data/explorer` POST
+- Added `GET /api/data/explorer/export-stats` endpoint returning CSV: summary rows (total, scanned, with/without labels) + per-class box and image counts
+- Added Limit number input (id=`exp-limit`) in Explorer load card; value passed to API call
+- Added "Export Stats CSV" button in Explorer stats panel (calls `window.open` on export endpoint)
+- Files changed: server/data_routes.py, web/js/tabs.js
+- **Learnings for future iterations:**
+  - Explorer tab is in tabs.js (not tabs-extra.js) — the story description had the wrong file
+  - `explorer_state["data"]` persists after load; export endpoint reads directly from it
+  - Use `fastapi.responses.Response` with `Content-Disposition` header for CSV downloads
+---

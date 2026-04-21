@@ -71,7 +71,7 @@
       "title": "Fix Dataset Explorer 5000-image limit and add statistics export",
       "description": "server/data_routes.py Dataset Explorer endpoint caps results at 5000 images. Change this limit to be configurable via a 'limit' parameter (default 5000, max 50000). Also add GET /api/data/explorer/export-stats endpoint that returns a CSV of per-class image counts, total images, images with/without labels. In web/js/tabs-extra.js, add an 'Export Stats CSV' button in the Dataset Explorer results section. Run pytest.",
       "priority": 10,
-      "passes": false
+      "passes": true
     }
   ]
 }
