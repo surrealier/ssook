@@ -1096,6 +1096,7 @@ Tabs.benchmark = {
   },
   stop() {
     this._polling = false;
+    API.get('/api/benchmark/stop').catch(() => {});
     App.setStatus(t('stopped'));
     document.getElementById('bench-run').disabled = false;
     document.getElementById('bench-stop').disabled = true;

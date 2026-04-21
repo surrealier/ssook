@@ -138,7 +138,7 @@ async def run_benchmark(req: BenchmarkRequest):
             bench_state["results"].append({"error": msg})
 
         try:
-            run_benchmark_core(configs, on_progress, on_result, on_error, lambda: False)
+            run_benchmark_core(configs, on_progress, on_result, on_error, lambda: not bench_state["running"])
         except Exception as e:
             bench_state["msg"] = f"Error: {e}"
         finally:
@@ -154,6 +154,12 @@ async def run_benchmark(req: BenchmarkRequest):
 
     executor.submit(_run)
     return {"ok": True, "msg": "Benchmark started"}
+
+
+@router.get("/api/benchmark/stop")
+async def benchmark_stop():
+    bench_state["running"] = False
+    return {"ok": True}
 
 
 @router.get("/api/benchmark/status")
