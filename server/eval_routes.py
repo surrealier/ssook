@@ -12,14 +12,12 @@ from pydantic import BaseModel
 from core.model_loader import load_model as _load_model
 from core.inference import run_inference, run_classification, run_segmentation, run_embedding
 from core.evaluation import evaluate_dataset, evaluate_map50_95, evaluate_classification, evaluate_segmentation, evaluate_embedder
-from server.state import eval_state, executor
+from server.state import eval_state, all_states, executor
 from server.utils import imread, glob_images
 
 router = APIRouter()
 
 # ── Evaluation async API (#6, #7) ──────────────────────
-eval_state = {"running": False, "progress": 0, "total": 0, "msg": "",
-               "model_name": "", "results": []}
 
 
 class EvalAsyncRequest(BaseModel):
@@ -462,6 +460,12 @@ async def evaluation_status():
         "model_name": eval_state["model_name"],
         "results": eval_state["results"],
     }
+
+@router.get("/api/eval/stop")
+async def evaluation_stop():
+    all_states["eval"]["running"] = False
+    return {"ok": True}
+
 
 @router.get("/api/evaluation/export-csv")
 async def evaluation_export_csv():
