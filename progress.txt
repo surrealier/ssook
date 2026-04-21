@@ -50,3 +50,18 @@
   - Frontend-only fixes (no server changes) still need pytest to pass — all 37 passed
   - The leaky split UI renders via a template literal; ids must be set there to be readable at run time
 ---
+
+<!-- ralph iteration 5 @ 2026-04-21 23:25:06 -->
+
+## 2026-04-21 - US-005
+- Added `GET /api/benchmark/export-csv` endpoint to server/benchmark_routes.py
+- Returns bench_state['results'] as a CSV download using Python's csv module
+- The Export button in tabs.js already existed (calls `window.open('/api/benchmark/export-csv', '_blank')`)
+- Files changed: server/benchmark_routes.py
+- **Learnings for future iterations:**
+  - The benchmark frontend Export button was already wired up in tabs.js — only the backend was missing
+  - bench_state result fields: name, codec, provider, fps, avg, decode_ms, pre_ms, infer_ms, post_ms, min, max, std, p50, p95, p99, cpu_pct, ram_mb
+  - Use `fastapi.responses.Response` (not StreamingResponse) for simple in-memory CSV — simpler and sufficient
+---
+
+<!-- ralph iteration 6 @ 2026-04-21 -->

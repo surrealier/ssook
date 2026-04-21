@@ -36,7 +36,7 @@
       "title": "Add /api/benchmark/export-csv endpoint",
       "description": "server/bench_routes.py (or equivalent benchmark route file - look in server/ directory) has no CSV export endpoint. Add GET /api/benchmark/export-csv that reads from bench_state['results'] and returns a CSV file as a download. The CSV should have columns: model_name, fps_mean, fps_p50, fps_p95, fps_p99, latency_ms_mean, preprocess_ms, inference_ms, postprocess_ms (include whichever fields actually exist in bench_state results). Use Python's csv module. Also add a small 'Export CSV' button in web/js/tabs.js in the benchmark results section that calls this endpoint and triggers a download. Run pytest.",
       "priority": 5,
-      "passes": false
+      "passes": true
     },
     {
       "id": "US-006",
