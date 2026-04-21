@@ -1192,6 +1192,7 @@ Tabs.evaluation = {
           <tbody id="eval-results"><tr><td colspan="7" class="text-secondary" style="text-align:center;padding:2rem;">${t('eval.run_hint')}</td></tr></tbody></table></div>
         </div>
         <div id="eval-detail-container"></div>
+        <div id="eval-confusion-container"></div>
       </div>`;
   },
   _onTaskChange() {
@@ -1587,6 +1588,36 @@ Tabs.evaluation = {
       }
       return '<tr><td>'+(x.name||'')+'</td><td>'+(x.map50?.toFixed(4)||0)+'%</td><td>'+(x.map5095?.toFixed(4)||0)+'%</td><td>'+(x.precision?.toFixed(4)||0)+'%</td><td>'+(x.recall?.toFixed(4)||0)+'%</td><td>'+(x.f1?.toFixed(4)||0)+'%</td><td>'+detBtn+'</td></tr>';
     }).join('');
+    if (task === 'detection') this._renderConfusion(results);
+  },
+  _renderConfusion(results) {
+    const c = document.getElementById('eval-confusion-container');
+    if (!c) return;
+    const detResults = results.filter(r => r.confusion_matrix && r.confusion_classes && r.confusion_classes.length > 0);
+    if (!detResults.length) { c.innerHTML = ''; return; }
+    const sections = detResults.map(r => {
+      const classes = r.confusion_classes;
+      const mat = r.confusion_matrix;
+      const n = classes.length;
+      const labels = [...classes.map(String), 'BG'];
+      const maxVal = Math.max(1, ...mat.flat());
+      const headerCells = labels.map(l => `<th style="min-width:40px;font-size:11px;padding:4px 6px;">${l}</th>`).join('');
+      const rows = mat.map((row, ri) => {
+        const cells = row.map((v, ci) => {
+          const alpha = v > 0 ? (0.15 + 0.75 * v / maxVal).toFixed(2) : '0';
+          const isTP = ri < n && ci < n && ri === ci;
+          const bg = v > 0 ? (isTP ? `rgba(34,197,94,${alpha})` : `rgba(239,68,68,${alpha})`) : 'transparent';
+          return `<td style="text-align:center;padding:4px 6px;font-size:12px;background:${bg};">${v||''}</td>`;
+        }).join('');
+        return `<tr><td style="font-size:11px;padding:4px 6px;font-weight:600;">${labels[ri]}</td>${cells}</tr>`;
+      }).join('');
+      return `<div class="card" style="padding:1.5rem;margin-top:1rem;overflow-x:auto;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">Confusion Matrix — ${r.name}</h3>
+        <table style="border-collapse:collapse;"><thead><tr><th style="padding:4px 6px;"></th>${headerCells}</tr></thead><tbody>${rows}</tbody></table>
+        <div class="text-secondary" style="margin-top:0.5rem;font-size:11px;">Rows = GT class, Cols = predicted class. BG = background (FN/FP).</div>
+      </div>`;
+    }).join('');
+    c.innerHTML = sections;
   },
   stop() {
     this._polling = false;

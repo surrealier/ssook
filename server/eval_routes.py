@@ -17,6 +17,80 @@ from server.utils import imread, glob_images
 
 router = APIRouter()
 
+
+def _build_confusion_matrix(gt_data, pred_data, iou_thres=0.5):
+    """Build class confusion matrix from GT and prediction dicts.
+
+    Returns (matrix, classes) where matrix is (n+1)x(n+1) with the last
+    index representing background (FP/FN). Rows=GT, cols=predicted.
+    """
+    all_cls: set = set()
+    for boxes in list(gt_data.values()) + list(pred_data.values()):
+        for b in boxes:
+            all_cls.add(b[0])
+    classes = sorted(all_cls)
+    if not classes:
+        return [], []
+    n = len(classes)
+    cls_idx = {c: i for i, c in enumerate(classes)}
+    bg = n
+    size = n + 1
+    matrix = [[0] * size for _ in range(size)]
+
+    def _iou(a, b):
+        x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        ua = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
+        return inter / (ua + 1e-9)
+
+    def _to_xyxy(b):
+        cx, cy, w, h = b[1], b[2], b[3], b[4]
+        return (cx - w/2, cy - h/2, cx + w/2, cy + h/2)
+
+    stems = set(list(gt_data.keys()) + list(pred_data.keys()))
+    for stem in stems:
+        gts = gt_data.get(stem, [])
+        preds = pred_data.get(stem, [])
+        if not gts and not preds:
+            continue
+        gt_boxes = [_to_xyxy(b) for b in gts]
+        gt_cls = [b[0] for b in gts]
+        pred_boxes = [_to_xyxy(b) for b in preds]
+        pred_cls = [b[0] for b in preds]
+        scores = [b[5] if len(b) > 5 else 0.0 for b in preds]
+        order = sorted(range(len(preds)), key=lambda i: -scores[i])
+
+        gt_matched = [False] * len(gts)
+        pred_matched = [False] * len(preds)
+
+        for pi in order:
+            best_iou = 0.0
+            best_j = -1
+            for j, gb in enumerate(gt_boxes):
+                if gt_matched[j]:
+                    continue
+                iou = _iou(pred_boxes[pi], gb)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_j = j
+            if best_iou >= iou_thres and best_j >= 0:
+                gt_matched[best_j] = True
+                pred_matched[pi] = True
+                gi = cls_idx.get(gt_cls[best_j], bg)
+                pi2 = cls_idx.get(pred_cls[pi], bg)
+                matrix[gi][pi2] += 1
+
+        for j, matched in enumerate(gt_matched):
+            if not matched:
+                matrix[cls_idx.get(gt_cls[j], bg)][bg] += 1
+        for pi, matched in enumerate(pred_matched):
+            if not matched:
+                matrix[bg][cls_idx.get(pred_cls[pi], bg)] += 1
+
+    return matrix, classes
+
+
 # ── Evaluation async API (#6, #7) ──────────────────────
 
 
@@ -170,6 +244,7 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                         "f1": round(v.get("f1", 0), 6),
                         "tp": v.get("tp", 0), "fp": v.get("fp", 0), "fn": v.get("fn", 0),
                     }
+                conf_matrix, conf_classes = _build_confusion_matrix(gt_eval, pred_data)
                 eval_state["results"].append({
                     "name": name,
                     "map50": round(ov.get("ap", 0) * 100, 4),
@@ -178,6 +253,8 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                     "recall": round(ov.get("recall", 0) * 100, 4),
                     "f1": round(ov.get("f1", 0) * 100, 4),
                     "detail": detail,
+                    "confusion_matrix": conf_matrix,
+                    "confusion_classes": conf_classes,
                 })
 
             _img_cache.clear()
