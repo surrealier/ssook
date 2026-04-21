@@ -140,3 +140,5 @@
   - `explorer_state["data"]` persists after load; export endpoint reads directly from it
   - Use `fastapi.responses.Response` with `Content-Disposition` header for CSV downloads
 ---
+
+<!-- ralph iteration 15 @ 2026-04-21 23:37:40 -->
