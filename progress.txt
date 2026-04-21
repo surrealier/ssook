@@ -79,3 +79,16 @@
   - The Stop button (`bench-stop`) already existed in the UI — only needed to wire up the server call
   - `run_benchmark_core` already accepts `is_stopped` callable; the fix was passing a real check instead of `lambda: False`
 ---
+
+<!-- ralph iteration 8 @ 2026-04-21 23:27:56 -->
+
+## 2026-04-21 - US-007
+- Added button text change as visual indicator when benchmark/eval tasks run
+- `bench-run` button text changes to `t('bench.running')` on start, reverts to `t('bench.run')` on done/stop/error
+- `eval-run-btn` button text changes to `t('eval.running')` on start, reverts to `t('eval.run')` on done/stop/error
+- Files changed: web/js/tabs.js
+- **Learnings for future iterations:**
+  - Both tabs already had `disabled = true` logic; what was missing was the button text change as visual indicator
+  - Must update textContent in ALL exit paths: `_poll()` completion, `stop()`, and error catch blocks
+  - `t('eval.running')` = "Running..." (line 267 i18n.js), `t('bench.running')` = "Benchmark running..."
+---

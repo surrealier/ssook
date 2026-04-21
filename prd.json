@@ -50,7 +50,7 @@
       "title": "Disable Run buttons during active operations to prevent double-execution",
       "description": "Multiple tabs (eval, benchmark, analysis tools) allow the user to click Run multiple times, which can spawn duplicate background tasks. For the evaluation tab and benchmark tab in web/js/tabs.js: disable the Run button when a task starts (set disabled=true and add a visual indicator like 'Running...') and re-enable it when polling detects the task is complete or errored. Look at how the run() and poll() methods work in these tabs and add button state management. Do NOT modify more than 2-3 tabs to keep the scope manageable. Run pytest.",
       "priority": 7,
-      "passes": false
+      "passes": true
     },
     {
       "id": "US-008",
