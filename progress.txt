@@ -26,3 +26,16 @@
   - `/api/evaluation/status` already existed — no need to add a new one
   - TaskState (in server/state.py) is a dict subclass with the same default fields; removing the re-declaration was sufficient
 ---
+
+<!-- ralph iteration 3 @ 2026-04-21 23:23:04 -->
+
+## 2026-04-21 - US-003
+- Replaced MD5 deduplication in dataset merger with perceptual dHash
+- `compute_dhash`: reads image with cv2, resizes to 9x8 grayscale, computes row diffs, encodes as 64-bit int
+- `hamming`: counts differing bits between two hashes; images within `dhash_threshold` bits are considered duplicates
+- Files changed: server/data_routes.py
+- **Learnings for future iterations:**
+  - dHash needs a 9-wide image (9 columns) to produce 8 column-pair differences per row → 8×8 = 64 bits
+  - Hamming comparison is O(n) per image against all seen hashes; acceptable for typical dataset sizes
+  - cv2.IMREAD_GRAYSCALE + cv2.resize is sufficient — no imagehash library needed
+---

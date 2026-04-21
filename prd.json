@@ -22,7 +22,7 @@
       "title": "Fix data_routes.py dataset merger using MD5 instead of dHash",
       "description": "server/data_routes.py merger endpoint (around line 470-490) accepts a dhash_threshold parameter but internally uses hashlib.md5 for deduplication instead of perceptual hashing. This means dhash_threshold is silently ignored and visually similar but not byte-identical images are not detected as duplicates. Replace the MD5 approach with a proper dHash (difference hash) implementation: compute an 8x8 greyscale image, compute row differences, flatten to a 64-bit hash, then compare using Hamming distance <= dhash_threshold. The implementation should use only opencv and numpy (no imagehash library). Run pytest.",
       "priority": 3,
-      "passes": false
+      "passes": true
     },
     {
       "id": "US-004",
