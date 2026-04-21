@@ -1,0 +1,144 @@
+## Codebase Patterns
+
+- **pytest environment**: Use `/c/Users/82106/anaconda3/envs/torch251/python.exe -m pytest tests/ -v` — the base anaconda env lacks cv2, and the torch251 env lacked pytest initially (installed it). The torch251 env is the correct one for this project.
+- **analysis_routes.py imports**: File uses `base64` and `pathlib.Path` throughout but had neither imported — pattern to check when adding new code to this file.
+
+---
+
+<!-- ralph iteration 1 @ 2026-04-21 23:19:38 -->
+
+## 2026-04-21 - US-001
+- Added `import base64` and `from pathlib import Path` to server/analysis_routes.py import block
+- Files changed: server/analysis_routes.py
+- **Learnings for future iterations:**
+  - The torch251 conda env is the correct pytest environment
+  - analysis_routes.py used base64 at lines 124 and 486, Path at line 394 without importing them
+---
+
+<!-- ralph iteration 2 @ 2026-04-21 23:21:35 -->
+
+## 2026-04-21 - US-002
+- Removed local `eval_state = {...}` re-declaration in eval_routes.py that shadowed the imported TaskState
+- Imported `all_states` from server.state
+- Added `GET /api/eval/stop` endpoint that sets `all_states["eval"]["running"] = False`
+- Files changed: server/eval_routes.py
+- **Learnings for future iterations:**
+  - `/api/evaluation/status` already existed — no need to add a new one
+  - TaskState (in server/state.py) is a dict subclass with the same default fields; removing the re-declaration was sufficient
+---
+
+<!-- ralph iteration 3 @ 2026-04-21 23:23:04 -->
+
+## 2026-04-21 - US-003
+- Replaced MD5 deduplication in dataset merger with perceptual dHash
+- `compute_dhash`: reads image with cv2, resizes to 9x8 grayscale, computes row diffs, encodes as 64-bit int
+- `hamming`: counts differing bits between two hashes; images within `dhash_threshold` bits are considered duplicates
+- Files changed: server/data_routes.py
+- **Learnings for future iterations:**
+  - dHash needs a 9-wide image (9 columns) to produce 8 column-pair differences per row → 8×8 = 64 bits
+  - Hamming comparison is O(n) per image against all seen hashes; acceptable for typical dataset sizes
+  - cv2.IMREAD_GRAYSCALE + cv2.resize is sufficient — no imagehash library needed
+---
+
+<!-- ralph iteration 4 @ 2026-04-21 23:24:09 -->
+
+## 2026-04-21 - US-004
+- Added `id="leaky-threshold"` to the threshold number input in tabs-extra.js renderHTML
+- Changed `threshold: 10` hardcode to read `+document.getElementById('leaky-threshold').value || 10`
+- Files changed: web/js/tabs-extra.js
+- **Learnings for future iterations:**
+  - Frontend-only fixes (no server changes) still need pytest to pass — all 37 passed
+  - The leaky split UI renders via a template literal; ids must be set there to be readable at run time
+---
+
+<!-- ralph iteration 5 @ 2026-04-21 23:25:06 -->
+
+## 2026-04-21 - US-005
+- Added `GET /api/benchmark/export-csv` endpoint to server/benchmark_routes.py
+- Returns bench_state['results'] as a CSV download using Python's csv module
+- The Export button in tabs.js already existed (calls `window.open('/api/benchmark/export-csv', '_blank')`)
+- Files changed: server/benchmark_routes.py
+- **Learnings for future iterations:**
+  - The benchmark frontend Export button was already wired up in tabs.js — only the backend was missing
+  - bench_state result fields: name, codec, provider, fps, avg, decode_ms, pre_ms, infer_ms, post_ms, min, max, std, p50, p95, p99, cpu_pct, ram_mb
+  - Use `fastapi.responses.Response` (not StreamingResponse) for simple in-memory CSV — simpler and sufficient
+---
+
+<!-- ralph iteration 6 @ 2026-04-21 -->
+
+<!-- ralph iteration 6 @ 2026-04-21 23:26:35 -->
+
+<!-- ralph iteration 7 @ 2026-04-21 23:26:47 -->
+
+## 2026-04-21 - US-006
+- Added `GET /api/benchmark/stop` endpoint to server/benchmark_routes.py that sets `bench_state['running'] = False`
+- Changed `is_stopped` lambda in `_run()` from `lambda: False` to `lambda: not bench_state['running']` so the core loop actually exits when stopped
+- Updated `Tabs.benchmark.stop()` in tabs.js to call `/api/benchmark/stop` before resetting UI state
+- Files changed: server/benchmark_routes.py, web/js/tabs.js
+- **Learnings for future iterations:**
+  - The Stop button (`bench-stop`) already existed in the UI — only needed to wire up the server call
+  - `run_benchmark_core` already accepts `is_stopped` callable; the fix was passing a real check instead of `lambda: False`
+---
+
+<!-- ralph iteration 8 @ 2026-04-21 23:27:56 -->
+
+## 2026-04-21 - US-007
+- Added button text change as visual indicator when benchmark/eval tasks run
+- `bench-run` button text changes to `t('bench.running')` on start, reverts to `t('bench.run')` on done/stop/error
+- `eval-run-btn` button text changes to `t('eval.running')` on start, reverts to `t('eval.run')` on done/stop/error
+- Files changed: web/js/tabs.js
+- **Learnings for future iterations:**
+  - Both tabs already had `disabled = true` logic; what was missing was the button text change as visual indicator
+  - Must update textContent in ALL exit paths: `_poll()` completion, `stop()`, and error catch blocks
+  - `t('eval.running')` = "Running..." (line 267 i18n.js), `t('bench.running')` = "Benchmark running..."
+---
+
+<!-- ralph iteration 9 @ 2026-04-21 23:30:52 -->
+
+<!-- ralph iteration 10 @ 2026-04-21 23:31:07 -->
+
+## 2026-04-21 - US-008
+- Added `console.warn('poll error:', e)` to benchmark `_poll()` catch at line 1097
+- Added `console.warn('poll error:', e)` to eval `_poll()` catch at line 1569
+- Both catch blocks now also update the respective status DOM element with the error message
+- Files changed: web/js/tabs.js
+- **Learnings for future iterations:**
+  - Benchmark and eval _poll() catch blocks were not truly empty — they retried after 1s — but silently dropped the error
+  - bench-status and eval-status elements are the correct status areas for each tab
+---
+
+<!-- ralph iteration 11 @ 2026-04-21 23:32:25 -->
+
+<!-- ralph iteration 12 @ 2026-04-21 23:32:37 -->
+
+<!-- ralph iteration 13 @ 2026-04-21 23:32:46 -->
+
+## 2026-04-21 - US-009
+- Added `_build_confusion_matrix()` helper to server/eval_routes.py (module-level)
+- Computes (n_classes+1)×(n_classes+1) matrix via greedy IoU matching (threshold 0.5); last index = background (FP/FN)
+- Added `confusion_matrix` and `confusion_classes` fields to each detection result in eval_state
+- Added `eval-confusion-container` div to eval tab HTML in tabs.js
+- Added `_renderConfusion()` method: renders per-model HTML tables with green (TP diagonal) / red (off-diagonal) color coding
+- `_renderResults()` calls `_renderConfusion()` automatically for detection task
+- Files changed: server/eval_routes.py, web/js/tabs.js
+- **Learnings for future iterations:**
+  - Confusion matrix rows = GT class, columns = predicted class; last row/col = background (FP/FN)
+  - Color-coded via rgba with alpha proportional to cell value / max value
+  - Private helpers from core.evaluation (_compute_iou_matrix) were not imported; used inline _iou() instead
+---
+
+<!-- ralph iteration 14 @ 2026-04-21 23:35:37 -->
+
+## 2026-04-21 - US-010
+- Made Dataset Explorer limit configurable via `limit` parameter (default 5000, max 50000) in `/api/data/explorer` POST
+- Added `GET /api/data/explorer/export-stats` endpoint returning CSV: summary rows (total, scanned, with/without labels) + per-class box and image counts
+- Added Limit number input (id=`exp-limit`) in Explorer load card; value passed to API call
+- Added "Export Stats CSV" button in Explorer stats panel (calls `window.open` on export endpoint)
+- Files changed: server/data_routes.py, web/js/tabs.js
+- **Learnings for future iterations:**
+  - Explorer tab is in tabs.js (not tabs-extra.js) — the story description had the wrong file
+  - `explorer_state["data"]` persists after load; export endpoint reads directly from it
+  - Use `fastapi.responses.Response` with `Content-Disposition` header for CSV downloads
+---
+
+<!-- ralph iteration 15 @ 2026-04-21 23:37:40 -->

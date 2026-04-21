@@ -1,11 +1,13 @@
 """/api/benchmark/* 라우터."""
+import csv
+import io
 import os
 import time as _time
 
 import cv2
 import numpy as np
 from fastapi import APIRouter
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from core.benchmark_runner import BenchmarkConfig, run_benchmark_core
@@ -136,7 +138,7 @@ async def run_benchmark(req: BenchmarkRequest):
             bench_state["results"].append({"error": msg})
 
         try:
-            run_benchmark_core(configs, on_progress, on_result, on_error, lambda: False)
+            run_benchmark_core(configs, on_progress, on_result, on_error, lambda: not bench_state["running"])
         except Exception as e:
             bench_state["msg"] = f"Error: {e}"
         finally:
@@ -154,6 +156,12 @@ async def run_benchmark(req: BenchmarkRequest):
     return {"ok": True, "msg": "Benchmark started"}
 
 
+@router.get("/api/benchmark/stop")
+async def benchmark_stop():
+    bench_state["running"] = False
+    return {"ok": True}
+
+
 @router.get("/api/benchmark/status")
 async def benchmark_status():
     return {
@@ -163,4 +171,44 @@ async def benchmark_status():
         "msg": bench_state["msg"],
         "results": bench_state["results"],
     }
+
+
+@router.get("/api/benchmark/export-csv")
+async def benchmark_export_csv():
+    results = bench_state.get("results", [])
+    fieldnames = ["model_name", "codec", "provider", "fps_mean", "latency_ms_mean",
+                  "decode_ms", "preprocess_ms", "inference_ms", "postprocess_ms",
+                  "fps_p50", "fps_p95", "fps_p99", "min_ms", "max_ms", "std_ms",
+                  "cpu_pct", "ram_mb"]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for r in results:
+        if "error" in r:
+            continue
+        writer.writerow({
+            "model_name": r.get("name", ""),
+            "codec": r.get("codec", ""),
+            "provider": r.get("provider", ""),
+            "fps_mean": r.get("fps", ""),
+            "latency_ms_mean": r.get("avg", ""),
+            "decode_ms": r.get("decode_ms", ""),
+            "preprocess_ms": r.get("pre_ms", ""),
+            "inference_ms": r.get("infer_ms", ""),
+            "postprocess_ms": r.get("post_ms", ""),
+            "fps_p50": r.get("p50", ""),
+            "fps_p95": r.get("p95", ""),
+            "fps_p99": r.get("p99", ""),
+            "min_ms": r.get("min", ""),
+            "max_ms": r.get("max", ""),
+            "std_ms": r.get("std", ""),
+            "cpu_pct": r.get("cpu_pct", ""),
+            "ram_mb": r.get("ram_mb", ""),
+        })
+    content = buf.getvalue()
+    return Response(
+        content=content,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=benchmark_results.csv"},
+    )
 

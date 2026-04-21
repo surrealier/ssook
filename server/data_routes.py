@@ -1,4 +1,6 @@
 """/api/data/* 라우터."""
+import csv
+import io
 import os
 import random
 import shutil
@@ -7,6 +9,7 @@ from typing import Optional
 import cv2
 import numpy as np
 from fastapi import APIRouter
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from server.state import explorer_state, splitter_state, converter_state, remapper_state, merger_state, sampler_state, executor
@@ -21,6 +24,7 @@ explorer_state = {"running": False, "progress": 0, "total": 0, "msg": "", "data"
 async def data_explorer(req: dict):
     img_dir = req.get("img_dir", "")
     lbl_dir = req.get("label_dir", "")
+    limit = min(int(req.get("limit", 5000)), 50000)
     if not img_dir or not os.path.isdir(img_dir):
         return {"error": "Invalid image directory"}
     if explorer_state["running"]:
@@ -38,7 +42,7 @@ async def data_explorer(req: dict):
             box_sizes = []  # (w, h) normalized
             aspect_ratios = []
             box_aspect_ratios = []
-            for i, fp in enumerate(imgs[:5000]):
+            for i, fp in enumerate(imgs[:limit]):
                 explorer_state["progress"] = i + 1
                 stem = os.path.splitext(os.path.basename(fp))[0]
                 txt = os.path.join(lbl_dir, stem + ".txt") if lbl_dir else ""
@@ -93,6 +97,35 @@ async def explorer_status():
     elif s["running"]:
         s.pop("data", None)
     return s
+
+@router.get("/api/data/explorer/export-stats")
+async def explorer_export_stats():
+    data = explorer_state.get("data")
+    if not data:
+        return Response(content="No data loaded", media_type="text/plain", status_code=400)
+    files = data.get("files", [])
+    class_counts = data.get("class_counts", {})
+    img_class_counts = data.get("img_class_counts", {})
+    total = data.get("total", len(files))
+    images_with_labels = sum(1 for f in files if f.get("boxes", 0) > 0)
+    images_without_labels = len(files) - images_with_labels
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["metric", "value"])
+    writer.writerow(["total_images", total])
+    writer.writerow(["images_scanned", len(files)])
+    writer.writerow(["images_with_labels", images_with_labels])
+    writer.writerow(["images_without_labels", images_without_labels])
+    writer.writerow([])
+    writer.writerow(["class_id", "box_count", "image_count"])
+    all_classes = sorted(set(list(class_counts.keys()) + list(img_class_counts.keys())), key=lambda x: int(x))
+    for cls in all_classes:
+        writer.writerow([cls, class_counts.get(cls, 0), img_class_counts.get(cls, 0)])
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=explorer_stats.csv"}
+    )
 
 @router.post("/api/data/explorer/preview")
 async def explorer_preview(req: dict):
@@ -467,25 +500,45 @@ async def data_merger(req: MergerRequest):
 
     def _run():
         try:
-            import shutil, hashlib
+            import shutil
+            import cv2
+            import numpy as np
+
+            def compute_dhash(path: str) -> int | None:
+                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    return None
+                resized = cv2.resize(img, (9, 8), interpolation=cv2.INTER_AREA)
+                diff = resized[:, 1:] > resized[:, :-1]
+                bits = diff.flatten()
+                h = 0
+                for b in bits:
+                    h = (h << 1) | int(b)
+                return h
+
+            def hamming(a: int, b: int) -> int:
+                return bin(a ^ b).count("1")
+
             os.makedirs(os.path.join(req.output_dir, "images"), exist_ok=True)
             os.makedirs(os.path.join(req.output_dir, "labels"), exist_ok=True)
             all_imgs = []
             for d in req.datasets:
                 all_imgs.extend(glob_images(d, recursive=req.recursive))
             merger_state["total"] = len(all_imgs)
-            seen_hashes = set()
+            seen_hashes: list[int] = []
             copied = 0
             dupes = 0
             for i, fp in enumerate(all_imgs):
-                # Simple hash-based dedup
-                with open(fp, "rb") as f:
-                    h = hashlib.md5(f.read(8192)).hexdigest()
-                if h in seen_hashes:
+                h = compute_dhash(fp)
+                if h is None:
+                    merger_state["progress"] = i + 1
+                    continue
+                is_dupe = any(hamming(h, s) <= req.dhash_threshold for s in seen_hashes)
+                if is_dupe:
                     dupes += 1
                     merger_state["progress"] = i + 1
                     continue
-                seen_hashes.add(h)
+                seen_hashes.append(h)
                 dst = os.path.join(req.output_dir, "images", os.path.basename(fp))
                 if os.path.exists(dst):
                     name, ext = os.path.splitext(os.path.basename(fp))

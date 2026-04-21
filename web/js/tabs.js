@@ -1044,6 +1044,7 @@ Tabs.benchmark = {
     const models = getSlotModels('bench-slots');
     if (!models.length) { App.setStatus(t('bench.no_models')); return; }
     document.getElementById('bench-run').disabled = true;
+    document.getElementById('bench-run').textContent = t('bench.running');
     document.getElementById('bench-stop').disabled = false;
     document.getElementById('bench-status').textContent = t('bench.running');
     document.getElementById('bench-progress').style.width = '0%';
@@ -1062,7 +1063,7 @@ Tabs.benchmark = {
       // Poll for results
       this._polling = true;
       this._poll();
-    } catch(e) { App.setStatus(`Error: ${e.message}`); document.getElementById('bench-run').disabled = false; }
+    } catch(e) { App.setStatus(`Error: ${e.message}`); document.getElementById('bench-run').disabled = false; document.getElementById('bench-run').textContent = t('bench.run'); }
   },
   _polling: false,
   async _poll() {
@@ -1087,17 +1088,20 @@ Tabs.benchmark = {
       } else {
         this._polling = false;
         document.getElementById('bench-run').disabled = false;
+        document.getElementById('bench-run').textContent = t('bench.run');
         document.getElementById('bench-stop').disabled = true;
         document.getElementById('bench-progress').style.width = '100%';
         const _bpt2 = document.getElementById('bench-progress-text'); if (_bpt2) _bpt2.textContent = '100%';
         App.setStatus(t('bench.complete'));
       }
-    } catch(e) { setTimeout(() => this._poll(), 1000); }
+    } catch(e) { console.warn('poll error:', e); document.getElementById('bench-status').textContent = 'Poll error: ' + e.message; setTimeout(() => this._poll(), 1000); }
   },
   stop() {
     this._polling = false;
+    API.get('/api/benchmark/stop').catch(() => {});
     App.setStatus(t('stopped'));
     document.getElementById('bench-run').disabled = false;
+    document.getElementById('bench-run').textContent = t('bench.run');
     document.getElementById('bench-stop').disabled = true;
   },
   exportResults() {
@@ -1188,6 +1192,7 @@ Tabs.evaluation = {
           <tbody id="eval-results"><tr><td colspan="7" class="text-secondary" style="text-align:center;padding:2rem;">${t('eval.run_hint')}</td></tr></tbody></table></div>
         </div>
         <div id="eval-detail-container"></div>
+        <div id="eval-confusion-container"></div>
       </div>`;
   },
   _onTaskChange() {
@@ -1285,6 +1290,7 @@ Tabs.evaluation = {
       if (!result) return; // 취소
 
       document.getElementById('eval-run-btn').disabled = true;
+      document.getElementById('eval-run-btn').textContent = t('eval.running');
       document.getElementById('eval-stop-btn').disabled = false;
       document.getElementById('eval-status').textContent = t('eval.running');
       document.getElementById('eval-prog').style.width = '0%';
@@ -1302,10 +1308,10 @@ Tabs.evaluation = {
         query_dir: document.getElementById('eval-query-dir')?.value || '',
         top_k: parseInt(document.getElementById('eval-topk')?.value || '5'),
       });
-      if (r.error) { App.setStatus('Error: ' + r.error); document.getElementById('eval-run-btn').disabled = false; return; }
+      if (r.error) { App.setStatus('Error: ' + r.error); document.getElementById('eval-run-btn').disabled = false; document.getElementById('eval-run-btn').textContent = t('eval.run'); return; }
       this._polling = true;
       this._poll();
-    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); document.getElementById('eval-run-btn').disabled = false; }
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); document.getElementById('eval-run-btn').disabled = false; document.getElementById('eval-run-btn').textContent = t('eval.run'); }
   },
   _savedMappings: {},
   _savedMappedOnly: true,
@@ -1553,6 +1559,7 @@ Tabs.evaluation = {
       else {
         this._polling = false;
         document.getElementById('eval-run-btn').disabled = false;
+        document.getElementById('eval-run-btn').textContent = t('eval.run');
         document.getElementById('eval-stop-btn').disabled = true;
         document.getElementById('eval-prog').style.width = '100%';
         const _ept2 = document.getElementById('eval-prog-text'); if (_ept2) _ept2.textContent = '100%';
@@ -1560,7 +1567,7 @@ Tabs.evaluation = {
         this._cachedHTML = document.getElementById('page-body').innerHTML;
         App.setStatus(t('eval.complete'));
       }
-    } catch(e) { setTimeout(() => this._poll(), 1000); }
+    } catch(e) { console.warn('poll error:', e); const _est = document.getElementById('eval-status'); if (_est) _est.textContent = 'Poll error: ' + e.message; setTimeout(() => this._poll(), 1000); }
   },
   _renderResults(results) {
     const tb = document.getElementById('eval-results');
@@ -1581,10 +1588,41 @@ Tabs.evaluation = {
       }
       return '<tr><td>'+(x.name||'')+'</td><td>'+(x.map50?.toFixed(4)||0)+'%</td><td>'+(x.map5095?.toFixed(4)||0)+'%</td><td>'+(x.precision?.toFixed(4)||0)+'%</td><td>'+(x.recall?.toFixed(4)||0)+'%</td><td>'+(x.f1?.toFixed(4)||0)+'%</td><td>'+detBtn+'</td></tr>';
     }).join('');
+    if (task === 'detection') this._renderConfusion(results);
+  },
+  _renderConfusion(results) {
+    const c = document.getElementById('eval-confusion-container');
+    if (!c) return;
+    const detResults = results.filter(r => r.confusion_matrix && r.confusion_classes && r.confusion_classes.length > 0);
+    if (!detResults.length) { c.innerHTML = ''; return; }
+    const sections = detResults.map(r => {
+      const classes = r.confusion_classes;
+      const mat = r.confusion_matrix;
+      const n = classes.length;
+      const labels = [...classes.map(String), 'BG'];
+      const maxVal = Math.max(1, ...mat.flat());
+      const headerCells = labels.map(l => `<th style="min-width:40px;font-size:11px;padding:4px 6px;">${l}</th>`).join('');
+      const rows = mat.map((row, ri) => {
+        const cells = row.map((v, ci) => {
+          const alpha = v > 0 ? (0.15 + 0.75 * v / maxVal).toFixed(2) : '0';
+          const isTP = ri < n && ci < n && ri === ci;
+          const bg = v > 0 ? (isTP ? `rgba(34,197,94,${alpha})` : `rgba(239,68,68,${alpha})`) : 'transparent';
+          return `<td style="text-align:center;padding:4px 6px;font-size:12px;background:${bg};">${v||''}</td>`;
+        }).join('');
+        return `<tr><td style="font-size:11px;padding:4px 6px;font-weight:600;">${labels[ri]}</td>${cells}</tr>`;
+      }).join('');
+      return `<div class="card" style="padding:1.5rem;margin-top:1rem;overflow-x:auto;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">Confusion Matrix — ${r.name}</h3>
+        <table style="border-collapse:collapse;"><thead><tr><th style="padding:4px 6px;"></th>${headerCells}</tr></thead><tbody>${rows}</tbody></table>
+        <div class="text-secondary" style="margin-top:0.5rem;font-size:11px;">Rows = GT class, Cols = predicted class. BG = background (FN/FP).</div>
+      </div>`;
+    }).join('');
+    c.innerHTML = sections;
   },
   stop() {
     this._polling = false;
     document.getElementById('eval-run-btn').disabled = false;
+    document.getElementById('eval-run-btn').textContent = t('eval.run');
     document.getElementById('eval-stop-btn').disabled = true;
   },
   showDetail(idx) {
@@ -1681,9 +1719,13 @@ Tabs.explorer = {
     return `
       <div style="display:flex;flex-direction:column;gap:1.5rem;">
         <div class="card" style="padding:1.5rem;">
-          <div style="display:grid;grid-template-columns:1fr 1fr auto auto;gap:1rem;align-items:end;">
+          <div style="display:grid;grid-template-columns:1fr 1fr auto auto auto;gap:1rem;align-items:end;">
             ${imgDirInput('exp-img')}
             ${lblDirInput('exp-lbl')}
+            <div class="form-group" style="margin:0;">
+              <label class="form-label">Limit</label>
+              <input type="number" class="form-input input-normal" id="exp-limit" value="5000" min="1" max="50000" style="width:90px;">
+            </div>
             <button class="btn btn-primary" style="height:36px;" onclick="Tabs.explorer.load()">${t('explorer.load')}</button>
           </div>
           <div id="exp-pbar-wrap" style="display:none;margin-top:0.75rem;">
@@ -1726,6 +1768,7 @@ Tabs.explorer = {
             <div class="card-flat" style="padding:1rem;margin-top:0.75rem;">
               <div class="text-label" style="margin-bottom:0.5rem;">${t('explorer.stats')}</div>
               <div id="exp-stats" class="text-secondary">—</div>
+              <button class="btn btn-secondary btn-sm" style="width:100%;margin-top:0.75rem;" onclick="Tabs.explorer._exportStats()">Export Stats CSV</button>
             </div>
           </div>
           <div style="flex:1;">
@@ -1744,7 +1787,8 @@ Tabs.explorer = {
     const pbarWrap = document.getElementById('exp-pbar-wrap');
     if (pbarWrap) pbarWrap.style.display = 'block';
     try {
-      const r = await API.post('/api/data/explorer', { img_dir, label_dir });
+      const limit = Math.min(parseInt(document.getElementById('exp-limit')?.value || '5000', 10), 50000) || 5000;
+      const r = await API.post('/api/data/explorer', { img_dir, label_dir, limit });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       this._pollLoad();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
@@ -1937,6 +1981,9 @@ Tabs.explorer = {
       }).join('')}</div>`;
   },
   _filteredFiles: [],
+  _exportStats() {
+    window.open('/api/data/explorer/export-stats', '_blank');
+  },
   async _preview(idx) {
     const f = this._filteredFiles[idx];
     if (!f) return;

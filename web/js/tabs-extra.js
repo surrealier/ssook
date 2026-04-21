@@ -1126,7 +1126,7 @@ Tabs.leaky = {
           ${dirInput('leak-test', t('splitter.test'))}
           <div class="form-group" style="margin-top:0.75rem;">
             <label class="form-label">${t('leaky.hamming')}</label>
-            <input type="number" class="form-input input-normal" value="10" min="0" max="64">
+            <input type="number" id="leaky-threshold" class="form-input input-normal" value="10" min="0" max="64">
           </div>
           <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.leaky.run()">${t('run')}</button>
           <div style="margin-top:0.5rem;"><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="leak-prog" style="width:0%;height:100%;"></div><span id="leak-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
@@ -1144,7 +1144,8 @@ Tabs.leaky = {
     const test_dir = document.getElementById('leak-test')?.value;
     if (!train_dir && !val_dir) { App.setStatus(t('common.select_dirs')); return; }
     try {
-      const r = await API.post('/api/quality/leaky', { train_dir, val_dir, test_dir, threshold: 10 });
+      const threshold = +document.getElementById('leaky-threshold').value || 10;
+      const r = await API.post('/api/quality/leaky', { train_dir, val_dir, test_dir, threshold });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
