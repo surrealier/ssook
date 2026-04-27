@@ -1666,6 +1666,70 @@ Tabs['calibration'] = {
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('calib.result')}</h3>
         <div id="calib-result-body"></div>
       </div>
+
+      <!-- Pruning Section -->
+      <div class="card" style="padding:1.5rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">🔪 Pruning</h3>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+          <div style="padding:1rem;background:var(--bg-02);border-radius:8px;">
+            <strong>Weight Pruning</strong>
+            <div class="text-secondary" style="font-size:12px;margin:0.25rem 0;">Magnitude-based unstructured pruning</div>
+            <label class="form-label" style="margin-top:0.5rem;">Sparsity: <span id="wp-val">30</span>%</label>
+            <input type="range" min="0" max="90" value="30" style="width:100%;" id="wp-sparsity" oninput="document.getElementById('wp-val').textContent=this.value">
+            <button class="btn btn-secondary btn-sm" style="margin-top:0.5rem;" onclick="Tabs['calibration']._runOpt('weight_pruning',{sparsity_ratio:parseInt(document.getElementById('wp-sparsity').value)/100})">Run</button>
+          </div>
+          <div style="padding:1rem;background:var(--bg-02);border-radius:8px;">
+            <strong>Channel Pruning</strong>
+            <div class="text-secondary" style="font-size:12px;margin:0.25rem 0;">L1-norm structured channel removal</div>
+            <label class="form-label" style="margin-top:0.5rem;">Ratio: <span id="cp-val">25</span>%</label>
+            <input type="range" min="0" max="50" value="25" style="width:100%;" id="cp-ratio" oninput="document.getElementById('cp-val').textContent=this.value">
+            <button class="btn btn-secondary btn-sm" style="margin-top:0.5rem;" onclick="Tabs['calibration']._runOpt('channel_pruning',{pruning_ratio:parseInt(document.getElementById('cp-ratio').value)/100})">Run</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Graph Optimization Section -->
+      <div class="card" style="padding:1.5rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">⚡ Graph Optimization</h3>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem;">
+          <div style="padding:1rem;background:var(--bg-02);border-radius:8px;text-align:center;">
+            <strong>ORT Optimizer</strong>
+            <div class="text-secondary" style="font-size:11px;margin:0.25rem 0;">Op fusion & constant folding</div>
+            <button class="btn btn-secondary btn-sm" style="margin-top:0.5rem;" onclick="Tabs['calibration']._runOpt('ort_graph_optimizer',{level:'all'})">Run</button>
+          </div>
+          <div style="padding:1rem;background:var(--bg-02);border-radius:8px;text-align:center;">
+            <strong>ONNX Simplifier</strong>
+            <div class="text-secondary" style="font-size:11px;margin:0.25rem 0;">Redundant node removal</div>
+            <button class="btn btn-secondary btn-sm" style="margin-top:0.5rem;" onclick="Tabs['calibration']._runOpt('onnx_simplifier',{})">Run</button>
+          </div>
+          <div style="padding:1rem;background:var(--bg-02);border-radius:8px;text-align:center;">
+            <strong>Dead Node Eliminator</strong>
+            <div class="text-secondary" style="font-size:11px;margin:0.25rem 0;">Remove unreachable nodes</div>
+            <button class="btn btn-secondary btn-sm" style="margin-top:0.5rem;" onclick="Tabs['calibration']._runOpt('dead_node_eliminator',{})">Run</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Pipeline Builder -->
+      <div class="card" style="padding:1.5rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">🔗 Pipeline Builder</h3>
+        <div class="text-secondary" style="font-size:12px;margin-bottom:0.75rem;">Chain multiple optimizations sequentially. Order matters.</div>
+        <div id="pipe-steps" style="display:flex;flex-direction:column;gap:0.5rem;margin-bottom:0.75rem;"></div>
+        <div style="display:flex;gap:0.5rem;align-items:center;">
+          <select class="form-input input-normal" id="pipe-add-method" style="flex:1;">
+            <option value="ort_graph_optimizer">ORT Graph Optimizer</option>
+            <option value="dead_node_eliminator">Dead Node Eliminator</option>
+            <option value="onnx_simplifier">ONNX Simplifier</option>
+            <option value="weight_pruning">Weight Pruning (30%)</option>
+            <option value="channel_pruning">Channel Pruning (25%)</option>
+            <option value="dynamic_int8">Dynamic INT8</option>
+            <option value="fp16">FP16 Conversion</option>
+          </select>
+          <button class="btn btn-secondary btn-sm" onclick="Tabs['calibration']._addPipeStep()">+ Add Step</button>
+        </div>
+        <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs['calibration']._runPipeline()">Run Pipeline</button>
+        <div id="pipe-result" style="display:none;margin-top:1rem;"></div>
+      </div>
     </div>`;
   },
   _onMethod() {
@@ -1741,6 +1805,256 @@ Tabs['calibration'] = {
         if (addBtn) { addBtn.click(); setTimeout(() => { const s2 = document.querySelectorAll('.bench-model-input'); if(s2[1]) s2[1].value = outputPath; }, 100); }
       }
     }, 200);
+  },
+  // ── New optimization methods ──
+  _pipeSteps: [],
+  async _runOpt(method, params) {
+    const path = document.getElementById('calib-model')?.value || G.model;
+    if (!path) { App.setStatus(t('select_model')); return; }
+    const r = await API.post('/api/optimize/run', { model_path: path, method, params });
+    if (r.error) { App.setStatus('Error: ' + r.error); return; }
+    App.setStatus(`Running ${method}...`);
+    this._pollOptimize();
+  },
+  _pollOptimize() {
+    if (this._timer) clearInterval(this._timer);
+    this._timer = setInterval(async () => {
+      const s = await API.get('/api/optimize/status');
+      const prog = s.total > 0 ? Math.round(s.progress / s.total * 100) : 0;
+      const el = document.getElementById('calib-prog');
+      if (el) el.style.width = (s.running ? Math.max(prog, 5) : (s.msg === 'Complete' ? 100 : 0)) + '%';
+      const pt = document.getElementById('calib-prog-text');
+      if (pt) pt.textContent = s.running ? prog + '%' : (s.msg === 'Complete' ? '100%' : '');
+      const msg = document.getElementById('calib-msg');
+      if (msg) msg.textContent = s.msg || '';
+      if (!s.running) {
+        clearInterval(this._timer); this._timer = null;
+        if (s.results) {
+          const res = s.results;
+          let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;">';
+          if (res.method) html += `<div><span class="text-secondary">Method</span><br><strong>${res.method}</strong></div>`;
+          if (res.output_path) html += `<div><span class="text-secondary">Output</span><br><strong style="word-break:break-all;font-size:11px;">${res.output_path}</strong></div>`;
+          if (res.original_size_mb !== undefined) html += `<div><span class="text-secondary">Original</span><br><strong>${res.original_size_mb} MB</strong></div>`;
+          if (res.output_size_mb !== undefined) html += `<div><span class="text-secondary">Output</span><br><strong>${res.output_size_mb} MB</strong></div>`;
+          if (res.quantized_size_mb !== undefined) html += `<div><span class="text-secondary">Output</span><br><strong>${res.quantized_size_mb} MB</strong></div>`;
+          if (res.compression_ratio) html += `<div><span class="text-secondary">Ratio</span><br><strong>${res.compression_ratio}x</strong></div>`;
+          if (res.overall_sparsity !== undefined) html += `<div><span class="text-secondary">Sparsity</span><br><strong>${(res.overall_sparsity*100).toFixed(1)}%</strong></div>`;
+          if (res.channels_removed !== undefined) html += `<div><span class="text-secondary">Channels Removed</span><br><strong>${res.channels_removed}</strong></div>`;
+          if (res.nodes_removed !== undefined) html += `<div><span class="text-secondary">Nodes Removed</span><br><strong>${res.nodes_removed}</strong></div>`;
+          // Pipeline steps
+          if (res.steps && res.steps.length) {
+            html += '</div><h4 style="margin-top:1rem;">Pipeline Steps</h4><div style="display:flex;flex-direction:column;gap:0.5rem;">';
+            for (const step of res.steps) {
+              html += `<div style="padding:0.5rem;background:var(--bg-02);border-radius:4px;font-size:12px;">
+                <strong>Step ${step.step}: ${step.optimizer}</strong> — ${step.method || step.optimizer}
+                ${step.output_size_mb !== undefined ? ` → ${step.output_size_mb} MB` : ''}
+                ${step.overall_sparsity !== undefined ? ` (sparsity: ${(step.overall_sparsity*100).toFixed(1)}%)` : ''}
+              </div>`;
+            }
+          }
+          html += '</div>';
+          if (res.output_path || (res.steps && res.steps.length)) {
+            const outPath = res.output_path || '';
+            html += `<button class="btn btn-secondary" style="margin-top:1rem;" onclick="Tabs['calibration']._openInBenchmark('${outPath.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}')">${t('calib.compare_bench')}</button>`;
+          }
+          document.getElementById('calib-result-body').innerHTML = html;
+          document.getElementById('calib-result').style.display = '';
+          App.setStatus('Optimization complete');
+        }
+      }
+    }, 500);
+  },
+  _addPipeStep() {
+    const method = document.getElementById('pipe-add-method').value;
+    const defaultParams = {
+      weight_pruning: { sparsity_ratio: 0.3 },
+      channel_pruning: { pruning_ratio: 0.25 },
+      ort_graph_optimizer: { level: 'all' },
+    };
+    this._pipeSteps.push({ optimizer: method, params: defaultParams[method] || {} });
+    this._renderPipeSteps();
+  },
+  _removePipeStep(idx) {
+    this._pipeSteps.splice(idx, 1);
+    this._renderPipeSteps();
+  },
+  _renderPipeSteps() {
+    const el = document.getElementById('pipe-steps');
+    if (!el) return;
+    if (!this._pipeSteps.length) { el.innerHTML = '<div class="text-secondary" style="font-size:12px;">No steps added yet.</div>'; return; }
+    el.innerHTML = this._pipeSteps.map((s, i) =>
+      `<div style="display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.75rem;background:var(--bg-02);border-radius:6px;">
+        <span style="font-weight:600;color:var(--text-03);min-width:24px;">${i+1}.</span>
+        <span style="flex:1;">${s.optimizer}</span>
+        <button class="btn btn-secondary btn-sm" style="padding:2px 8px;font-size:11px;" onclick="Tabs['calibration']._removePipeStep(${i})">✕</button>
+      </div>`
+    ).join('');
+  },
+  async _runPipeline() {
+    const path = document.getElementById('calib-model')?.value || G.model;
+    if (!path) { App.setStatus(t('select_model')); return; }
+    if (!this._pipeSteps.length) { App.setStatus('Add at least one step'); return; }
+    const r = await API.post('/api/optimize/run', { model_path: path, pipeline: this._pipeSteps });
+    if (r.error) { App.setStatus('Error: ' + r.error); return; }
+    App.setStatus('Running pipeline...');
+    this._pollOptimize();
+  }
+};
+
+/* ── Diagnose Tab ───────────────────────────────────── */
+Tabs['diagnose'] = {
+  title: true,
+  _timer: null,
+  render() {
+    return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
+      <div class="card" style="padding:1.5rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('diag.title')}</h3>
+        ${modelInput('diag-model')}
+        <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs['diagnose'].run()">${t('diag.run')}</button>
+      </div>
+      <div><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="diag-prog" style="width:0%;height:100%;"></div><span id="diag-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
+        <span class="text-secondary" id="diag-msg" style="margin-top:0.25rem;display:block;">${t('ready')}</span></div>
+      <div id="diag-results" style="display:none;"></div>
+    </div>`;
+  },
+  async run() {
+    const path = document.getElementById('diag-model')?.value || G.model;
+    if (!path) { App.setStatus(t('diag.no_model')); return; }
+    const r = await API.post('/api/diagnose/run', { model_path: path, include_charts: true });
+    if (r.error) { App.setStatus('Error: ' + r.error); return; }
+    App.setStatus(t('diag.running'));
+    document.getElementById('diag-results').style.display = 'none';
+    this._poll();
+  },
+  _poll() {
+    if (this._timer) clearInterval(this._timer);
+    this._timer = setInterval(async () => {
+      const s = await API.get('/api/diagnose/status');
+      const prog = s.total > 0 ? Math.round(s.progress / s.total * 100) : 0;
+      const el = document.getElementById('diag-prog');
+      if (el) el.style.width = (s.running ? Math.max(prog, 5) : (s.msg === 'Complete' ? 100 : 0)) + '%';
+      const pt = document.getElementById('diag-prog-text');
+      if (pt) pt.textContent = s.running ? prog + '%' : (s.msg === 'Complete' ? '100%' : '');
+      const msg = document.getElementById('diag-msg');
+      if (msg) msg.textContent = s.msg || '';
+      if (!s.running) {
+        clearInterval(this._timer); this._timer = null;
+        if (s.results && s.results.summary) {
+          this._renderResults(s.results);
+          App.setStatus(t('diag.complete'));
+        } else if (s.msg && s.msg.startsWith('Error')) {
+          App.setStatus(s.msg);
+        }
+      }
+    }, 500);
+  },
+  _renderResults(r) {
+    const container = document.getElementById('diag-results');
+    if (!container) return;
+    const sm = r.summary;
+    const sevColors = { critical: '#ef4444', warning: '#f59e0b', info: '#3b82f6' };
+    const sevIcons = { critical: '🔴', warning: '🟠', info: '🔵' };
+
+    let html = '';
+    // Summary cards
+    html += `<div class="card" style="padding:1.5rem;margin-bottom:1rem;">
+      <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('diag.summary')}</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1rem;">
+        <div style="text-align:center;padding:1rem;background:var(--bg-02);border-radius:8px;">
+          <div style="font-size:2rem;font-weight:700;color:${sm.health_score>=70?'#22c55e':sm.health_score>=40?'#f59e0b':'#ef4444'}">${sm.health_score}</div>
+          <div class="text-secondary" style="font-size:12px;">${t('diag.health_score')}</div>
+        </div>
+        <div style="text-align:center;padding:1rem;background:var(--bg-02);border-radius:8px;">
+          <div style="font-size:1.2rem;font-weight:600;">${sm.file_size_mb} MB</div>
+          <div class="text-secondary" style="font-size:12px;">${t('diag.file_size')}</div>
+        </div>
+        <div style="text-align:center;padding:1rem;background:var(--bg-02);border-radius:8px;">
+          <div style="font-size:1.2rem;font-weight:600;">${(sm.total_params/1e6).toFixed(1)}M</div>
+          <div class="text-secondary" style="font-size:12px;">${t('diag.params')}</div>
+        </div>
+        <div style="text-align:center;padding:1rem;background:var(--bg-02);border-radius:8px;">
+          <div style="font-size:1.2rem;font-weight:600;">${sm.num_nodes}</div>
+          <div class="text-secondary" style="font-size:12px;">${t('diag.nodes')}</div>
+        </div>
+        <div style="text-align:center;padding:1rem;background:var(--bg-02);border-radius:8px;">
+          <div style="font-size:1.2rem;font-weight:600;text-transform:uppercase;">${r.architecture}</div>
+          <div class="text-secondary" style="font-size:12px;">${t('diag.architecture')}</div>
+        </div>
+      </div>
+    </div>`;
+
+    // Findings
+    if (r.findings && r.findings.length) {
+      html += `<div class="card" style="padding:1.5rem;margin-bottom:1rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('diag.findings')}</h3>
+        <div style="display:flex;flex-direction:column;gap:0.5rem;">`;
+      for (const f of r.findings) {
+        html += `<div style="display:flex;align-items:flex-start;gap:0.75rem;padding:0.75rem;background:var(--bg-02);border-radius:6px;border-left:3px solid ${sevColors[f.severity]};">
+          <span style="font-size:16px;">${sevIcons[f.severity]}</span>
+          <div><span style="font-size:11px;text-transform:uppercase;color:${sevColors[f.severity]};font-weight:600;">${f.severity} · ${f.category}</span>
+          <div style="margin-top:2px;color:var(--text-01);font-size:13px;">${f.message}</div></div>
+        </div>`;
+      }
+      html += `</div></div>`;
+    }
+
+    // Charts
+    if (r.charts && !r.charts.error) {
+      html += `<div class="card" style="padding:1.5rem;margin-bottom:1rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('diag.charts')}</h3>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:1rem;">`;
+      for (const [key, src] of Object.entries(r.charts)) {
+        if (src && src.startsWith('data:image')) {
+          html += `<div style="background:var(--bg-02);border-radius:8px;padding:0.5rem;text-align:center;">
+            <img src="${src}" style="max-width:100%;border-radius:4px;" alt="${key}">
+          </div>`;
+        }
+      }
+      html += `</div></div>`;
+    }
+
+    // Recommendations
+    if (r.recommendations && r.recommendations.length) {
+      html += `<div class="card" style="padding:1.5rem;margin-bottom:1rem;">
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('diag.recommendations')}</h3>
+        <div style="display:flex;flex-direction:column;gap:0.75rem;">`;
+      for (let i = 0; i < r.recommendations.length; i++) {
+        const rec = r.recommendations[i];
+        const isExec = rec.executable;
+        const badge = isExec
+          ? `<span style="background:#22c55e22;color:#22c55e;padding:2px 8px;border-radius:4px;font-size:11px;">${t('diag.executable')}</span>`
+          : `<span style="background:#f59e0b22;color:#f59e0b;padding:2px 8px;border-radius:4px;font-size:11px;">${t('diag.future_work')}</span>`;
+        html += `<div style="padding:1rem;background:var(--bg-02);border-radius:8px;border:1px solid var(--border-01);">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+            <div style="display:flex;align-items:center;gap:0.5rem;">
+              <strong style="font-size:14px;">${rec.method}</strong>${badge}
+            </div>
+            ${isExec ? `<button class="btn btn-primary btn-sm" onclick="Tabs['diagnose']._applyRec(${i})">${t('diag.apply')}</button>` : ''}
+          </div>
+          <div style="color:var(--text-02);font-size:13px;margin-bottom:0.25rem;">${rec.reason}</div>
+          <div style="font-size:12px;color:var(--text-03);">${t('diag.expected_impact')}: ${rec.expected_impact}</div>
+          ${!isExec && rec.explanation ? `<div style="margin-top:0.5rem;padding:0.5rem;background:var(--bg-01);border-radius:4px;font-size:12px;color:var(--text-03);">${rec.explanation}</div>` : ''}
+        </div>`;
+      }
+      html += `</div></div>`;
+    }
+
+    container.innerHTML = html;
+    container.style.display = '';
+  },
+  async _applyRec(idx) {
+    const path = document.getElementById('diag-model')?.value || G.model;
+    if (!path) return;
+    const r = await API.post('/api/diagnose/apply-recommendation', {
+      model_path: path, recommendation_index: idx
+    });
+    if (r.error) { App.setStatus('Error: ' + r.error); return; }
+    App.setStatus('Optimization started — check Calibration tab for progress');
+    App.switchTab('calibration');
+    // Poll optimization status in calibration tab
+    if (Tabs['calibration'] && Tabs['calibration']._poll) {
+      Tabs['calibration']._pollOptimize();
+    }
   }
 };
 
