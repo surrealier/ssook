@@ -107,8 +107,9 @@ from server.data_routes import router as data_router
 from server.quality_routes import router as quality_router
 from server.system_routes import router as system_router
 from server.extra_routes import router as extra_router
+from server.optimization_routes import router as optimization_router
 
 for r in [config_router, model_router, viewer_router, eval_router,
           analysis_router, benchmark_router, data_router, quality_router,
-          system_router, extra_router]:
+          system_router, extra_router, optimization_router]:
     app.include_router(r)
