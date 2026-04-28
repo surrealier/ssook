@@ -48,9 +48,18 @@ async def heartbeat():
 
 @app.post("/api/shutdown")
 async def shutdown():
-    """Gracefully shut down the server."""
-    import threading
-    threading.Timer(0.5, lambda: os._exit(0)).start()
+    """Gracefully shut down the server and all child processes."""
+    import threading, signal
+    def _kill():
+        try:
+            import psutil
+            parent = psutil.Process(os.getpid())
+            for child in parent.children(recursive=True):
+                child.kill()
+        except Exception:
+            pass
+        os._exit(0)
+    threading.Timer(0.5, _kill).start()
     return {"ok": True}
 
 
