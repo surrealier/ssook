@@ -17,6 +17,8 @@ from server.utils import imread, glob_images
 
 router = APIRouter()
 
+_EVAL_HISTORY_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "eval_history")
+
 
 def _build_confusion_matrix(gt_data, pred_data, iou_thres=0.5):
     """Build class confusion matrix from GT and prediction dicts.
@@ -118,6 +120,20 @@ async def run_evaluation_async(req: EvalAsyncRequest):
         return {"error": "Evaluation already running"}
 
     eval_state.update(running=True, progress=0, total=1, msg="Starting...", model_name="", results=[])
+
+    def _auto_save_results():
+        """Auto-save eval results on completion."""
+        import json, datetime
+        if not eval_state["results"]:
+            return
+        os.makedirs(_EVAL_HISTORY_DIR, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(_EVAL_HISTORY_DIR, f"eval_{ts}.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"results": eval_state["results"], "msg": eval_state["msg"]}, f, ensure_ascii=False)
+        except Exception:
+            pass
 
     def _run():
         import glob
@@ -259,6 +275,7 @@ async def run_evaluation_async(req: EvalAsyncRequest):
 
             _img_cache.clear()
             eval_state.update(running=False, msg="Complete")
+            _auto_save_results()
         except Exception as e:
             eval_state.update(running=False, msg=f"Error: {e}")
 
@@ -379,16 +396,35 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                     done += 1; eval_state.update(progress=done, msg=f"{name}: {done}/{total_work}")
 
                 if agg_pred:
-                    all_pred = np.concatenate([m.flatten() for m in agg_pred])
-                    all_gt = np.concatenate([m.flatten() for m in agg_gt])
-                    metrics = evaluate_segmentation(all_pred, all_gt, nc)
-                    ov = metrics.get("__overall__", {})
-                    detail = {str(k): v for k, v in metrics.items() if k != "__overall__"}
+                    # Per-image evaluation, then average
+                    all_ious = {}  # class_id -> [iou, ...]
+                    all_dices = {}
+                    for pm, gm in zip(agg_pred, agg_gt):
+                        m = evaluate_segmentation(pm, gm, nc)
+                        for k, v in m.items():
+                            if k == "__overall__":
+                                continue
+                            all_ious.setdefault(k, []).append(v["iou"])
+                            all_dices.setdefault(k, []).append(v["dice"])
+                    detail = {}
+                    valid_ious, valid_dices = [], []
+                    for k in sorted(all_ious.keys()):
+                        ious = [x for x in all_ious[k] if not np.isnan(x)]
+                        dices = all_dices[k]
+                        mean_iou = float(np.mean(ious)) if ious else 0.0
+                        mean_dice = float(np.mean(dices)) if dices else 0.0
+                        detail[str(k)] = {"iou": round(mean_iou, 6), "dice": round(mean_dice, 6)}
+                        if ious:
+                            valid_ious.append(mean_iou)
+                            valid_dices.append(mean_dice)
+                    miou = float(np.mean(valid_ious)) if valid_ious else 0.0
+                    mdice = float(np.mean(valid_dices)) if valid_dices else 0.0
                     eval_state["results"].append({
                         "name": name, "task": "segmentation",
-                        "mIoU": round(ov.get("mIoU", 0) * 100, 4),
-                        "mDice": round(ov.get("mDice", 0) * 100, 4),
+                        "mIoU": round(miou * 100, 4),
+                        "mDice": round(mdice * 100, 4),
                         "detail": detail,
+                        "num_images": len(agg_pred),
                     })
                 else:
                     eval_state["results"].append({"name": name, "task": "segmentation", "error": "No valid predictions"})
@@ -720,3 +756,40 @@ def _overlay_segmentation(frame, mask, alpha=0.5):
     return cv2.addWeighted(frame, 1 - alpha, overlay, alpha, 0)
 
 
+
+# ── Eval result persistence ─────────────────────────────
+
+
+@router.get("/api/eval/history")
+async def eval_history():
+    """List saved evaluation results."""
+    if not os.path.isdir(_EVAL_HISTORY_DIR):
+        return {"files": []}
+    files = sorted([f for f in os.listdir(_EVAL_HISTORY_DIR) if f.endswith(".json")], reverse=True)
+    return {"files": files}
+
+
+@router.get("/api/eval/load/{filename}")
+async def eval_load(filename: str):
+    """Load a saved evaluation result."""
+    import json
+    path = os.path.join(_EVAL_HISTORY_DIR, filename)
+    if not os.path.isfile(path):
+        return {"error": "File not found"}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+@router.post("/api/eval/save")
+async def eval_save():
+    """Save current evaluation results to file."""
+    import json, datetime
+    if not eval_state["results"]:
+        return {"error": "No results to save"}
+    os.makedirs(_EVAL_HISTORY_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"eval_{ts}.json"
+    path = os.path.join(_EVAL_HISTORY_DIR, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"results": eval_state["results"], "msg": eval_state["msg"]}, f, ensure_ascii=False, indent=2)
+    return {"ok": True, "filename": filename}

@@ -148,7 +148,8 @@ async def run_benchmark(req: BenchmarkRequest):
                 buf = encoded_bufs.get(codec)
                 if buf and isinstance(buf, str) and os.path.isfile(buf):
                     try: os.remove(buf)
-                    except: pass
+                    except Exception:
+                        pass
             if not bench_state["msg"].startswith("Error"):
                 bench_state["msg"] = "Complete"
 

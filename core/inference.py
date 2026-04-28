@@ -553,6 +553,19 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
         output = model_info.session.run(None, {model_info.input_name: tensor})
         infer_ms = (time.perf_counter() - t0) * 1000.0
         result = postprocess_yolo_nas(output, conf, ratio, pad, orig_shape)
+    elif model_info.model_type.startswith("pose_"):
+        pose_res = run_pose(model_info, frame, conf)
+        infer_ms = pose_res.infer_ms
+        result = DetectionResult(
+            boxes=pose_res.boxes, scores=pose_res.scores,
+            class_ids=np.zeros(len(pose_res.scores), dtype=np.int32),
+            infer_ms=infer_ms)
+    elif model_info.model_type.startswith("instseg_"):
+        iseg_res = run_instance_seg(model_info, frame, conf)
+        infer_ms = iseg_res.infer_ms
+        result = DetectionResult(
+            boxes=iseg_res.boxes, scores=iseg_res.scores,
+            class_ids=iseg_res.class_ids, infer_ms=infer_ms)
     else:
         padded, ratio, pad = letterbox(frame, model_info.input_size)
         tensor = _padded_to_tensor(padded, model_info.input_size)

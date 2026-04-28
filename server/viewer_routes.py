@@ -164,6 +164,43 @@ async def viewer_stream(session_id: str):
                     sess["last_result"] = None
                     vis = overlay_segmentation(frame, result.mask)
                     _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                elif model.model_type.startswith("pose_"):
+                    from core.inference import run_pose, COCO_SKELETON
+                    pose_res = run_pose(model, frame, cfg.conf_threshold)
+                    sess["last_detections"] = len(pose_res.boxes)
+                    sess["last_infer_ms"] = round(pose_res.infer_ms, 2)
+                    sess["last_frame"] = frame.copy()
+                    sess["last_result"] = None
+                    vis = frame
+                    for i in range(len(pose_res.boxes)):
+                        x1, y1, x2, y2 = pose_res.boxes[i].astype(int)
+                        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        kpts = pose_res.keypoints[i]
+                        for kx, ky, kc in kpts:
+                            if kc > 0.5:
+                                cv2.circle(vis, (int(kx), int(ky)), 3, (0, 0, 255), -1)
+                        for a, b in COCO_SKELETON:
+                            if kpts[a][2] > 0.5 and kpts[b][2] > 0.5:
+                                cv2.line(vis, (int(kpts[a][0]), int(kpts[a][1])),
+                                         (int(kpts[b][0]), int(kpts[b][1])), (255, 255, 0), 2)
+                    _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                elif model.model_type.startswith("instseg_"):
+                    from core.inference import run_instance_seg
+                    iseg_res = run_instance_seg(model, frame, cfg.conf_threshold)
+                    sess["last_detections"] = len(iseg_res.boxes)
+                    sess["last_infer_ms"] = round(iseg_res.infer_ms, 2)
+                    sess["last_frame"] = frame.copy()
+                    sess["last_result"] = None
+                    vis = frame.copy()
+                    palette = [(int(hash(str(i)*3)%200+55), int(hash(str(i)*7)%200+55), int(hash(str(i)*11)%200+55)) for i in range(max(len(iseg_res.masks), 1))]
+                    for i, mask in enumerate(iseg_res.masks):
+                        color = palette[i % len(palette)]
+                        overlay = vis.copy()
+                        overlay[mask > 0] = color
+                        cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
+                        x1, y1, x2, y2 = iseg_res.boxes[i].astype(int)
+                        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+                    _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 65])
                 else:
                     result = run_inference(model, frame, cfg.conf_threshold)
                     sess["last_detections"] = len(result.boxes)

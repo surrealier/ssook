@@ -68,8 +68,18 @@ def ensure_model(model_path: str, model_type: str = "yolo", cfg=None):
 
 
 def load_fresh(model_path: str, model_type: str = "yolo", cfg=None):
-    """항상 새로 로드 (전역 상태 갱신)."""
+    """항상 새로 로드 (전역 상태 갱신). 이전 세션은 명시적으로 해제."""
     global _loaded_model, _loaded_model_meta
+    # Release previous session
+    with _model_lock:
+        if _loaded_model is not None and _loaded_model.session is not None:
+            try:
+                del _loaded_model.session
+            except Exception:
+                pass
+            _loaded_model = None
+            import gc; gc.collect()
+
     custom_name = ""
     if model_type.startswith("custom:"):
         custom_name = model_type.split(":", 1)[1]

@@ -785,7 +785,7 @@ Tabs.converter = {
       if (m) m.textContent = s.msg || `${s.progress}/${s.total}`;
       if (s.running) setTimeout(() => this._poll(), 500);
       else App.setStatus(s.msg + (s.results ? ` — ${JSON.stringify(s.results)}` : ''));
-    } catch(e) {}
+    } catch(e) { console.warn('poll error:', e); }
   }
 };
 
@@ -1019,7 +1019,7 @@ Tabs.anomaly = {
           : '<tr><td colspan="4" class="text-secondary" style="text-align:center;">' + t('anomaly.none') + '</td></tr>';
         App.setStatus(s.msg);
       } else if (s.running) setTimeout(() => this._poll(), 500);
-    } catch(e) {}
+    } catch(e) { console.warn('poll error:', e); }
   }
 };
 
@@ -1060,7 +1060,7 @@ Tabs.quality = {
           `<tr><td>${r.file}</td><td>${r.blur}</td><td>${r.brightness}</td><td>${r.entropy}</td><td>${r.aspect}</td><td>${r.issues}</td></tr>`).join('');
         App.setStatus(s.msg);
       } else if (s.running) setTimeout(() => this._poll(), 500);
-    } catch(e) {}
+    } catch(e) { console.warn('poll error:', e); }
   }
 };
 

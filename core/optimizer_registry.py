@@ -93,30 +93,32 @@ registry.register(_DynamicINT8())
 registry.register(_StaticINT8())
 registry.register(_FP16())
 
+import logging as _logging
+
 # Auto-register optimizers from submodules
 def _auto_register():
     try:
         from core.optimizers.mixed_precision import MixedPrecisionOptimizer
         registry.register(MixedPrecisionOptimizer())
-    except Exception:
-        pass
+    except Exception as e:
+        _logging.debug("Optional optimizer mixed_precision not available: %s", e)
     try:
         from core.optimizers.weight_pruning import WeightPruningOptimizer
         registry.register(WeightPruningOptimizer())
-    except Exception:
-        pass
+    except Exception as e:
+        _logging.debug("Optional optimizer weight_pruning not available: %s", e)
     try:
         from core.optimizers.channel_pruning import ChannelPruningOptimizer
         registry.register(ChannelPruningOptimizer())
-    except Exception:
-        pass
+    except Exception as e:
+        _logging.debug("Optional optimizer channel_pruning not available: %s", e)
     try:
         from core.optimizers.graph_optimizer import (
             ORTGraphOptimizer, ONNXSimplifier, DeadNodeEliminator)
         registry.register(ORTGraphOptimizer())
         registry.register(ONNXSimplifier())
         registry.register(DeadNodeEliminator())
-    except Exception:
-        pass
+    except Exception as e:
+        _logging.debug("Optional optimizer graph_optimizer not available: %s", e)
 
 _auto_register()

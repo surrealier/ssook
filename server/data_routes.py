@@ -69,7 +69,7 @@ async def data_explorer(req: dict):
                     if im is not None:
                         h_, w_ = im.shape[:2]
                         aspect_ratios.append(round(w_ / max(h_, 1), 2))
-                except:
+                except Exception:
                     pass
                 file_info.append({"name": os.path.basename(fp), "path": fp, "boxes": len(boxes),
                                   "classes": list(set(boxes)), "box_details": box_details})

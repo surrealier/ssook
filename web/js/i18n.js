@@ -262,6 +262,7 @@ const I18n = {
     // Evaluation extra
     'eval.gt_classmap':     { en: 'GT Class Mapping (id: name, one per line)', ko: 'GT 클래스 매핑 (id: name, 한 줄에 하나)' },
     'eval.csv_export':      { en: 'CSV Export',          ko: 'CSV 내보내기' },
+    'eval.history':         { en: 'History',             ko: '이력' },
     'eval.add_one_model':   { en: 'Add at least one model', ko: '최소 하나의 모델을 추가하세요' },
     'eval.select_images':   { en: 'Select images directory', ko: '이미지 디렉토리를 선택하세요' },
     'eval.loading_class':   { en: 'Loading class info...', ko: '클래스 정보 로딩 중...' },

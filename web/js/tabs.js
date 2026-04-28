@@ -1180,6 +1180,7 @@ Tabs.evaluation = {
             <button class="btn btn-danger btn-sm" id="eval-stop-btn" disabled onclick="Tabs.evaluation.stop()">${t('stop')}</button>
             <div style="flex:1;"></div>
             <button class="btn btn-secondary btn-sm" onclick="Tabs.evaluation.exportCSV()">${t('eval.csv_export')}</button>
+            <button class="btn btn-secondary btn-sm" onclick="Tabs.evaluation.showHistory()">${t('eval.history')}</button>
           </div>
           <div style="margin-top:0.5rem;">
             <div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="eval-prog" style="width:0%;height:100%;"></div><span id="eval-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
@@ -1646,6 +1647,24 @@ Tabs.evaluation = {
     c.innerHTML = `<div class="card" style="padding:1.5rem;"><h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('eval.per_class', {name: r.name})}</h3><div class="table-container"><table><thead><tr>${header}</tr></thead><tbody>${rows}</tbody></table></div></div>`;
   },
   exportCSV() { window.open('/api/evaluation/export-csv', '_blank'); },
+  async showHistory() {
+    try {
+      const r = await API.get('/api/eval/history');
+      if (!r.files || !r.files.length) { App.setStatus('No saved results'); return; }
+      const items = r.files.map(f => `<div style="padding:0.5rem;cursor:pointer;border-bottom:1px solid var(--border-01);" onmouseover="this.style.background='var(--bg-02)'" onmouseout="this.style.background=''" onclick="Tabs.evaluation._loadHistory('${f}')">${f.replace('.json','').replace('eval_','')}</div>`).join('');
+      const c = document.getElementById('eval-detail-container');
+      if (c) c.innerHTML = `<div class="card" style="padding:1.5rem;"><h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('eval.history')}</h3>${items}</div>`;
+    } catch(e) { App.setStatus('Error: ' + e.message); }
+  },
+  async _loadHistory(filename) {
+    try {
+      const r = await API.get('/api/eval/load/' + filename);
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      this._lastResults = r.results || [];
+      this._renderResults(this._lastResults);
+      App.setStatus('Loaded: ' + filename);
+    } catch(e) { App.setStatus('Error: ' + e.message); }
+  },
 };
 
 /* ── Analysis ───────────────────────────────────────── */
