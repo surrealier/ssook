@@ -68,6 +68,7 @@ const App = {
             <option value="ko" ${lang==='ko'?'selected':''}>KO</option>
           </select>
         </div>
+        <button onclick="App.shutdown()" class="btn btn-danger btn-sm" style="margin:0.25rem 0.75rem;font-size:12px;">${t('shutdown')}</button>
       </div>`;
 
     document.getElementById('sidebar').innerHTML = html;
@@ -149,6 +150,12 @@ const App = {
     } else if (/\bcomplete$|\bsaved|저장[  ]?완료|완료$/.test(lower)) {
       Notify.success(text);
     }
+  },
+
+  async shutdown() {
+    if (!confirm(I18n.t('shutdown_confirm'))) return;
+    try { await API.post('/api/shutdown'); } catch(e) {}
+    document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-size:1.5rem;color:#888;">Server stopped. You can close this tab.</div>';
   },
 
   async loadSystemInfo() {

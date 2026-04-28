@@ -47,6 +47,8 @@ const I18n = {
     'nav.diagnose':         { en: 'Model Diagnose',    ko: '모델 진단' },
     // Common
     'dark_mode':    { en: 'Dark mode',    ko: '다크 모드' },
+    'shutdown':     { en: 'Quit',         ko: '종료' },
+    'shutdown_confirm': { en: 'Shut down the server?', ko: '서버를 종료하시겠습니까?' },
     'language':     { en: 'Language',     ko: '언어' },
     'ready':        { en: 'Ready',        ko: '준비' },
     'browse':       { en: 'Browse',       ko: '찾아보기' },

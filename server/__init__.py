@@ -46,6 +46,14 @@ async def heartbeat():
     return {"ok": True}
 
 
+@app.post("/api/shutdown")
+async def shutdown():
+    """Gracefully shut down the server."""
+    import threading
+    threading.Timer(0.5, lambda: os._exit(0)).start()
+    return {"ok": True}
+
+
 def _heartbeat_watchdog():
     global _last_heartbeat
     while True:
