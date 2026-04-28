@@ -40,7 +40,7 @@ a = Analysis(
         ('web',         'web'),
         ('settings',    'settings'),
         ('assets',      'assets'),
-        ('server.py',   '.'),
+        ('server',      'server'),
         ('core',        'core'),
     ] + _ep_datas,
     hiddenimports=[
