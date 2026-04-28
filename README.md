@@ -119,6 +119,22 @@ python run_web.py
 
 ---
 
+## 📖 Documentation
+
+> 🌐 [English](docs/index.md) | [한국어](docs/ko/index.md) | [日本語](docs/ja/index.md) | [中文](docs/zh/index.md)
+
+| Document | Topics |
+|----------|--------|
+| [Model Optimization](docs/model-optimization.md) | Quantization (INT8, FP16, Mixed Precision), Pruning, Graph Optimization |
+| [Model Analysis](docs/model-analysis.md) | Model Diagnosis, Profiler, Inspector |
+| [Evaluation Metrics](docs/evaluation-metrics.md) | mAP, IoU, P/R/F1, Confidence Optimizer, FP/FN Error Analysis |
+| [Embedding & CLIP](docs/embedding-and-clip.md) | t-SNE / UMAP / PCA, CLIP Zero-Shot, Embedder Evaluation |
+| [Execution Providers](docs/execution-providers.md) | Auto EP Selection, venv Isolation, GPU Acceleration |
+| [Tracking & Sampling](docs/tracking-and-sampling.md) | ByteTrack / SORT, Smart Sampler, dHash Duplicate Detection |
+| [General Features](docs/general-features.md) | Viewer, Explorer, Splitter, Converter, Quality Tools, Benchmark |
+
+---
+
 ## ⚙ Configuration
 
 Settings are stored in `settings/app_config.yaml` and persist across sessions:
