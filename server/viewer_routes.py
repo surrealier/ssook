@@ -85,6 +85,7 @@ async def viewer_start(req: VideoStartRequest):
             "stream_max_height": req.stream_max_height,
             "tracker": tracker,
         }
+        model._frame_buffer = []
         return {"session_id": sid, "fps": fps,
                 "total_frames": _video_sessions[sid]["total"]}
     except Exception as e:
@@ -114,6 +115,7 @@ async def viewer_stream(session_id: str):
                 if seek_to is not None:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, seek_to)
                     sess["seek_to"] = None
+                    model._frame_buffer = []
 
                 # Handle step
                 step = sess.get("step_request")

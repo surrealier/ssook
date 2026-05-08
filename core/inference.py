@@ -119,6 +119,38 @@ def preprocess_darknet(frame: np.ndarray, input_size: tuple) -> np.ndarray:
     return np.ascontiguousarray(img[np.newaxis], dtype=np.float32) / 255.0
 
 
+# ── Sequential (3-frame) preprocessing ──────────────────
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def _get_seq_frames(model_info, frame: np.ndarray) -> list:
+    """3프레임 버퍼 관리. 부족 시 현재 프레임으로 패딩."""
+    buf = model_info._frame_buffer
+    buf.append(frame.copy())
+    if len(buf) > 3:
+        buf.pop(0)
+    if len(buf) < 3:
+        # 부족분을 현재 프레임 복제로 채움 (버퍼 자체는 건드리지 않고 반환만)
+        pad = [frame] * (3 - len(buf))
+        return pad + buf
+    return buf
+
+
+def preprocess_sequential(frames: list, input_size: tuple, imagenet_norm: bool = False) -> np.ndarray:
+    """3프레임 → (1, 9, H, W) tensor. Simple resize, no letterbox."""
+    h, w = input_size
+    channels = []
+    for f in frames:
+        img = cv2.resize(f, (w, h))
+        img = img[..., ::-1].astype(np.float32) / 255.0  # BGR→RGB, [0,1]
+        if imagenet_norm:
+            img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
+        channels.append(img.transpose(2, 0, 1))  # (3, H, W)
+    tensor = np.concatenate(channels, axis=0)  # (9, H, W)
+    return np.ascontiguousarray(tensor[np.newaxis], dtype=np.float32)
+
+
 def _nms(boxes_xyxy, scores, class_ids, iou_thres):
     """클래스별 NMS → 최종 인덱스 반환 (offset 트릭으로 단일 호출)"""
     if len(scores) == 0:
@@ -308,6 +340,78 @@ def postprocess_yolo_nas(outputs: list, conf: float,
                          ratio: float, pad: tuple, orig_shape: tuple) -> DetectionResult:
     """YOLO-NAS 출력: 두 텐서 (1, N, 4) + (1, N, C) 또는 단일 (1, N, 4+C)."""
     return postprocess_detr(outputs, conf, ratio, pad, orig_shape)
+
+
+def postprocess_dinov3_seq(outputs: list, conf: float,
+                           input_size: tuple, orig_shape: tuple) -> DetectionResult:
+    """DINOv3 seq: pred_logits (1,300,nc) + pred_boxes (1,300,4) cxcywh absolute pixel."""
+    logits, boxes_raw = _split_detr_outputs(outputs)
+
+    scores_all = 1.0 / (1.0 + np.exp(-logits))  # sigmoid
+    max_scores = scores_all.max(axis=1)
+    class_ids = scores_all.argmax(axis=1).astype(np.int32)
+    mask = max_scores > conf
+    if not mask.any():
+        return DetectionResult.empty()
+
+    boxes_raw = boxes_raw[mask]
+    scores = max_scores[mask].astype(np.float32)
+    class_ids = class_ids[mask]
+
+    cx, cy, bw, bh = boxes_raw[:, 0], boxes_raw[:, 1], boxes_raw[:, 2], boxes_raw[:, 3]
+    x1, y1 = cx - bw / 2, cy - bh / 2
+    x2, y2 = cx + bw / 2, cy + bh / 2
+
+    # absolute pixel in resized image → scale to original
+    rh, rw = input_size
+    oh, ow = orig_shape[:2]
+    sx, sy = ow / rw, oh / rh
+    x1 = np.clip(x1 * sx, 0, ow)
+    y1 = np.clip(y1 * sy, 0, oh)
+    x2 = np.clip(x2 * sx, 0, ow)
+    y2 = np.clip(y2 * sy, 0, oh)
+
+    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
+    return DetectionResult(boxes=boxes_xyxy, scores=scores, class_ids=class_ids, infer_ms=0.0)
+
+
+def postprocess_seq_rfdetr(outputs: list, conf: float, orig_shape: tuple) -> DetectionResult:
+    """RF-DETR seq: pred_logits (1,300,nc) + pred_boxes (1,300,4) cxcywh normalized [0,1]."""
+    logits, boxes_raw = _split_detr_outputs(outputs)
+
+    scores_all = 1.0 / (1.0 + np.exp(-logits))  # sigmoid
+    max_scores = scores_all.max(axis=1)
+    class_ids = scores_all.argmax(axis=1).astype(np.int32)
+    mask = max_scores > conf
+    if not mask.any():
+        return DetectionResult.empty()
+
+    boxes_raw = boxes_raw[mask]
+    scores = max_scores[mask].astype(np.float32)
+    class_ids = class_ids[mask]
+
+    oh, ow = orig_shape[:2]
+    cx, cy, bw, bh = boxes_raw[:, 0], boxes_raw[:, 1], boxes_raw[:, 2], boxes_raw[:, 3]
+    x1 = np.clip((cx - bw / 2) * ow, 0, ow)
+    y1 = np.clip((cy - bh / 2) * oh, 0, oh)
+    x2 = np.clip((cx + bw / 2) * ow, 0, ow)
+    y2 = np.clip((cy + bh / 2) * oh, 0, oh)
+
+    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
+    return DetectionResult(boxes=boxes_xyxy, scores=scores, class_ids=class_ids, infer_ms=0.0)
+
+
+def _split_detr_outputs(outputs: list):
+    """DETR 2-tensor 출력에서 logits와 boxes를 분리. 순서 무관."""
+    if len(outputs) >= 2:
+        # shape[-1]==4인 것이 boxes
+        if outputs[0].shape[-1] == 4:
+            return outputs[1][0], outputs[0][0]
+        else:
+            return outputs[0][0], outputs[1][0]
+    # single tensor fallback: (1, N, 4+C)
+    data = outputs[0][0]
+    return data[:, 4:], data[:, :4]
 
 
 def postprocess_custom(outputs: list, cmt, conf: float,
@@ -566,6 +670,31 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
         result = DetectionResult(
             boxes=iseg_res.boxes, scores=iseg_res.scores,
             class_ids=iseg_res.class_ids, infer_ms=infer_ms)
+    elif model_info.model_type.startswith("seq_"):
+        frames = _get_seq_frames(model_info, frame)
+        imagenet_norm = model_info.model_type in ("seq_rfdetr", "seq_dinov3")
+        tensor = preprocess_sequential(frames, model_info.input_size, imagenet_norm)
+        output = model_info.session.run(None, {model_info.input_name: tensor})
+        infer_ms = (time.perf_counter() - t0) * 1000.0
+        if model_info.model_type == "seq_yolo":
+            ih, iw = model_info.input_size
+            result = postprocess_v8(output[0][:1], conf, 1.0, (0, 0), (ih, iw))
+            if len(result.boxes) > 0:
+                oh, ow = orig_shape[:2]
+                result.boxes[:, 0] *= ow / iw
+                result.boxes[:, 2] *= ow / iw
+                result.boxes[:, 1] *= oh / ih
+                result.boxes[:, 3] *= oh / ih
+                np.clip(result.boxes[:, 0], 0, ow, out=result.boxes[:, 0])
+                np.clip(result.boxes[:, 1], 0, oh, out=result.boxes[:, 1])
+                np.clip(result.boxes[:, 2], 0, ow, out=result.boxes[:, 2])
+                np.clip(result.boxes[:, 3], 0, oh, out=result.boxes[:, 3])
+        elif model_info.model_type == "seq_rfdetr":
+            result = postprocess_seq_rfdetr(output, conf, orig_shape)
+        elif model_info.model_type == "seq_dinov3":
+            result = postprocess_dinov3_seq(output, conf, model_info.input_size, orig_shape)
+        else:
+            result = DetectionResult.empty()
     else:
         padded, ratio, pad = letterbox(frame, model_info.input_size)
         tensor = _padded_to_tensor(padded, model_info.input_size)

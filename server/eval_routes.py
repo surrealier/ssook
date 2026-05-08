@@ -214,6 +214,7 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                     gt_eval = gt_data
 
                 pred_data = {}
+                mi._frame_buffer = []
                 for fp in img_files:
                     if fp in _img_cache:
                         frame = _img_cache[fp]
@@ -655,6 +656,7 @@ async def run_evaluation(req: EvalRequest):
             try:
                 mi = _load_model(model_path)
                 pred_data = {}
+                mi._frame_buffer = []
                 for fp in img_files:
                     frame = imread(fp)
                     if frame is None:

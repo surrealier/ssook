@@ -11,6 +11,8 @@ _DARKNET_DEFAULT_NAMES = {
     0: "person", 1: "face", 2: "red-sign", 3: "wheelchair", 4: "cane",
 }
 
+_SEQ_DEFAULT_NAMES = {0: "smoke", 1: "fire", 2: "falldown"}
+
 
 @dataclass
 class ModelInfo:
@@ -26,6 +28,7 @@ class ModelInfo:
     batch_size: int = 1                  # 고정 배치 크기 (1=단일, 4=4배치 등)
     custom_type_name: str = ""           # custom 모델 타입 이름 (model_type=="custom" 시)
     _batch_buf: Any = field(default=None, repr=False)  # 배치 텐서 캐시 (inference.py에서 사용)
+    _frame_buffer: list = field(default_factory=list, repr=False)  # sequential 모델 프레임 버퍼
 
 
 # 지원 모델 타입 목록
@@ -40,6 +43,10 @@ MODEL_TYPES = {
     "gold_yolo": "Gold-YOLO",
     "yolox":     "YOLOX",
     "efficientdet": "EfficientDet",
+    # Sequential Detection (3)
+    "seq_yolo":    "Sequential YOLO (3-frame 9ch)",
+    "seq_rfdetr":  "Sequential RF-DETR (3-frame 9ch)",
+    "seq_dinov3":  "Sequential DINOv3 (3-frame 9ch)",
     # Classification (5)
     "cls_resnet":      "ResNet (Classification)",
     "cls_efficientnet":"EfficientNet (Classification)",
@@ -191,7 +198,7 @@ def _detect_task_type(session: ort.InferenceSession, model_type: str = "yolo") -
 
 def _detect_layout(session: ort.InferenceSession, model_type: str = "yolo") -> Literal["v8", "v5"]:
     """출력 텐서 shape으로 YOLO 버전 자동 감지"""
-    if model_type in ("detr", "yolo_nas", "yolov10", "custom"):
+    if model_type in ("detr", "yolo_nas", "yolov10", "custom") or model_type.startswith("seq_"):
         return "v8"  # DETR 계열은 별도 postprocess 사용
     shape = session.get_outputs()[0].shape
     # shape: (1, dim1, dim2)
@@ -271,6 +278,8 @@ def _load_onnx(path: str, model_type: str = "yolo", session_options=None) -> Mod
     names = _get_names_from_onnx(session)
     if model_type == "darknet" and all(v.startswith("class_") for v in names.values()):
         names = _DARKNET_DEFAULT_NAMES
+    if model_type.startswith("seq_") and all(v.startswith("class_") for v in names.values()):
+        names = {k: v for k, v in _SEQ_DEFAULT_NAMES.items() if k < len(names)} or _SEQ_DEFAULT_NAMES
 
     inputs = session.get_inputs()
 
