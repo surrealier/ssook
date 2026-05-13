@@ -130,6 +130,22 @@ async def system_info():
 
 
 # ── File System API (for file/dir selection dialogs) ────
+def _parse_filters(s):
+    """Parse filter string. Accepts '*.onnx;*.pt' or Qt-style 'Models (*.onnx *.pt)'."""
+    if not s:
+        return [("All files", "*.*")]
+    pairs = []
+    for part in s.split(";;"):
+        part = part.strip()
+        if "(" in part and ")" in part:
+            label = part[:part.index("(")].strip()
+            exts = part[part.index("(") + 1:part.index(")")].strip()
+            pairs.append((label, exts))
+        else:
+            pairs.append(("Files", part))
+    return pairs or [("All files", "*.*")]
+
+
 class FileSelectRequest(BaseModel):
     filters: Optional[str] = None
 

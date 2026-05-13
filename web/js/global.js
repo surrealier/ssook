@@ -84,93 +84,21 @@ function multiModelSlots(containerId, listId) {
   </div>`;
 }
 
-/* Picker functions — web-based file browser */
-function _showFileBrowser(mode, exts, callback) {
+/* Picker functions — native OS file dialog */
+async function _showFileBrowser(mode, exts, callback) {
   // mode: "file" | "dir"
-  let currentPath = '';
-  const overlay = document.createElement('div');
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;';
-  const modal = document.createElement('div');
-  modal.style.cssText = 'background:var(--background-tint-00);border-radius:12px;width:560px;max-height:70vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
-  modal.innerHTML = `
-    <div style="padding:1rem 1.25rem;border-bottom:1px solid var(--border-01);display:flex;align-items:center;justify-content:space-between;">
-      <strong>${mode === 'dir' ? 'Select Directory' : 'Select File'}</strong>
-      <button class="btn btn-ghost btn-sm" id="fb-close">✕</button>
-    </div>
-    <div style="padding:0.5rem 1.25rem;display:flex;gap:0.5rem;align-items:center;border-bottom:1px solid var(--border-01);">
-      <button class="btn btn-ghost btn-sm" id="fb-up">⬆</button>
-      <input type="text" class="form-input input-normal" id="fb-path" style="flex:1;font-size:12px;" placeholder="Paste path and press Enter">
-    </div>
-    <div id="fb-list" style="flex:1;overflow-y:auto;padding:0.5rem;min-height:200px;max-height:50vh;"></div>
-    <div style="padding:0.75rem 1.25rem;border-top:1px solid var(--border-01);display:flex;gap:0.5rem;justify-content:flex-end;">
-      ${mode === 'dir' ? '<button class="btn btn-primary btn-sm" id="fb-select-dir">Select This Directory</button>' : ''}
-      <button class="btn btn-secondary btn-sm" id="fb-cancel">Cancel</button>
-    </div>`;
-  overlay.appendChild(modal);
-  document.body.appendChild(overlay);
-
-  const listEl = modal.querySelector('#fb-list');
-  const pathEl = modal.querySelector('#fb-path');
-
-  async function navigate(path) {
-    listEl.innerHTML = '<div class="text-secondary" style="padding:1rem;text-align:center;">Loading...</div>';
-    try {
-      const r = await API.post('/api/fs/browse', {path: path || null, exts, mode});
-      currentPath = r.current || '';
-      pathEl.value = currentPath;
-      if (!r.entries || !r.entries.length) {
-        listEl.innerHTML = '<div class="text-secondary" style="padding:1rem;text-align:center;">Empty</div>';
-        return;
-      }
-      listEl.innerHTML = '';
-      let selectedRow = null;
-      r.entries.forEach(e => {
-        const row = document.createElement('div');
-        row.style.cssText = 'padding:0.35rem 0.5rem;cursor:pointer;border-radius:6px;display:flex;align-items:center;gap:0.5rem;font-size:13px;transition:background 0.1s;';
-        row.onmouseenter = () => { if (row !== selectedRow) row.style.background = 'var(--background-tint-01)'; };
-        row.onmouseleave = () => { if (row !== selectedRow) row.style.background = ''; };
-        if (e.type === 'drive' || e.type === 'dir') {
-          row.innerHTML = '<span style="opacity:0.6;">📁</span> ' + e.name;
-          row.ondblclick = () => navigate(e.path);
-          row.onclick = () => {
-            if (selectedRow) { selectedRow.style.background = ''; selectedRow.style.outline = ''; }
-            selectedRow = row;
-            row.style.background = 'var(--action-link-01, rgba(74,158,255,0.15))';
-            row.style.outline = '1px solid var(--action-link-05, #4a9eff)';
-            pathEl.value = e.path; currentPath = e.path;
-          };
-        } else {
-          row.innerHTML = '<span style="opacity:0.4;">📄</span> ' + e.name;
-          row.onclick = () => { cleanup(); callback(e.path); };
-        }
-        listEl.appendChild(row);
-      });
-    } catch(err) {
-      listEl.innerHTML = `<div class="text-secondary" style="padding:1rem;text-align:center;">Error: ${err.message}</div>`;
+  try {
+    if (mode === 'dir') {
+      const r = await API.post('/api/fs/select-dir', {});
+      if (r.path) callback(r.path);
+    } else {
+      const filters = exts ? exts.map(e => `*${e}`).join(';') : null;
+      const r = await API.post('/api/fs/select', { filters });
+      if (r.path) callback(r.path);
     }
+  } catch (err) {
+    console.error('File dialog error:', err);
   }
-
-  function cleanup() { overlay.remove(); }
-
-  modal.querySelector('#fb-close').onclick = cleanup;
-  modal.querySelector('#fb-cancel').onclick = cleanup;
-  overlay.onclick = (e) => { if (e.target === overlay) cleanup(); };
-  modal.querySelector('#fb-up').onclick = async () => {
-    if (!currentPath) return;
-    const r = await API.post('/api/fs/browse', {path: currentPath, exts, mode});
-    if (r.parent) navigate(r.parent);
-  };
-  const selDirBtn = modal.querySelector('#fb-select-dir');
-  if (selDirBtn) selDirBtn.onclick = () => { if (currentPath) { cleanup(); callback(currentPath); } };
-
-  pathEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      const v = pathEl.value.trim();
-      if (v) navigate(v);
-    }
-  });
-
-  navigate('');
 }
 
 async function pickModel(inputId) {
@@ -421,7 +349,7 @@ function showHFBrowser(targetInputId) {
   modal.style.cssText = 'background:var(--background-tint-00);border-radius:12px;width:620px;max-height:75vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
   modal.innerHTML = `
     <div style="padding:1rem 1.25rem;border-bottom:1px solid var(--border-01);display:flex;align-items:center;justify-content:space-between;">
-      <strong>🤗 HuggingFace Hub — ONNX Models</strong>
+      <strong>HuggingFace Hub — ONNX Models</strong>
       <button class="btn btn-ghost btn-sm" id="hf-close">✕</button>
     </div>
     <div style="padding:0.75rem 1.25rem;display:flex;gap:0.5rem;border-bottom:1px solid var(--border-01);">
@@ -442,7 +370,7 @@ function showHFBrowser(targetInputId) {
       <div class="text-secondary" style="padding:2rem;text-align:center;">Search for ONNX models on HuggingFace Hub</div>
     </div>
     <div style="padding:0.5rem 1.25rem;border-top:1px solid var(--border-01);display:flex;gap:0.5rem;justify-content:space-between;align-items:center;">
-      <button class="btn btn-secondary btn-sm" id="hf-cached-btn">📦 Cached Models</button>
+      <button class="btn btn-secondary btn-sm" id="hf-cached-btn">Cached Models</button>
       <button class="btn btn-secondary btn-sm" id="hf-cancel">Cancel</button>
     </div>`;
   overlay.appendChild(modal);
