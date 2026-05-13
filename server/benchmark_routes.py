@@ -34,6 +34,8 @@ async def run_benchmark(req: BenchmarkRequest):
         from core.benchmark_runner import BenchmarkConfig, run_benchmark_core
         bench_state.update(progress=0, total=0, msg="Starting...", results=[])
 
+        from core.app_config import AppConfig
+        bench_cfg = AppConfig()
         codecs = req.codecs or ["none"]
         configs = []
         codec_map = {}  # config index -> codec name
@@ -43,6 +45,7 @@ async def run_benchmark(req: BenchmarkRequest):
                 configs.append(BenchmarkConfig(
                     model_path=path, iterations=req.iterations,
                     warmup=300, src_hw=(1080, 1920),
+                    model_type=bench_cfg.model_type,
                 ))
                 codec_map[idx] = codec
                 idx += 1
