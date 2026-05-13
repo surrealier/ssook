@@ -95,14 +95,19 @@ async def gt_classes(req: dict):
 async def infer_shapes(req: ModelLoadRequest):
     try:
         import onnxruntime as ort
-        from core.inference import preprocess
+        from core.inference import preprocess, preprocess_sequential
         session = ort.InferenceSession(req.path)
         inp = session.get_inputs()[0]
         h = int(inp.shape[2]) if isinstance(inp.shape[2], int) else 640
         w = int(inp.shape[3]) if isinstance(inp.shape[3], int) else 640
         bs = int(inp.shape[0]) if isinstance(inp.shape[0], int) and inp.shape[0] > 0 else 1
-        dummy = np.random.randint(0, 256, (h, w, 3), dtype=np.uint8)
-        tensor = preprocess(dummy, (h, w))
+        in_ch = int(inp.shape[1]) if isinstance(inp.shape[1], int) else 3
+        if in_ch == 9:
+            dummy_frames = [np.random.randint(0, 256, (h, w, 3), dtype=np.uint8) for _ in range(3)]
+            tensor, _, _ = preprocess_sequential(dummy_frames, (h, w))
+        else:
+            dummy = np.random.randint(0, 256, (h, w, 3), dtype=np.uint8)
+            tensor = preprocess(dummy, (h, w))
         if bs > 1:
             tensor = np.repeat(tensor, bs, axis=0)
         outputs = session.run(None, {inp.name: tensor})
