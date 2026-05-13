@@ -134,20 +134,111 @@ class FileSelectRequest(BaseModel):
     filters: Optional[str] = None
 
 
+def _native_file_dialog(title="Select File", filters=None, multiple=False, directory=False):
+    """OS 네이티브 파일 다이얼로그. Windows/macOS/Linux 지원."""
+    import subprocess, sys
+    system = platform.system()
+
+    if system == "Windows":
+        if directory:
+            script = (
+                "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null;"
+                "$d = New-Object System.Windows.Forms.FolderBrowserDialog;"
+                f"$d.Description = '{title}';"
+                "$d.ShowNewFolderButton = $true;"
+                "if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath } else { '' }"
+            )
+        else:
+            filter_str = "All files (*.*)|*.*"
+            if filters:
+                parts = []
+                for f in _parse_filters(filters):
+                    parts.append(f"{f[0]}|{f[1].replace(' ', ';')}")
+                filter_str = "|".join(parts) + "|All files (*.*)|*.*"
+            script = (
+                "Add-Type -AssemblyName System.Windows.Forms;"
+                "$d = New-Object System.Windows.Forms.OpenFileDialog;"
+                f"$d.Title = '{title}';"
+                f"$d.Filter = '{filter_str}';"
+                f"$d.Multiselect = {'$true' if multiple else '$false'};"
+                "if ($d.ShowDialog() -eq 'OK') {"
+                f"  {'$d.FileNames -join \"|\"' if multiple else '$d.FileName'}"
+                "} else { '' }"
+            )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=120
+        )
+        path = result.stdout.strip()
+        if multiple:
+            return [p for p in path.split("|") if p]
+        return path
+
+    elif system == "Darwin":
+        if directory:
+            script = 'tell application "System Events" to activate\n'
+            script += f'set f to choose folder with prompt "{title}"\nreturn POSIX path of f'
+        elif multiple:
+            script = 'tell application "System Events" to activate\n'
+            script += f'set f to choose file with prompt "{title}" with multiple selections allowed\n'
+            script += 'set out to ""\nrepeat with p in f\nset out to out & POSIX path of p & "\\n"\nend repeat\nreturn out'
+        else:
+            script = 'tell application "System Events" to activate\n'
+            script += f'set f to choose file with prompt "{title}"\nreturn POSIX path of f'
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=120
+        )
+        path = result.stdout.strip()
+        if multiple:
+            return [p for p in path.split("\n") if p]
+        return path
+
+    else:  # Linux
+        cmd = ["zenity"]
+        if directory:
+            cmd += ["--file-selection", "--directory", f"--title={title}"]
+        else:
+            cmd += ["--file-selection", f"--title={title}"]
+            if multiple:
+                cmd += ["--multiple", "--separator=|"]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            path = result.stdout.strip()
+            if multiple:
+                return [p for p in path.split("|") if p]
+            return path
+        except FileNotFoundError:
+            # Fallback to tkinter
+            return _tkinter_file_dialog(title, filters, multiple, directory)
+
+
+def _tkinter_file_dialog(title, filters, multiple, directory):
+    """Fallback: tkinter dialog."""
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    if directory:
+        path = filedialog.askdirectory(title=title)
+        root.destroy()
+        return path or ""
+    ft = [("All files", "*.*")] if not filters else _parse_filters(filters)
+    if multiple:
+        paths = filedialog.askopenfilenames(title=title, filetypes=ft)
+        root.destroy()
+        return list(paths) if paths else []
+    path = filedialog.askopenfilename(title=title, filetypes=ft)
+    root.destroy()
+    return path or ""
+
+
 @router.post("/api/fs/select")
 async def select_file(req: FileSelectRequest):
-    """Return a file selection dialog via tkinter (fallback)."""
+    """Native OS file selection dialog."""
     try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        path = filedialog.askopenfilename(
-            title="Select File",
-            filetypes=[("All files", "*.*")] if not req.filters else _parse_filters(req.filters),
-        )
-        root.destroy()
+        path = _native_file_dialog(title="Select File", filters=req.filters)
         return {"path": path or ""}
     except Exception as e:
         return {"error": str(e), "path": ""}
@@ -155,19 +246,10 @@ async def select_file(req: FileSelectRequest):
 
 @router.post("/api/fs/select-multi")
 async def select_files(req: FileSelectRequest):
-    """Return multiple file selection dialog via tkinter."""
+    """Native OS multiple file selection dialog."""
     try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        paths = filedialog.askopenfilenames(
-            title="Select Files",
-            filetypes=[("All files", "*.*")] if not req.filters else _parse_filters(req.filters),
-        )
-        root.destroy()
-        return {"paths": list(paths) if paths else []}
+        paths = _native_file_dialog(title="Select Files", filters=req.filters, multiple=True)
+        return {"paths": paths if paths else []}
     except Exception as e:
         return {"error": str(e), "paths": []}
 
@@ -195,3 +277,103 @@ async def system_full_info():
     }
 
 
+
+
+# ── Missing FS endpoints ────────────────────────────────
+class FsListRequest(BaseModel):
+    path: str = ""
+    extensions: Optional[list] = None
+    recursive: bool = False
+
+
+@router.post("/api/fs/list")
+async def fs_list(req: FsListRequest):
+    """List files in a directory, optionally filtered by extensions."""
+    from pathlib import Path
+    p = Path(req.path) if req.path else Path(".")
+    if not p.exists():
+        return {"files": [], "error": f"Path not found: {req.path}"}
+    files = []
+    try:
+        items = p.rglob("*") if req.recursive else p.iterdir()
+        for f in items:
+            if f.is_file():
+                if req.extensions:
+                    if f.suffix.lower() in [e.lower() if e.startswith('.') else f'.{e.lower()}' for e in req.extensions]:
+                        files.append(str(f))
+                else:
+                    files.append(str(f))
+    except PermissionError:
+        pass
+    files.sort()
+    return {"files": files, "count": len(files)}
+
+
+@router.post("/api/fs/select-dir")
+async def select_dir():
+    """Native OS directory selection dialog."""
+    try:
+        path = _native_file_dialog(title="Select Directory", directory=True)
+        return {"path": path or ""}
+    except Exception as e:
+        return {"error": str(e), "path": ""}
+
+
+class FsBrowseRequest(BaseModel):
+    path: str = ""
+    mode: str = "all"  # "all" | "dir" | "file"
+
+
+@router.post("/api/fs/browse")
+async def fs_browse(req: FsBrowseRequest):
+    """Browse directory contents for the web-based file browser."""
+    from pathlib import Path
+    p = Path(req.path) if req.path else Path.home()
+    if not p.exists():
+        p = Path.home()
+    if p.is_file():
+        p = p.parent
+
+    entries = []
+    try:
+        for item in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+            if item.name.startswith('.'):
+                continue
+            entries.append({
+                "name": item.name,
+                "path": str(item),
+                "is_dir": item.is_dir(),
+                "size": item.stat().st_size if item.is_file() else 0,
+            })
+    except PermissionError:
+        pass
+
+    # Filter by mode
+    if req.mode == "dir":
+        entries = [e for e in entries if e["is_dir"]]
+
+    return {
+        "current": str(p),
+        "parent": str(p.parent) if p.parent != p else "",
+        "entries": entries,
+    }
+
+
+class ListFilesRequest(BaseModel):
+    dir: str = ""
+    extensions: Optional[list] = None
+
+
+@router.post("/api/list-files")
+async def list_files(req: ListFilesRequest):
+    """List image/label files in a directory (used by pose/instance-seg tabs)."""
+    from pathlib import Path
+    p = Path(req.dir) if req.dir else Path(".")
+    if not p.exists():
+        return {"files": [], "error": f"Path not found: {req.dir}"}
+    exts = req.extensions or [".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"]
+    files = sorted([
+        str(f) for f in p.iterdir()
+        if f.is_file() and f.suffix.lower() in exts
+    ])
+    return {"files": files, "count": len(files)}
