@@ -279,7 +279,7 @@ def _load_onnx(path: str, model_type: str = "yolo", session_options=None) -> Mod
     if model_type == "darknet" and all(v.startswith("class_") for v in names.values()):
         names = _DARKNET_DEFAULT_NAMES
     if model_type.startswith("seq_") and all(v.startswith("class_") for v in names.values()):
-        names = {k: v for k, v in _SEQ_DEFAULT_NAMES.items() if k < len(names)} or _SEQ_DEFAULT_NAMES
+        names = _SEQ_DEFAULT_NAMES
 
     inputs = session.get_inputs()
 
