@@ -399,10 +399,10 @@ def postprocess_seq_rfdetr(outputs: list, conf: float, orig_shape: tuple,
     boxes_out = outputs[0][0]   # (300, 4) cxcywh normalized
     scores_out = outputs[1][0]  # (300, C)
 
-    # Skip background column if present
+    # Skip background column if present (RF-DETR: background is LAST column)
     nc = scores_out.shape[-1]
     if nc > num_classes:
-        class_scores = scores_out[:, 1:]  # skip background col[0]
+        class_scores = scores_out[:, :num_classes]  # first nc cols are real classes
     else:
         class_scores = scores_out
 
