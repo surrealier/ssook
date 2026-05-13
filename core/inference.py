@@ -137,18 +137,31 @@ def _get_seq_frames(model_info, frame: np.ndarray) -> list:
     return buf
 
 
-def preprocess_sequential(frames: list, input_size: tuple, imagenet_norm: bool = False) -> np.ndarray:
-    """3프레임 → (1, 9, H, W) tensor. Simple resize, no letterbox."""
+def preprocess_sequential(frames: list, input_size: tuple,
+                          imagenet_norm: bool = False,
+                          use_letterbox: bool = False) -> "tuple[np.ndarray, float, tuple]":
+    """3프레임 → (1, 9, H, W) tensor.
+
+    Returns: (tensor, ratio, pad)
+        - use_letterbox=True: letterbox resize, ratio/pad for coordinate unscaling
+        - use_letterbox=False: simple resize, ratio=1.0, pad=(0,0)
+    """
     h, w = input_size
     channels = []
+    ratio, pad = 1.0, (0.0, 0.0)
     for f in frames:
-        img = cv2.resize(f, (w, h))
-        img = img[..., ::-1].astype(np.float32) / 255.0  # BGR→RGB, [0,1]
+        if use_letterbox:
+            img, ratio, pad = letterbox(f, input_size)
+            img = img[..., ::-1].astype(np.float32) / 255.0
+        else:
+            img = cv2.resize(f, (w, h))
+            img = img[..., ::-1].astype(np.float32) / 255.0
         if imagenet_norm:
             img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
-        channels.append(img.transpose(2, 0, 1))  # (3, H, W)
-    tensor = np.concatenate(channels, axis=0)  # (9, H, W)
-    return np.ascontiguousarray(tensor[np.newaxis], dtype=np.float32)
+        channels.append(img.transpose(2, 0, 1))
+    tensor = np.concatenate(channels, axis=0)
+    return np.ascontiguousarray(tensor[np.newaxis], dtype=np.float32), ratio, pad
+
 
 
 def _nms(boxes_xyxy, scores, class_ids, iou_thres):
@@ -673,22 +686,13 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
     elif model_info.model_type.startswith("seq_"):
         frames = _get_seq_frames(model_info, frame)
         imagenet_norm = model_info.model_type in ("seq_rfdetr", "seq_dinov3")
-        tensor = preprocess_sequential(frames, model_info.input_size, imagenet_norm)
+        use_letterbox = model_info.model_type == "seq_yolo"
+        tensor, ratio, pad = preprocess_sequential(
+            frames, model_info.input_size, imagenet_norm, use_letterbox)
         output = model_info.session.run(None, {model_info.input_name: tensor})
         infer_ms = (time.perf_counter() - t0) * 1000.0
         if model_info.model_type == "seq_yolo":
-            ih, iw = model_info.input_size
-            result = postprocess_v8(output[0][:1], conf, 1.0, (0, 0), (ih, iw))
-            if len(result.boxes) > 0:
-                oh, ow = orig_shape[:2]
-                result.boxes[:, 0] *= ow / iw
-                result.boxes[:, 2] *= ow / iw
-                result.boxes[:, 1] *= oh / ih
-                result.boxes[:, 3] *= oh / ih
-                np.clip(result.boxes[:, 0], 0, ow, out=result.boxes[:, 0])
-                np.clip(result.boxes[:, 1], 0, oh, out=result.boxes[:, 1])
-                np.clip(result.boxes[:, 2], 0, ow, out=result.boxes[:, 2])
-                np.clip(result.boxes[:, 3], 0, oh, out=result.boxes[:, 3])
+            result = postprocess_v8(output[0][:1], conf, ratio, pad, orig_shape)
         elif model_info.model_type == "seq_rfdetr":
             result = postprocess_seq_rfdetr(output, conf, orig_shape)
         elif model_info.model_type == "seq_dinov3":
