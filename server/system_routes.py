@@ -162,7 +162,7 @@ def _native_file_dialog(title="Select File", filters=None, multiple=False, direc
                 f"$d.Filter = '{filter_str}';"
                 f"$d.Multiselect = {'$true' if multiple else '$false'};"
                 "if ($d.ShowDialog() -eq 'OK') {"
-                f"  {'$d.FileNames -join \"|\"' if multiple else '$d.FileName'}"
+                + ("  $d.FileNames -join '|'" if multiple else "  $d.FileName") +
                 "} else { '' }"
             )
         result = subprocess.run(
