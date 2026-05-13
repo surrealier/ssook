@@ -388,18 +388,31 @@ def postprocess_dinov3_seq(outputs: list, conf: float,
     return DetectionResult(boxes=boxes_xyxy, scores=scores, class_ids=class_ids, infer_ms=0.0)
 
 
-def postprocess_seq_rfdetr(outputs: list, conf: float, orig_shape: tuple) -> DetectionResult:
-    """RF-DETR seq: pred_logits (1,300,nc) + pred_boxes (1,300,4) cxcywh normalized [0,1]."""
-    logits, boxes_raw = _split_detr_outputs(outputs)
+def postprocess_seq_rfdetr(outputs: list, conf: float, orig_shape: tuple,
+                           num_classes: int = 3) -> DetectionResult:
+    """RF-DETR seq: 'boxes' (1,300,4) cxcywh normalized + 'scores' (1,300,C) sigmoid.
 
-    scores_all = 1.0 / (1.0 + np.exp(-logits))  # sigmoid
-    max_scores = scores_all.max(axis=1)
-    class_ids = scores_all.argmax(axis=1).astype(np.int32)
+    RF-DETR ONNX export: outputs[0]=boxes, outputs[1]=scores.
+    scores are already sigmoid-applied.
+    If C > num_classes, first column is background (skipped).
+    """
+    boxes_out = outputs[0][0]   # (300, 4) cxcywh normalized
+    scores_out = outputs[1][0]  # (300, C)
+
+    # Skip background column if present
+    nc = scores_out.shape[-1]
+    if nc > num_classes:
+        class_scores = scores_out[:, 1:]  # skip background col[0]
+    else:
+        class_scores = scores_out
+
+    max_scores = class_scores.max(axis=1)
+    class_ids = class_scores.argmax(axis=1).astype(np.int32)
     mask = max_scores > conf
     if not mask.any():
         return DetectionResult.empty()
 
-    boxes_raw = boxes_raw[mask]
+    boxes_raw = boxes_out[mask]
     scores = max_scores[mask].astype(np.float32)
     class_ids = class_ids[mask]
 
@@ -694,7 +707,7 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
         if model_info.model_type == "seq_yolo":
             result = postprocess_v8(output[0][:1], conf, ratio, pad, orig_shape)
         elif model_info.model_type == "seq_rfdetr":
-            result = postprocess_seq_rfdetr(output, conf, orig_shape)
+            result = postprocess_seq_rfdetr(output, conf, orig_shape, len(model_info.names))
         elif model_info.model_type == "seq_dinov3":
             result = postprocess_dinov3_seq(output, conf, model_info.input_size, orig_shape)
         else:
