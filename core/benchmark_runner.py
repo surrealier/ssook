@@ -165,12 +165,19 @@ def run_benchmark_core(
         layout = model_info.output_layout
         input_name = model_info.input_name
         is_darknet = model_info.model_type == "darknet"
+        is_seq = model_info.model_type.startswith("seq_")
 
         rng = np.random.default_rng(42)
         dummy_frame = rng.integers(0, 256, (src_h, src_w, 3), dtype=np.uint8)
 
         def _preprocess():
-            if is_darknet:
+            if is_seq:
+                from core.inference import preprocess_sequential
+                frames = [dummy_frame] * 3
+                imagenet_norm = model_info.model_type in ("seq_rfdetr", "seq_dinov3")
+                use_lb = model_info.model_type == "seq_yolo"
+                t, r, p = preprocess_sequential(frames, (model_h, model_w), imagenet_norm, use_lb)
+            elif is_darknet:
                 img = cv2.resize(dummy_frame, (model_w, model_h))
                 img = img[..., ::-1].transpose(2, 0, 1)
                 t = np.ascontiguousarray(img[np.newaxis], dtype=np.float32) / 255.0
