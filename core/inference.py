@@ -140,27 +140,32 @@ def _get_seq_frames(model_info, frame: np.ndarray) -> list:
 def preprocess_sequential(frames: list, input_size: tuple,
                           imagenet_norm: bool = False,
                           use_letterbox: bool = False) -> "tuple[np.ndarray, float, tuple]":
-    """3프레임 → (1, 9, H, W) tensor.
+    """3프레임 → (1, 9, H, W) tensor. 최적화: 사전 할당 버퍼, 최소 복사.
 
     Returns: (tensor, ratio, pad)
-        - use_letterbox=True: letterbox resize, ratio/pad for coordinate unscaling
-        - use_letterbox=False: simple resize, ratio=1.0, pad=(0,0)
     """
     h, w = input_size
-    channels = []
+    # Pre-allocate output tensor
+    tensor = np.empty((1, 9, h, w), dtype=np.float32)
     ratio, pad = 1.0, (0.0, 0.0)
-    for f in frames:
+
+    for i, f in enumerate(frames):
         if use_letterbox:
             img, ratio, pad = letterbox(f, input_size)
-            img = img[..., ::-1].astype(np.float32) / 255.0
         else:
             img = cv2.resize(f, (w, h))
-            img = img[..., ::-1].astype(np.float32) / 255.0
+        # BGR→RGB via cv2 (faster than numpy slicing) + write directly to tensor
+        cv2.cvtColor(img, cv2.COLOR_BGR2RGB, dst=img)
+        # Transpose HWC→CHW and normalize in-place into pre-allocated tensor
+        c_offset = i * 3
+        for c in range(3):
+            np.divide(img[:, :, c], 255.0, out=tensor[0, c_offset + c])
         if imagenet_norm:
-            img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
-        channels.append(img.transpose(2, 0, 1))
-    tensor = np.concatenate(channels, axis=0)
-    return np.ascontiguousarray(tensor[np.newaxis], dtype=np.float32), ratio, pad
+            for c in range(3):
+                tensor[0, c_offset + c] -= _IMAGENET_MEAN[c]
+                tensor[0, c_offset + c] /= _IMAGENET_STD[c]
+
+    return tensor, ratio, pad
 
 
 
