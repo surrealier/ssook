@@ -63,7 +63,7 @@ async def run_benchmark(req: BenchmarkRequest):
                 configs.append(BenchmarkConfig(
                     model_path=path, iterations=req.iterations,
                     warmup=300, src_hw=(1080, 1920),
-                    model_type=mt,
+                    model_type=mt, input_size=req.input_size,
                 ))
                 codec_map[idx] = codec
                 idx += 1

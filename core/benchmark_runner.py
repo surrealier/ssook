@@ -74,6 +74,7 @@ class BenchmarkConfig:
     warmup: int = 300
     batch_size: int = 1
     src_hw: "tuple[int, int]" = (1080, 1920)  # 원본 입력 해상도 (H, W); 기본 1920×1080
+    input_size: int = 0  # 0=모델 고유값 사용, >0=dynamic 모델에 이 크기 적용
     ep_key: str = "auto"
 
 
@@ -148,6 +149,12 @@ def run_benchmark_core(
 
         src_h, src_w = cfg.src_hw
         model_h, model_w = model_info.input_size
+        # Dynamic 모델: input_size가 기본값(640)이면 cfg.input_size로 오버라이드
+        if cfg.input_size > 0 and model_info.input_size == (640, 640):
+            inp_shape = model_info.session.get_inputs()[0].shape
+            is_dynamic = not (isinstance(inp_shape[2], int) and inp_shape[2] > 0)
+            if is_dynamic:
+                model_h, model_w = cfg.input_size, cfg.input_size
         batch = cfg.batch_size
 
         raw_batch = model_info.session.get_inputs()[0].shape[0]
