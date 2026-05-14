@@ -124,6 +124,26 @@ _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
+def _preprocess_single_frame(frame: np.ndarray, input_size: tuple,
+                             imagenet_norm: bool, use_letterbox: bool):
+    """단일 프레임 → (3, H, W) float32 tensor + ratio/pad. 내부 헬퍼."""
+    h, w = input_size
+    if use_letterbox:
+        img, ratio, pad = letterbox(frame, input_size)
+    else:
+        img = cv2.resize(frame, (w, h))
+        ratio, pad = 1.0, (0.0, 0.0)
+    cv2.cvtColor(img, cv2.COLOR_BGR2RGB, dst=img)
+    chw = np.empty((3, h, w), dtype=np.float32)
+    for c in range(3):
+        np.divide(img[:, :, c], 255.0, out=chw[c])
+    if imagenet_norm:
+        for c in range(3):
+            chw[c] -= _IMAGENET_MEAN[c]
+            chw[c] /= _IMAGENET_STD[c]
+    return chw, ratio, pad
+
+
 def _get_seq_frames(model_info, frame: np.ndarray) -> list:
     """3프레임 버퍼 관리. 부족 시 현재 프레임으로 패딩."""
     buf = model_info._frame_buffer
@@ -131,7 +151,6 @@ def _get_seq_frames(model_info, frame: np.ndarray) -> list:
     if len(buf) > 3:
         buf.pop(0)
     if len(buf) < 3:
-        # 부족분을 현재 프레임 복제로 채움 (버퍼 자체는 건드리지 않고 반환만)
         pad = [frame] * (3 - len(buf))
         return pad + buf
     return buf
@@ -140,12 +159,11 @@ def _get_seq_frames(model_info, frame: np.ndarray) -> list:
 def preprocess_sequential(frames: list, input_size: tuple,
                           imagenet_norm: bool = False,
                           use_letterbox: bool = False) -> "tuple[np.ndarray, float, tuple]":
-    """3프레임 → (1, 9, H, W) tensor. 최적화: 사전 할당 버퍼, 최소 복사.
+    """3프레임 → (1, 9, H, W) tensor. 사전 할당 버퍼, 최소 복사.
 
     Returns: (tensor, ratio, pad)
     """
     h, w = input_size
-    # Pre-allocate output tensor
     tensor = np.empty((1, 9, h, w), dtype=np.float32)
     ratio, pad = 1.0, (0.0, 0.0)
 
@@ -154,9 +172,7 @@ def preprocess_sequential(frames: list, input_size: tuple,
             img, ratio, pad = letterbox(f, input_size)
         else:
             img = cv2.resize(f, (w, h))
-        # BGR→RGB via cv2 (faster than numpy slicing) + write directly to tensor
         cv2.cvtColor(img, cv2.COLOR_BGR2RGB, dst=img)
-        # Transpose HWC→CHW and normalize in-place into pre-allocated tensor
         c_offset = i * 3
         for c in range(3):
             np.divide(img[:, :, c], 255.0, out=tensor[0, c_offset + c])
@@ -164,6 +180,43 @@ def preprocess_sequential(frames: list, input_size: tuple,
             for c in range(3):
                 tensor[0, c_offset + c] -= _IMAGENET_MEAN[c]
                 tensor[0, c_offset + c] /= _IMAGENET_STD[c]
+
+    return tensor, ratio, pad
+
+
+def preprocess_sequential_cached(model_info, frame: np.ndarray, input_size: tuple,
+                                 imagenet_norm: bool = False,
+                                 use_letterbox: bool = False) -> "tuple[np.ndarray, float, tuple]":
+    """3프레임 → (1, 9, H, W) tensor. 이전 프레임의 전처리 결과를 캐싱하여 재사용.
+
+    _seq_tensor_buf: list of (3,H,W) float32 tensors (최대 3개)
+    새 프레임만 resize+normalize하고, 이전 2프레임은 캐시에서 복사.
+    """
+    h, w = input_size
+    # 텐서 캐시 버퍼 관리
+    tbuf = getattr(model_info, '_seq_tensor_buf', None)
+    if tbuf is None:
+        tbuf = []
+        model_info._seq_tensor_buf = tbuf
+
+    # 새 프레임만 전처리
+    chw, ratio, pad = _preprocess_single_frame(frame, input_size, imagenet_norm, use_letterbox)
+    tbuf.append(chw)
+    if len(tbuf) > 3:
+        tbuf.pop(0)
+
+    # 출력 텐서 조립
+    tensor = np.empty((1, 9, h, w), dtype=np.float32)
+    if len(tbuf) < 3:
+        # 부족분은 현재 프레임으로 패딩
+        for i in range(3 - len(tbuf)):
+            tensor[0, i*3:(i+1)*3] = chw
+        for i, t in enumerate(tbuf):
+            offset = (3 - len(tbuf) + i) * 3
+            tensor[0, offset:offset+3] = t
+    else:
+        for i in range(3):
+            tensor[0, i*3:(i+1)*3] = tbuf[i]
 
     return tensor, ratio, pad
 
@@ -629,6 +682,27 @@ def convert_darknet_to_unified(
     )
 
 
+def _run_with_iobinding(model_info: ModelInfo, tensor: np.ndarray) -> list:
+    """IOBinding으로 추론. CUDA EP일 때 CPU→GPU 전송 최적화. 미지원 시 fallback."""
+    session = model_info.session
+    try:
+        providers = session.get_providers()
+        if "CUDAExecutionProvider" not in providers:
+            return session.run(None, {model_info.input_name: tensor})
+
+        io = session.io_binding()
+        # 입력을 numpy에서 직접 바인딩 (ORT가 내부적으로 GPU 복사 최적화)
+        io.bind_cpu_input(model_info.input_name, tensor)
+        # 출력은 GPU에 할당
+        for out in session.get_outputs():
+            io.bind_output(out.name, "cuda")
+        session.run_with_iobinding(io)
+        return [o.numpy() for o in io.get_outputs()]
+    except Exception:
+        # IOBinding 미지원 시 fallback
+        return session.run(None, {model_info.input_name: tensor})
+
+
 def _make_batch_tensor(tensor: np.ndarray, bs: int, model_info: ModelInfo) -> np.ndarray:
     """고정 배치 모델용: 단일 이미지 텐서를 배치 크기로 확장. 캐싱된 버퍼 재사용."""
     if bs <= 1:
@@ -702,12 +776,11 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
             boxes=iseg_res.boxes, scores=iseg_res.scores,
             class_ids=iseg_res.class_ids, infer_ms=infer_ms)
     elif model_info.model_type.startswith("seq_"):
-        frames = _get_seq_frames(model_info, frame)
         imagenet_norm = model_info.model_type in ("seq_rfdetr", "seq_dinov3")
         use_letterbox = model_info.model_type == "seq_yolo"
-        tensor, ratio, pad = preprocess_sequential(
-            frames, model_info.input_size, imagenet_norm, use_letterbox)
-        output = model_info.session.run(None, {model_info.input_name: tensor})
+        tensor, ratio, pad = preprocess_sequential_cached(
+            model_info, frame, model_info.input_size, imagenet_norm, use_letterbox)
+        output = _run_with_iobinding(model_info, tensor)
         infer_ms = (time.perf_counter() - t0) * 1000.0
         if model_info.model_type == "seq_yolo":
             result = postprocess_v8(output[0][:1], conf, ratio, pad, orig_shape)
