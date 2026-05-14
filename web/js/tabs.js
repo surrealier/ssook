@@ -42,7 +42,7 @@ Tabs.viewer = {
             <input type="text" class="form-input input-normal" style="width:100%;box-sizing:border-box;font-size:11px;height:28px;margin-bottom:0.35rem;" id="v-model-path" placeholder="Model path" value="${G.model}" onchange="Tabs.viewer.selectModel(this.value)">
             <div style="display:flex;gap:0.25rem;margin-bottom:0.5rem;">
               <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseModel()">${t('browse')}</button>
-              <button class="btn btn-ghost btn-sm" onclick="showHFBrowser('v-model-path')" title="HuggingFace Hub">🤗</button>
+              <button class="btn btn-ghost btn-sm" onclick="showHFBrowser('v-model-path')" title="HuggingFace Hub" style="font-size:11px;font-weight:500;">HF</button>
               <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshModels()" title="Refresh">↻</button>
             </div>
             <div id="v-model-list" style="flex:1;overflow-y:auto;font-size:12px;" class="text-secondary">${t('viewer.loading')}</div>
@@ -52,13 +52,13 @@ Tabs.viewer = {
             <input type="text" class="form-input input-normal" style="width:100%;box-sizing:border-box;font-size:11px;height:28px;margin-bottom:0.35rem;" id="v-video-path" placeholder="Video/Image path" value="${G.videoPath||''}" onchange="Tabs.viewer.selectVideo(this.value)">
             <div style="display:flex;gap:0.25rem;margin-bottom:0.5rem;">
               <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseVideo()">${t('browse')}</button>
-              <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseImageFolder()" title="Open image folder">📁</button>
+              <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseImageFolder()" title="Open image folder">${Icons.folder(14)}</button>
               <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshVideos()" title="Refresh">↻</button>
             </div>
             <div id="v-img-nav-bar" style="display:none;align-items:center;gap:0.25rem;margin-bottom:0.5rem;">
               <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer._navImage(-1)">◀</button>
               <span id="v-img-nav" style="flex:1;text-align:center;font-size:11px;" class="text-secondary"></span>
-              <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer._navImage(1)">▶</button>
+              <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer._navImage(1)">${Icons.play(12)}</button>
             </div>
             <div id="v-video-list" style="flex:1;overflow-y:auto;font-size:12px;" class="text-secondary">${t('viewer.loading')}</div>
           </div>
@@ -71,7 +71,7 @@ Tabs.viewer = {
                 <label class="form-label" style="font-size:10px;">Text Encoder</label>
                 <div style="display:flex;gap:0.25rem;">
                   <input type="text" class="form-input input-normal" style="flex:1;font-size:11px;height:28px;min-width:0;" id="v-clip-txt-enc" placeholder="Text encoder .onnx">
-                  <button class="btn btn-secondary btn-sm" onclick="pickFile('v-clip-txt-enc','ONNX (*.onnx)')" style="font-size:10px;">📂</button>
+                  <button class="btn btn-secondary btn-sm" onclick="pickFile('v-clip-txt-enc','ONNX (*.onnx)')" style="font-size:10px;"></button>
                 </div>
               </div>
             </div>
@@ -89,8 +89,8 @@ Tabs.viewer = {
           <input type="range" id="v-seek" min="0" max="0" value="0" style="width:100%;accent-color:var(--action-link-05);margin:0;" disabled>
           <!-- Control bar -->
           <div style="display:flex;gap:0.35rem;align-items:center;flex-wrap:wrap;">
-            <button class="btn btn-primary btn-sm" id="btn-play" onclick="Tabs.viewer.togglePlay()" disabled>▶ ${t('viewer.play')}</button>
-            <button class="btn btn-secondary btn-sm" id="btn-stop" onclick="Tabs.viewer.stop()" disabled>⏹</button>
+            <button class="btn btn-primary btn-sm" id="btn-play" onclick="Tabs.viewer.togglePlay()" disabled>${Icons.play(14)} ${t('viewer.play')}</button>
+            <button class="btn btn-secondary btn-sm" id="btn-stop" onclick="Tabs.viewer.stop()" disabled>${Icons.stop(14)}</button>
             <span style="width:1px;height:20px;background:var(--border-default);margin:0 0.25rem;"></span>
             <button class="btn btn-secondary btn-sm" id="btn-snapshot" onclick="Tabs.viewer.snapshot()" disabled style="display:flex;align-items:center;gap:2px;">${Icons._svg('<rect x="2" y="4" width="20" height="16" rx="2"/><circle cx="12" cy="13" r="4"/><path d="M17 4l-2-2H9L7 4"/>',14)}</button>
             <span style="width:1px;height:20px;background:var(--border-default);margin:0 0.25rem;"></span>
@@ -246,7 +246,7 @@ Tabs.viewer = {
   },
   _onKey(e) {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
-    if (e.key === ' ') { e.preventDefault(); this._streamSessionId ? (this._paused ? this.play() : this.pause()) : this.play(); }
+    if (e.key === ' ') { e.preventDefault(); this.togglePlay(); }
     else if (e.key === 'ArrowLeft') { e.preventDefault(); this._imgList ? this._navImage(-1) : this.stepBack(); }
     else if (e.key === 'ArrowRight') { e.preventDefault(); this._imgList ? this._navImage(1) : this.stepFwd(); }
     else if (e.key === 's' || e.key === 'S') this.snapshot();
@@ -477,7 +477,7 @@ Tabs.viewer = {
   _setControls(playing) {
     const btn = document.getElementById('btn-play');
     btn.disabled = false;
-    btn.innerHTML = playing ? '⏸ ' + t('viewer.pause') : '▶ ' + t('viewer.play');
+    btn.innerHTML = playing ? Icons.pause(14) + ' ' + t('viewer.pause') : Icons.play(14) + ' ' + t('viewer.play');
     document.getElementById('btn-stop').disabled = !this._streamSessionId;
     document.getElementById('btn-snapshot').disabled = !this._streamSessionId;
   },
@@ -499,7 +499,7 @@ Tabs.viewer = {
     this._paused = false;
     const btn = document.getElementById('btn-play');
     btn.disabled = !G.model || !G.videoPath;
-    btn.innerHTML = '▶ ' + t('viewer.play');
+    btn.innerHTML = Icons.play(14) + ' ' + t('viewer.play');
     document.getElementById('btn-stop').disabled = true;
     document.getElementById('btn-snapshot').disabled = true;
   },
@@ -508,7 +508,7 @@ Tabs.viewer = {
     const r = await API.post('/api/viewer/pause/' + this._streamSessionId, {});
     this._paused = r.paused;
     const btn = document.getElementById('btn-play');
-    btn.innerHTML = this._paused ? '▶ ' + t('viewer.play') : '⏸ ' + t('viewer.pause');
+    btn.innerHTML = this._paused ? Icons.play(14) + ' ' + t('viewer.play') : Icons.pause(14) + ' ' + t('viewer.pause');
     App.setStatus(this._paused ? t('viewer.paused') : t('viewer.playing'));
     if (!this._paused) this._pollStatus();
   },
@@ -563,25 +563,25 @@ Tabs.settings = {
           <div class="card" style="padding:1.5rem;">
             <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('settings.test_model_dl')}</h3>
             <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
-              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 Detection (YOLO11n)</a>
-              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-cls.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 Classification (YOLO11n-cls)</a>
-              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-seg.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 Segmentation (YOLO11n-seg)</a>
-              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 Pose (YOLO11n-pose)</a>
-              <a href="https://huggingface.co/Xenova/clip-vit-base-patch32/tree/main/onnx" target="_blank" class="btn btn-secondary btn-sm">📥 CLIP (ViT-B/32 ONNX)</a>
-              <a href="https://huggingface.co/immich-app/ViT-B-32__openai/tree/main" target="_blank" class="btn btn-secondary btn-sm">📥 Embedder (ViT-B/32 ONNX)</a>
-              <a href="https://huggingface.co/Xenova/vilt-b32-finetuned-vqa/tree/main/onnx" target="_blank" class="btn btn-secondary btn-sm">📥 VLM — VQA (ViLT)</a>
-              <a href="https://huggingface.co/Xenova/blip-image-captioning-base/tree/main/onnx" target="_blank" class="btn btn-secondary btn-sm">📥 VLM — Caption (BLIP)</a>
+              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">↓ Detection (YOLO11n)</a>
+              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-cls.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">↓ Classification (YOLO11n-cls)</a>
+              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-seg.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">↓ Segmentation (YOLO11n-seg)</a>
+              <a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.onnx" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">↓ Pose (YOLO11n-pose)</a>
+              <a href="https://huggingface.co/Xenova/clip-vit-base-patch32/tree/main/onnx" target="_blank" class="btn btn-secondary btn-sm">↓ CLIP (ViT-B/32 ONNX)</a>
+              <a href="https://huggingface.co/immich-app/ViT-B-32__openai/tree/main" target="_blank" class="btn btn-secondary btn-sm">↓ Embedder (ViT-B/32 ONNX)</a>
+              <a href="https://huggingface.co/Xenova/vilt-b32-finetuned-vqa/tree/main/onnx" target="_blank" class="btn btn-secondary btn-sm">↓ VLM — VQA (ViLT)</a>
+              <a href="https://huggingface.co/Xenova/blip-image-captioning-base/tree/main/onnx" target="_blank" class="btn btn-secondary btn-sm">↓ VLM — Caption (BLIP)</a>
             </div>
             <h4 class="text-heading-h3" style="margin:1.25rem 0 0.75rem;font-size:14px;">${t('settings.test_data_dl')}</h4>
             <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
-              <a href="https://ultralytics.com/assets/coco128.zip" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 COCO128 Dataset (YOLO format)</a>
+              <a href="https://ultralytics.com/assets/coco128.zip" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">↓ COCO128 Dataset (YOLO format)</a>
             </div>
             <h4 class="text-heading-h3" style="margin:1.25rem 0 0.75rem;font-size:14px;">${t('settings.builtin_samples')}</h4>
             <div class="text-secondary" style="font-size:12px;margin-bottom:0.5rem;">${t('settings.builtin_samples_desc')}</div>
             <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
-              <a href="/assets/samples/bus.jpg" download class="btn btn-secondary btn-sm">🖼️ bus.jpg</a>
-              <a href="/assets/samples/zidane.jpg" download class="btn btn-secondary btn-sm">🖼️ zidane.jpg</a>
-              <a href="/assets/samples/people.mp4" download class="btn btn-secondary btn-sm">🎬 people.mp4</a>
+              <a href="/assets/samples/bus.jpg" download class="btn btn-secondary btn-sm">${Icons.image(12)} bus.jpg</a>
+              <a href="/assets/samples/zidane.jpg" download class="btn btn-secondary btn-sm">${Icons.image(12)} zidane.jpg</a>
+              <a href="/assets/samples/people.mp4" download class="btn btn-secondary btn-sm">people.mp4</a>
             </div>
           </div>
           <div class="card" style="padding:1.5rem;">
@@ -1003,7 +1003,7 @@ Tabs.benchmark = {
           <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('bench.config')}</h3>
           <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;">
             <div class="form-group"><label class="form-label">${t('bench.iters')}</label><input type="number" class="form-input input-normal" value="500" min="10" max="5000" step="100" id="bench-iters"></div>
-            <div class="form-group"><label class="form-label">${t('bench.input_size')}</label><select class="form-input input-normal" id="bench-size"><option>640</option><option>320</option><option>1280</option></select></div>
+            <div class="form-group"><label class="form-label">${t('bench.input_size')}</label><select class="form-input input-normal" id="bench-size"><option>640</option><option>320</option><option>960</option><option>1280</option></select></div>
             <div class="form-group"><label class="form-label">${t('bench.warmup')}</label><span class="form-input" style="background:var(--background-neutral-02);color:var(--text-03);">${t('bench.fixed')}</span></div>
           </div>
           <div style="margin-top:0.75rem;">
@@ -1171,10 +1171,6 @@ Tabs.evaluation = {
                 <input type="number" class="form-input input-normal" id="eval-topk" value="5" min="1" max="100" style="width:80px;"></div>
             </div>
           </div>
-          <div class="form-group" style="margin-top:0.75rem;" id="eval-classmap-group">
-            <label class="form-label">${t('eval.gt_classmap')}</label>
-            <textarea class="form-input" id="eval-classmap" rows="4" style="font-size:12px;font-family:monospace;" placeholder="0: person&#10;1: car&#10;2: bicycle"></textarea>
-          </div>
           <div style="display:flex;gap:0.5rem;margin-top:1rem;">
             <button class="btn btn-primary" id="eval-run-btn" onclick="Tabs.evaluation.run()">${t('eval.run')}</button>
             <button class="btn btn-danger btn-sm" id="eval-stop-btn" disabled onclick="Tabs.evaluation.stop()">${t('stop')}</button>
@@ -1207,7 +1203,6 @@ Tabs.evaluation = {
     if (segOpts) segOpts.style.display = task === 'segmentation' ? '' : 'none';
     if (clipOpts) clipOpts.style.display = task === 'clip' ? '' : 'none';
     if (embedOpts) embedOpts.style.display = task === 'embedder' ? '' : 'none';
-    if (cmGroup) cmGroup.style.display = (task === 'segmentation' || task === 'clip' || task === 'embedder') ? 'none' : '';
     const thead = document.getElementById('eval-thead');
     if (thead) {
       if (task === 'detection') thead.innerHTML = '<th>Model</th><th>mAP@50</th><th>mAP@50:95</th><th>Precision</th><th>Recall</th><th>F1</th><th></th>';
@@ -2101,7 +2096,7 @@ Tabs.splitter = {
       if (pbarText) pbarText.textContent = '100%';
       if (s.results) {
         const res = document.getElementById('split-result');
-        if (res) res.innerHTML = `✅ Train: ${s.results.train||0}, Val: ${s.results.val||0}, Test: ${s.results.test||0}`;
+        if (res) res.innerHTML = `Done — Train: ${s.results.train||0}, Val: ${s.results.val||0}, Test: ${s.results.test||0}`;
         App.setStatus(`Split complete — Train: ${s.results.train||0}, Val: ${s.results.val||0}, Test: ${s.results.test||0}`);
       } else {
         App.setStatus(s.msg || 'Complete');
