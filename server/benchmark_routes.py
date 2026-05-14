@@ -36,16 +36,34 @@ async def run_benchmark(req: BenchmarkRequest):
 
         from core.app_config import AppConfig
         bench_cfg = AppConfig()
+        configured_type = bench_cfg.model_type
         codecs = req.codecs or ["none"]
         configs = []
         codec_map = {}  # config index -> codec name
         idx = 0
         for path in req.models:
+            # Detect model_type per model: if input has 9 channels, use configured seq_ type
+            # otherwise use default "yolo"
+            mt = "yolo"
+            try:
+                import onnxruntime as _ort
+                _s = _ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+                _inp = _s.get_inputs()[0]
+                in_ch = int(_inp.shape[1]) if len(_inp.shape) >= 4 and isinstance(_inp.shape[1], int) else 3
+                if in_ch == 9 and configured_type.startswith("seq_"):
+                    mt = configured_type
+                elif in_ch == 9:
+                    mt = "seq_yolo"
+                else:
+                    mt = configured_type if not configured_type.startswith("seq_") else "yolo"
+                del _s
+            except Exception:
+                mt = configured_type
             for codec in codecs:
                 configs.append(BenchmarkConfig(
                     model_path=path, iterations=req.iterations,
                     warmup=300, src_hw=(1080, 1920),
-                    model_type=bench_cfg.model_type,
+                    model_type=mt,
                 ))
                 codec_map[idx] = codec
                 idx += 1
