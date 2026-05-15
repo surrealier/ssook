@@ -186,39 +186,68 @@ def preprocess_sequential(frames: list, input_size: tuple,
 
 def preprocess_sequential_cached(model_info, frame: np.ndarray, input_size: tuple,
                                  imagenet_norm: bool = False,
-                                 use_letterbox: bool = False) -> "tuple[np.ndarray, float, tuple]":
-    """3프레임 → (1, 9, H, W) tensor. 이전 프레임의 전처리 결과를 캐싱하여 재사용.
+                                 use_letterbox: bool = False) -> "tuple[np.ndarray, float, tuple] | None":
+    """3프레임 → (1, 9, H, W) tensor. 캐싱 + stride=2 + 비동기 전처리.
 
-    _seq_tensor_buf: list of (3,H,W) float32 tensors (최대 3개)
-    새 프레임만 resize+normalize하고, 이전 2프레임은 캐시에서 복사.
+    Stride=2: [0,1,2] → [2,3,4] → [4,5,6] (매 2프레임마다 추론)
+    홀수 프레임에서는 None 반환 → 호출자가 이전 결과 재사용.
+    비동기: 추론 완료 후 다음 프레임 전처리를 백그라운드에서 시작.
+
+    Returns: (tensor, ratio, pad) or None (skip this frame)
     """
     h, w = input_size
-    # 텐서 캐시 버퍼 관리
     tbuf = getattr(model_info, '_seq_tensor_buf', None)
     if tbuf is None:
         tbuf = []
         model_info._seq_tensor_buf = tbuf
+    counter = getattr(model_info, '_seq_frame_counter', 0)
 
-    # 새 프레임만 전처리
+    # 비동기 전처리 결과 수거
+    fut = getattr(model_info, '_seq_async_future', None)
+    if fut is not None:
+        try:
+            async_chw, async_ratio, async_pad = fut.result(timeout=0.1)
+            tbuf.append(async_chw)
+            if len(tbuf) > 3:
+                tbuf.pop(0)
+        except Exception:
+            pass
+        model_info._seq_async_future = None
+
+    # 현재 프레임 전처리
     chw, ratio, pad = _preprocess_single_frame(frame, input_size, imagenet_norm, use_letterbox)
     tbuf.append(chw)
     if len(tbuf) > 3:
         tbuf.pop(0)
+    counter += 1
+    model_info._seq_frame_counter = counter
 
-    # 출력 텐서 조립
-    tensor = np.empty((1, 9, h, w), dtype=np.float32)
+    # 버퍼가 3개 미만이면 skip
     if len(tbuf) < 3:
-        # 부족분은 현재 프레임으로 패딩
-        for i in range(3 - len(tbuf)):
-            tensor[0, i*3:(i+1)*3] = chw
-        for i, t in enumerate(tbuf):
-            offset = (3 - len(tbuf) + i) * 3
-            tensor[0, offset:offset+3] = t
-    else:
-        for i in range(3):
-            tensor[0, i*3:(i+1)*3] = tbuf[i]
+        return None
+
+    # stride=2: 매 2프레임마다 추론 (counter가 짝수일 때), 단 첫 추론(counter==3)은 항상 실행
+    if counter > 3 and counter % 2 != 0:
+        return None
+
+    # 텐서 조립
+    tensor = np.empty((1, 9, h, w), dtype=np.float32)
+    for i in range(3):
+        tensor[0, i*3:(i+1)*3] = tbuf[i]
 
     return tensor, ratio, pad
+
+
+def _start_async_preprocess(model_info, frame: np.ndarray, input_size: tuple,
+                            imagenet_norm: bool, use_letterbox: bool):
+    """다음 프레임 전처리를 백그라운드 스레드에서 시작."""
+    from concurrent.futures import ThreadPoolExecutor
+    pool = getattr(model_info, '_seq_thread_pool', None)
+    if pool is None:
+        pool = ThreadPoolExecutor(max_workers=1)
+        model_info._seq_thread_pool = pool
+    model_info._seq_async_future = pool.submit(
+        _preprocess_single_frame, frame.copy(), input_size, imagenet_norm, use_letterbox)
 
 
 
@@ -778,18 +807,28 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
     elif model_info.model_type.startswith("seq_"):
         imagenet_norm = model_info.model_type in ("seq_rfdetr", "seq_dinov3")
         use_letterbox = model_info.model_type == "seq_yolo"
-        tensor, ratio, pad = preprocess_sequential_cached(
+        prep_result = preprocess_sequential_cached(
             model_info, frame, model_info.input_size, imagenet_norm, use_letterbox)
-        output = _run_with_iobinding(model_info, tensor)
-        infer_ms = (time.perf_counter() - t0) * 1000.0
-        if model_info.model_type == "seq_yolo":
-            result = postprocess_v8(output[0][:1], conf, ratio, pad, orig_shape)
-        elif model_info.model_type == "seq_rfdetr":
-            result = postprocess_seq_rfdetr(output, conf, orig_shape, len(model_info.names))
-        elif model_info.model_type == "seq_dinov3":
-            result = postprocess_dinov3_seq(output, conf, model_info.input_size, orig_shape)
+        if prep_result is None:
+            # Stride skip — 이전 결과 재사용
+            infer_ms = 0.0
+            cached = getattr(model_info, '_seq_last_result', None)
+            result = cached if cached is not None else DetectionResult.empty()
         else:
-            result = DetectionResult.empty()
+            tensor, ratio, pad = prep_result
+            output = _run_with_iobinding(model_info, tensor)
+            infer_ms = (time.perf_counter() - t0) * 1000.0
+            if model_info.model_type == "seq_yolo":
+                result = postprocess_v8(output[0][:1], conf, ratio, pad, orig_shape)
+            elif model_info.model_type == "seq_rfdetr":
+                result = postprocess_seq_rfdetr(output, conf, orig_shape, len(model_info.names))
+            elif model_info.model_type == "seq_dinov3":
+                result = postprocess_dinov3_seq(output, conf, model_info.input_size, orig_shape)
+            else:
+                result = DetectionResult.empty()
+            model_info._seq_last_result = result
+            # 비동기: 다음 프레임 전처리 시작 (현재 프레임을 미리 처리)
+            _start_async_preprocess(model_info, frame, model_info.input_size, imagenet_norm, use_letterbox)
     else:
         padded, ratio, pad = letterbox(frame, model_info.input_size)
         tensor = _padded_to_tensor(padded, model_info.input_size)

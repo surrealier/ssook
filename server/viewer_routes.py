@@ -87,6 +87,8 @@ async def viewer_start(req: VideoStartRequest):
         }
         model._frame_buffer = []
         model._seq_tensor_buf = []
+        model._seq_frame_counter = 0
+        model._seq_last_result = None
         return {"session_id": sid, "fps": fps,
                 "total_frames": _video_sessions[sid]["total"]}
     except Exception as e:
@@ -118,6 +120,8 @@ async def viewer_stream(session_id: str):
                     sess["seek_to"] = None
                     model._frame_buffer = []
                     model._seq_tensor_buf = []
+                    model._seq_frame_counter = 0
+                    model._seq_last_result = None
 
                 # Handle step
                 step = sess.get("step_request")
