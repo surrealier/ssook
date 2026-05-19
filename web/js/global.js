@@ -6,6 +6,100 @@ const G = {
   models: [],     // list of loaded model paths (for multi-model tabs)
 };
 
+/* ── Shared UX primitives ─────────────────────────────────────
+   Tiny, framework-free helpers reused across tabs.
+   - UX.spinner(size): inline SVG spinner
+   - UX.empty(iconName, titleKey, hintKey): empty-state card
+   - UX.guardRun(opts, asyncFn): toggle a Run/Stop button pair while a task is in-flight
+   - Form.validate(rules): client-side validation with .form-error markers
+*/
+const UX = {
+  spinner(size) {
+    size = size || 14;
+    return `<svg class="ux-spin" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+      <path d="M21 12a9 9 0 1 1-6.219-8.56"></path>
+    </svg>`;
+  },
+  empty(iconHtml, title, hint) {
+    return `<div class="empty-state">
+      <div class="empty-state-icon">${iconHtml || ''}</div>
+      <div class="empty-state-title">${title || ''}</div>
+      ${hint ? `<div class="empty-state-hint">${hint}</div>` : ''}
+    </div>`;
+  },
+  // Guard a Run button so double-clicks cannot spawn duplicate background tasks.
+  // opts: { runId, stopId?, runningLabel?, idleLabel? }. asyncFn must return when
+  // the *kick-off* is done (not the entire background task). On error or rejection
+  // the run button is restored; on success the caller is responsible for resetting
+  // state once the background task completes (poll loop or task completion path).
+  async guardRun(opts, asyncFn) {
+    const runBtn = document.getElementById(opts.runId);
+    const stopBtn = opts.stopId ? document.getElementById(opts.stopId) : null;
+    if (!runBtn) return asyncFn();
+    if (runBtn.disabled) return; // already running
+    const idle = opts.idleLabel || runBtn.textContent;
+    runBtn.disabled = true;
+    if (opts.runningLabel) runBtn.textContent = opts.runningLabel;
+    if (stopBtn) stopBtn.disabled = false;
+    try {
+      return await asyncFn();
+    } catch (e) {
+      // On kick-off failure restore immediately. Poll path resets on its own.
+      runBtn.disabled = false;
+      runBtn.textContent = idle;
+      if (stopBtn) stopBtn.disabled = true;
+      throw e;
+    }
+  },
+};
+
+const Form = {
+  // rules: [{el: id|HTMLElement, required?, type?: 'path'|'number', min?, max?}]
+  // Returns {ok, errors: [{el, msg}]}.
+  validate(rules) {
+    const errors = [];
+    for (const r of rules) {
+      const el = typeof r.el === 'string' ? document.getElementById(r.el) : r.el;
+      if (!el) continue;
+      el.classList.remove('form-error');
+      const v = (el.value || '').trim();
+      if (r.required && !v) {
+        errors.push({ el, msg: r.msg || 'Required' });
+        el.classList.add('form-error');
+        continue;
+      }
+      if (r.type === 'number' && v !== '') {
+        const n = Number(v);
+        if (!isFinite(n) || (r.min != null && n < r.min) || (r.max != null && n > r.max)) {
+          errors.push({ el, msg: r.msg || `Number out of range` });
+          el.classList.add('form-error');
+        }
+      }
+    }
+    if (errors.length && typeof App !== 'undefined' && App.toast) {
+      App.toast('warn', errors[0].msg || 'Invalid input',
+        errors.map(e => (e.el.id || e.el.name) + ': ' + e.msg).join('\n'));
+    }
+    return { ok: errors.length === 0, errors };
+  },
+  // Map a backend 422 detail array to per-field errors.
+  // detail: [{loc: ['body','field'], msg, type}, ...]
+  showBackendErrors(detail, idMap) {
+    if (!Array.isArray(detail)) return;
+    const lines = [];
+    for (const d of detail) {
+      const field = d.loc && d.loc[d.loc.length - 1];
+      const domId = (idMap && idMap[field]) || field;
+      const el = domId && document.getElementById(domId);
+      if (el) el.classList.add('form-error');
+      lines.push(`${field}: ${d.msg}`);
+    }
+    if (typeof App !== 'undefined' && App.toast) {
+      App.toast('error', 'Backend validation error', lines.join('\n'));
+    }
+  },
+};
+
 /* Auto-set lblDir when imgDir changes */
 function setImgDir(dir) {
   G.imgDir = dir;
@@ -25,13 +119,13 @@ function setModel(path) {
   App.setStatus(`Model: ${path.split(/[\\/]/).pop()}`);
 }
 
-/* Reusable UI components */
+/* Reusable UI components — every input gets a real `<label for=>` for a11y. */
 function modelInput(id) {
   return `<div class="form-group">
-    <label class="form-label">${t('settings.model')}</label>
+    <label class="form-label" for="${id}">${t('settings.model')}</label>
     <div style="display:flex;gap:0.5rem;">
-      <input type="text" class="form-input input-normal" style="flex:1;" id="${id}" data-bind="model" value="${G.model}" onchange="setModel(this.value)">
-      <button class="btn btn-secondary btn-sm" onclick="pickModel('${id}')">
+      <input type="text" class="form-input input-normal" style="flex:1;" id="${id}" data-bind="model" value="${G.model}" onchange="setModel(this.value)" aria-label="${t('settings.model')}">
+      <button class="btn btn-secondary btn-sm" onclick="pickModel('${id}')" aria-label="${t('browse')}">
         ${t('browse')}
       </button>
     </div>
@@ -39,10 +133,10 @@ function modelInput(id) {
 }
 function imgDirInput(id) {
   return `<div class="form-group">
-    <label class="form-label">${t('explorer.img_dir')}</label>
+    <label class="form-label" for="${id}">${t('explorer.img_dir')}</label>
     <div style="display:flex;gap:0.5rem;">
-      <input type="text" class="form-input input-normal" style="flex:1;" id="${id}" data-bind="imgDir" value="${G.imgDir}" onchange="setImgDir(this.value)">
-      <button class="btn btn-secondary btn-sm" onclick="pickImgDir('${id}')">
+      <input type="text" class="form-input input-normal" style="flex:1;" id="${id}" data-bind="imgDir" value="${G.imgDir}" onchange="setImgDir(this.value)" aria-label="${t('explorer.img_dir')}">
+      <button class="btn btn-secondary btn-sm" onclick="pickImgDir('${id}')" aria-label="${t('browse')}">
         ${t('browse')}
       </button>
     </div>
@@ -50,10 +144,10 @@ function imgDirInput(id) {
 }
 function lblDirInput(id) {
   return `<div class="form-group">
-    <label class="form-label">${t('explorer.lbl_dir')}</label>
+    <label class="form-label" for="${id}">${t('explorer.lbl_dir')}</label>
     <div style="display:flex;gap:0.5rem;">
-      <input type="text" class="form-input input-normal" style="flex:1;" id="${id}" data-bind="lblDir" value="${G.lblDir}" onchange="setLblDir(this.value)">
-      <button class="btn btn-secondary btn-sm" onclick="pickLblDir('${id}')">
+      <input type="text" class="form-input input-normal" style="flex:1;" id="${id}" data-bind="lblDir" value="${G.lblDir}" onchange="setLblDir(this.value)" aria-label="${t('explorer.lbl_dir')}">
+      <button class="btn btn-secondary btn-sm" onclick="pickLblDir('${id}')" aria-label="${t('browse')}">
         ${t('browse')}
       </button>
     </div>
@@ -61,10 +155,10 @@ function lblDirInput(id) {
 }
 function outDirInput(id) {
   return `<div class="form-group">
-    <label class="form-label">${t('splitter.output')}</label>
+    <label class="form-label" for="${id}">${t('splitter.output')}</label>
     <div style="display:flex;gap:0.5rem;">
-      <input type="text" class="form-input input-normal" style="flex:1;" id="${id}" onchange="this.value=this.value.trim()">
-      <button class="btn btn-secondary btn-sm" onclick="pickDir('${id}')">
+      <input type="text" class="form-input input-normal" style="flex:1;" id="${id}" onchange="this.value=this.value.trim()" aria-label="${t('splitter.output')}">
+      <button class="btn btn-secondary btn-sm" onclick="pickDir('${id}')" aria-label="${t('browse')}">
         ${t('browse')}
       </button>
     </div>

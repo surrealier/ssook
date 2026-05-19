@@ -48,4 +48,16 @@ const Icons = {
   moon:       (s) => Icons._svg('<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>', s),
   globe:      (s) => Icons._svg('<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>', s),
   logo:       (s) => Icons._svg('<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/>', s),
+  // Media & file
+  folder:     (s) => Icons._svg('<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>', s),
+  play:       (s) => Icons._svg('<polygon points="5 3 19 12 5 21 5 3"/>', s),
+  pause:      (s) => Icons._svg('<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>', s),
+  stop:       (s) => Icons._svg('<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>', s),
+  image:      (s) => Icons._svg('<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>', s),
+  chart:      (s) => Icons._svg('<line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/>', s),
+  lightbulb:  (s) => Icons._svg('<path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/>', s),
+  zap:        (s) => Icons._svg('<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>', s),
+  link:       (s) => Icons._svg('<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>', s),
+  circle:     (s) => Icons._svg('<circle cx="12" cy="12" r="10"/>', s),
+  dot:        (s) => Icons._svg('<circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/>', s),
 };

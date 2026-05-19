@@ -42,25 +42,25 @@ Tabs.viewer = {
             <input type="text" class="form-input input-normal" style="width:100%;box-sizing:border-box;font-size:11px;height:28px;margin-bottom:0.35rem;" id="v-model-path" placeholder="Model path" value="${G.model}" onchange="Tabs.viewer.selectModel(this.value)">
             <div style="display:flex;gap:0.25rem;margin-bottom:0.5rem;">
               <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseModel()">${t('browse')}</button>
-              <button class="btn btn-ghost btn-sm" onclick="showHFBrowser('v-model-path')" title="HuggingFace Hub" style="font-size:11px;font-weight:500;">HF</button>
-              <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshModels()" title="Refresh">↻</button>
+              <button class="btn btn-ghost btn-sm" onclick="showHFBrowser('v-model-path')" title="${t('a11y.huggingface')}" aria-label="${t('a11y.huggingface')}" style="font-size:11px;font-weight:500;">HF</button>
+              <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshModels()" title="${t('a11y.refresh')}" aria-label="${t('a11y.refresh')}">↻</button>
             </div>
-            <div id="v-model-list" style="flex:1;overflow-y:auto;font-size:12px;" class="text-secondary">${t('viewer.loading')}</div>
+            <div id="v-model-list" style="flex:1;overflow-y:auto;font-size:12px;" class="text-secondary">${UX.spinner(12)} ${t('viewer.loading')}</div>
           </div>
           <div class="card-flat" style="padding:0.75rem;flex:1;display:flex;flex-direction:column;">
             <div class="text-label" style="margin-bottom:0.5rem;">${t('viewer.video_image')}</div>
             <input type="text" class="form-input input-normal" style="width:100%;box-sizing:border-box;font-size:11px;height:28px;margin-bottom:0.35rem;" id="v-video-path" placeholder="Video/Image path" value="${G.videoPath||''}" onchange="Tabs.viewer.selectVideo(this.value)">
             <div style="display:flex;gap:0.25rem;margin-bottom:0.5rem;">
               <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseVideo()">${t('browse')}</button>
-              <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseImageFolder()" title="Open image folder">${Icons.folder(14)}</button>
-              <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshVideos()" title="Refresh">↻</button>
+              <button class="btn btn-secondary btn-sm" onclick="Tabs.viewer.browseImageFolder()" title="${t('a11y.browse_folder')}" aria-label="${t('a11y.browse_folder')}">${Icons.folder(14)}</button>
+              <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer.refreshVideos()" title="${t('a11y.refresh')}" aria-label="${t('a11y.refresh')}">↻</button>
             </div>
             <div id="v-img-nav-bar" style="display:none;align-items:center;gap:0.25rem;margin-bottom:0.5rem;">
-              <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer._navImage(-1)">◀</button>
+              <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer._navImage(-1)" title="${t('a11y.prev')}" aria-label="${t('a11y.prev')}">◀</button>
               <span id="v-img-nav" style="flex:1;text-align:center;font-size:11px;" class="text-secondary"></span>
-              <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer._navImage(1)">${Icons.play(12)}</button>
+              <button class="btn btn-ghost btn-sm" onclick="Tabs.viewer._navImage(1)" title="${t('a11y.next')}" aria-label="${t('a11y.next')}">${Icons.play(12)}</button>
             </div>
-            <div id="v-video-list" style="flex:1;overflow-y:auto;font-size:12px;" class="text-secondary">${t('viewer.loading')}</div>
+            <div id="v-video-list" style="flex:1;overflow-y:auto;font-size:12px;" class="text-secondary">${UX.spinner(12)} ${t('viewer.loading')}</div>
           </div>
           <!-- CLIP/VLM text input panel (hidden by default) -->
           <div id="v-text-panel" class="card-flat" style="padding:0.75rem;display:none;">
@@ -90,9 +90,9 @@ Tabs.viewer = {
           <!-- Control bar -->
           <div style="display:flex;gap:0.35rem;align-items:center;flex-wrap:wrap;">
             <button class="btn btn-primary btn-sm" id="btn-play" onclick="Tabs.viewer.togglePlay()" disabled>${Icons.play(14)} ${t('viewer.play')}</button>
-            <button class="btn btn-secondary btn-sm" id="btn-stop" onclick="Tabs.viewer.stop()" disabled>${Icons.stop(14)}</button>
+            <button class="btn btn-secondary btn-sm" id="btn-stop" onclick="Tabs.viewer.stop()" disabled title="${t('a11y.stop')}" aria-label="${t('a11y.stop')}">${Icons.stop(14)}</button>
             <span style="width:1px;height:20px;background:var(--border-default);margin:0 0.25rem;"></span>
-            <button class="btn btn-secondary btn-sm" id="btn-snapshot" onclick="Tabs.viewer.snapshot()" disabled style="display:flex;align-items:center;gap:2px;">${Icons._svg('<rect x="2" y="4" width="20" height="16" rx="2"/><circle cx="12" cy="13" r="4"/><path d="M17 4l-2-2H9L7 4"/>',14)}</button>
+            <button class="btn btn-secondary btn-sm" id="btn-snapshot" onclick="Tabs.viewer.snapshot()" disabled title="${t('a11y.snapshot')}" aria-label="${t('a11y.snapshot')}" style="display:flex;align-items:center;gap:2px;">${Icons._svg('<rect x="2" y="4" width="20" height="16" rx="2"/><circle cx="12" cy="13" r="4"/><path d="M17 4l-2-2H9L7 4"/>',14)}</button>
             <span style="width:1px;height:20px;background:var(--border-default);margin:0 0.25rem;"></span>
             <label style="font-size:11px;display:flex;align-items:center;gap:3px;cursor:pointer;" title="${t('viewer.save_crops_tip')}">
               <input type="checkbox" id="v-save-crops"> ${t('viewer.save_crops')}

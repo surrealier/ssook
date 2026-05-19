@@ -151,8 +151,8 @@ Tabs['model-compare'] = {
     // 이미지를 개별 API로 로드 (메모리 최적화)
     const pa = document.getElementById('cmp-panel-a');
     const pb = document.getElementById('cmp-panel-b');
-    pa.innerHTML = `<span class="text-muted">${t('cmp.loading')}</span>`;
-    pb.innerHTML = `<span class="text-muted">${t('cmp.loading')}</span>`;
+    pa.innerHTML = `<span class="text-muted">${UX.spinner(12)} ${t('cmp.loading')}</span>`;
+    pb.innerHTML = `<span class="text-muted">${UX.spinner(12)} ${t('cmp.loading')}</span>`;
     API.get(`/api/analysis/model-compare/image/${i}/a`).then(d => {
       if (d.image) pa.innerHTML = `<img src="data:image/jpeg;base64,${d.image}" style="max-width:100%;max-height:400px;"><div class="text-secondary" style="margin-top:0.5rem;">Boxes: ${r.count_a} | ${r.ms_a}ms</div>`;
       else pa.innerHTML = `<span class="text-muted">${t('cmp.not_available')}</span>`;
@@ -300,7 +300,7 @@ Tabs['conf-optimizer'] = {
         if (s.results) {
           this._results = s.results;
           document.getElementById('co-results').innerHTML = s.results.map((r, i) =>
-            `<tr><td>${r.class_name||r.class_id}</td><td>${r.best_threshold}</td><td>${r.best_f1?.toFixed(4)}</td><td>${r.precision?.toFixed(4)}</td><td>${r.recall?.toFixed(4)}</td><td><button class="btn btn-ghost btn-sm" onclick="Tabs['conf-optimizer']._showPR(${i})">📈</button></td></tr>`
+            `<tr><td>${r.class_name||r.class_id}</td><td>${r.best_threshold}</td><td>${r.best_f1?.toFixed(4)}</td><td>${r.precision?.toFixed(4)}</td><td>${r.recall?.toFixed(4)}</td><td><button class="btn btn-ghost btn-sm" onclick="Tabs['conf-optimizer']._showPR(${i})">${Icons.chart(12)}</button></td></tr>`
           ).join('');
         }
         App.setStatus(t('co.complete'));
@@ -421,7 +421,7 @@ Tabs.segmentation = {
     return `
       <div style="max-width:640px;display:flex;flex-direction:column;gap:1.5rem;">
         <div class="card" style="padding:1.5rem;">
-          <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('seg.title')}<a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-seg.onnx" class="btn btn-ghost btn-sm" style="margin-left:auto;" target="_blank">📥 YOLO11n-seg ONNX</a></h3>
+          <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('seg.title')}<a href="https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-seg.onnx" class="btn btn-ghost btn-sm" style="margin-left:auto;" target="_blank">↓ YOLO11n-seg ONNX</a></h3>
           ${modelInput('seg-model')}
           ${imgDirInput('seg-img')}
           ${lblDirInput('seg-lbl')}
@@ -512,7 +512,7 @@ Tabs.clip = {
     return `
       <div style="max-width:640px;display:flex;flex-direction:column;gap:1.5rem;">
         <div class="card" style="padding:1.5rem;">
-          <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('clip.title')}<a href="https://huggingface.co/Xenova/clip-vit-base-patch32/tree/main/onnx" target="_blank" class="btn btn-ghost btn-sm" style="margin-left:auto;">📥 CLIP ONNX</a></h3>
+          <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('clip.title')}<a href="https://huggingface.co/Xenova/clip-vit-base-patch32/tree/main/onnx" target="_blank" class="btn btn-ghost btn-sm" style="margin-left:auto;">↓ CLIP ONNX</a></h3>
           <div class="form-group">
             <label class="form-label">${t('clip.img_enc')}</label>
             <div style="display:flex;gap:0.5rem;">
@@ -612,7 +612,7 @@ Tabs.embedder = {
     return `
       <div style="max-width:640px;display:flex;flex-direction:column;gap:1.5rem;">
         <div class="card" style="padding:1.5rem;">
-          <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('emb.title')}<a href="https://huggingface.co/immich-app/ViT-B-32__openai/tree/main" target="_blank" class="btn btn-ghost btn-sm" style="margin-left:auto;">📥 Embedder ONNX</a></h3>
+          <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('emb.title')}<a href="https://huggingface.co/immich-app/ViT-B-32__openai/tree/main" target="_blank" class="btn btn-ghost btn-sm" style="margin-left:auto;">↓ Embedder ONNX</a></h3>
           ${modelInput('emb-model')}
           ${imgDirInput('emb-img')}
           <div class="form-group" style="margin-top:0.75rem;">
@@ -1579,7 +1579,7 @@ Tabs['profiler'] = {
         <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.opt_suggest')}</div>`;
       if (r.optimization_suggestions && r.optimization_suggestions.length) {
         r.optimization_suggestions.forEach(s => {
-          html += `<div style="font-size:11px;padding:0.4rem 0.6rem;margin-bottom:0.25rem;background:var(--bg-02);border-radius:6px;border-left:3px solid var(--accent);">💡 ${s}</div>`;
+          html += `<div style="font-size:11px;padding:0.4rem 0.6rem;margin-bottom:0.25rem;background:var(--bg-02);border-radius:6px;border-left:3px solid var(--accent);">${s}</div>`;
         });
       } else { html += `<span class="text-secondary" style="font-size:12px;">${t('profiler.no_suggest')}</span>`; }
       html += '</div></div>';
@@ -1691,7 +1691,7 @@ Tabs['calibration'] = {
 
       <!-- Graph Optimization Section -->
       <div class="card" style="padding:1.5rem;">
-        <h3 class="text-heading-h3" style="margin-bottom:1rem;">⚡ Graph Optimization</h3>
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">Graph Optimization</h3>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem;">
           <div style="padding:1rem;background:var(--bg-02);border-radius:8px;text-align:center;">
             <strong>ORT Optimizer</strong>
@@ -1713,7 +1713,7 @@ Tabs['calibration'] = {
 
       <!-- Pipeline Builder -->
       <div class="card" style="padding:1.5rem;">
-        <h3 class="text-heading-h3" style="margin-bottom:1rem;">🔗 Pipeline Builder</h3>
+        <h3 class="text-heading-h3" style="margin-bottom:1rem;">Pipeline Builder</h3>
         <div class="text-secondary" style="font-size:12px;margin-bottom:0.75rem;">Chain multiple optimizations sequentially. Order matters.</div>
         <div id="pipe-steps" style="display:flex;flex-direction:column;gap:0.5rem;margin-bottom:0.75rem;"></div>
         <div style="display:flex;gap:0.5rem;align-items:center;">
@@ -1954,7 +1954,7 @@ Tabs['diagnose'] = {
     if (!container) return;
     const sm = r.summary;
     const sevColors = { critical: '#ef4444', warning: '#f59e0b', info: '#3b82f6' };
-    const sevIcons = { critical: '🔴', warning: '🟠', info: '🔵' };
+    const sevIcons = { critical: '●', warning: '●', info: '●' };
 
     let html = '';
     // Summary cards
@@ -2059,7 +2059,7 @@ Tabs['diagnose'] = {
   }
 };
 
-/* ── Phase 1: VLM Tab (placeholder) ─────────────────── */
+/* ── VLM Tab (CLIP-based v1) ────────────────────────── */
 Tabs['vlm'] = {
   title: true,
   render() {
@@ -2067,21 +2067,169 @@ Tabs['vlm'] = {
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('vlm.title')}</h3>
         ${modelInput('vlm-model')}
+        <div class="form-group" style="margin-top:0.75rem;">
+          <label class="form-label" for="vlm-text-encoder">${t('vlm.text_encoder')}</label>
+          <div style="display:flex;gap:0.5rem;">
+            <input type="text" class="form-input input-normal" style="flex:1;" id="vlm-text-encoder" placeholder="${t('vlm.text_encoder_hint')}">
+            <button class="btn btn-secondary btn-sm" onclick="pickFile('vlm-text-encoder', 'ONNX (*.onnx)')">${t('browse')}</button>
+          </div>
+        </div>
         ${imgDirInput('vlm-img')}
         <div class="form-group" style="margin-top:0.75rem;">
-          <label class="form-label">${t('vlm.task')}</label>
-          <select class="form-input input-normal" id="vlm-task">
-            <option value="vqa">Visual Question Answering (VQA)</option>
-            <option value="caption">Image Captioning</option>
-            <option value="grounding">Visual Grounding</option>
+          <label class="form-label" for="vlm-task">${t('vlm.task')}</label>
+          <select class="form-input input-normal" id="vlm-task" onchange="Tabs.vlm._onTaskChange()">
+            <option value="caption">${t('vlm.task.caption')}</option>
+            <option value="vqa">${t('vlm.task.vqa')}</option>
+            <option value="grounding">${t('vlm.task.grounding')}</option>
           </select>
         </div>
         <div class="form-group" style="margin-top:0.75rem;">
-          <label class="form-label">${t('vlm.prompt')}</label>
+          <label class="form-label" for="vlm-prompt">${t('vlm.prompt')}</label>
           <input type="text" class="form-input input-normal" id="vlm-prompt" placeholder="${t('vlm.prompt_hint')}" value="">
+        </div>
+        <div class="form-group" id="vlm-candidates-group" style="margin-top:0.75rem;display:none;">
+          <label class="form-label" for="vlm-candidates">${t('vlm.candidates')}</label>
+          <input type="text" class="form-input input-normal" id="vlm-candidates" placeholder="${t('vlm.candidates_hint')}" value="yes,no">
+        </div>
+        <div style="margin-top:1rem;display:flex;gap:0.5rem;">
+          <button class="btn btn-primary" id="vlm-run" onclick="Tabs.vlm.run()">${t('run')}</button>
+          <button class="btn btn-secondary" id="vlm-batch" onclick="Tabs.vlm.runBatch()">${t('vlm.batch')}</button>
         </div>
         <p class="text-secondary" style="margin-top:0.75rem;font-size:12px;">${t('vlm.desc')}</p>
       </div>
+      <div id="vlm-result" class="card" style="padding:1.5rem;display:none;">
+        <h3 class="text-heading-h3" style="margin-bottom:0.75rem;">${t('vlm.result')}</h3>
+        <div id="vlm-output" style="display:flex;gap:1rem;flex-wrap:wrap;"></div>
+      </div>
     </div>`;
+  },
+  _onTaskChange() {
+    const task = document.getElementById('vlm-task').value;
+    const g = document.getElementById('vlm-candidates-group');
+    if (g) g.style.display = task === 'vqa' ? '' : 'none';
+  },
+  _readInputs() {
+    return {
+      model: document.getElementById('vlm-model')?.value || G.model,
+      textEncoder: document.getElementById('vlm-text-encoder')?.value || '',
+      imgDir: document.getElementById('vlm-img')?.value || G.imgDir,
+      task: document.getElementById('vlm-task')?.value || 'caption',
+      prompt: document.getElementById('vlm-prompt')?.value || '',
+      candidates: document.getElementById('vlm-candidates')?.value || '',
+    };
+  },
+  _validate(inputs) {
+    const r = Form.validate([
+      { el: 'vlm-model',         required: true, msg: t('vlm.err_model') },
+      { el: 'vlm-text-encoder',  required: true, msg: t('vlm.err_text_encoder') },
+      { el: 'vlm-img',           required: true, msg: t('vlm.err_imgdir') },
+    ]);
+    return r.ok;
+  },
+  _payload(inputs, imagePath) {
+    return {
+      model_path: inputs.model,
+      image_path: imagePath,
+      vlm_prompt: inputs.prompt,
+      vlm_task: inputs.task,
+      vlm_text_encoder: inputs.textEncoder,
+      vlm_candidates: inputs.candidates,
+      model_type: 'vlm',
+    };
+  },
+  async run() {
+    const inputs = this._readInputs();
+    if (!this._validate(inputs)) return;
+    await UX.guardRun({ runId: 'vlm-run', runningLabel: t('vlm.running'), idleLabel: t('run') }, async () => {
+      App.setStatus(t('vlm.running'));
+      try {
+        const files = await API.post('/api/list-files', { dir: inputs.imgDir });
+        if (!files.files || files.files.length === 0) {
+          App.setStatus('Error: ' + t('vlm.err_imgdir'));
+          return;
+        }
+        const imgPath = files.files[0];
+        const r = await API.post('/api/model/infer', this._payload(inputs, imgPath));
+        if (r.error) { App.setStatus('Error: ' + r.error); return; }
+        const resultDiv = document.getElementById('vlm-result');
+        const outputDiv = document.getElementById('vlm-output');
+        resultDiv.style.display = '';
+        const promptLabel = inputs.task === 'vqa' ? t('vlm.prompt') : t('vlm.task.caption');
+        outputDiv.innerHTML = `
+          <div style="flex:1;min-width:300px;">
+            <img src="data:image/jpeg;base64,${r.image}" style="width:100%;border-radius:8px;border:1px solid var(--border-01);">
+          </div>
+          <div style="flex:1;min-width:200px;">
+            <div class="form-label" style="margin-bottom:0.5rem;">${promptLabel}</div>
+            <div class="text-body" style="margin-bottom:1rem;padding:0.5rem;background:var(--background-tint-02);border-radius:6px;">${inputs.prompt || '(none)'}</div>
+            <div class="form-label" style="margin-bottom:0.5rem;">${t('vlm.result')}</div>
+            <div class="text-body" style="padding:0.5rem;background:var(--background-tint-02);border-radius:6px;">${r.vlm_result || t('vlm.no_response')}</div>
+            <div class="text-secondary" style="margin-top:0.5rem;">Task: ${r.vlm_task || inputs.task} · Inference: ${r.infer_ms || 0}ms</div>
+          </div>`;
+        App.setStatus(t('vlm.complete'));
+      } finally {
+        const btn = document.getElementById('vlm-run');
+        if (btn) { btn.disabled = false; btn.textContent = t('run'); }
+      }
+    });
+  },
+  async runBatch() {
+    const inputs = this._readInputs();
+    if (!this._validate(inputs)) return;
+    await UX.guardRun({ runId: 'vlm-batch', runningLabel: t('vlm.running'), idleLabel: t('vlm.batch') }, async () => {
+      App.setStatus(t('vlm.running'));
+      try {
+        // Kick off the async batch on the server; results stream via /api/vlm/status.
+        const start = await API.vlmBatch({
+          model_path: inputs.model,
+          text_encoder: inputs.textEncoder,
+          img_dir: inputs.imgDir,
+          prompt: inputs.prompt,
+          task: inputs.task,
+          candidates: inputs.candidates,
+          max_images: 50,
+        });
+        if (start.error) {
+          App.toast('error', start.error, start.code || '');
+          return;
+        }
+        const resultDiv = document.getElementById('vlm-result');
+        const outputDiv = document.getElementById('vlm-output');
+        resultDiv.style.display = '';
+        outputDiv.innerHTML = `<div class="text-muted" style="width:100%;">${UX.spinner(14)} ${t('vlm.running')} (${start.total})</div>`;
+        await this._pollBatch(start.total);
+        App.setStatus(t('vlm.complete'));
+      } finally {
+        const btn = document.getElementById('vlm-batch');
+        if (btn) { btn.disabled = false; btn.textContent = t('vlm.batch'); }
+      }
+    });
+  },
+  async _pollBatch(total) {
+    const outputDiv = document.getElementById('vlm-output');
+    let failed = 0;
+    while (true) {
+      let s;
+      try { s = await API.vlmStatus(); }
+      catch (e) {
+        if (++failed > 5) { App.toast('warn', 'VLM polling stalled', e.message); return; }
+        await new Promise(res => setTimeout(res, 1000));
+        continue;
+      }
+      failed = 0;
+      const results = s.results || [];
+      const cards = results.map(r => `
+        <div style="width:220px;border:1px solid var(--border-01);border-radius:8px;overflow:hidden;padding:0.5rem;">
+          <div class="text-secondary truncate">${r.file}</div>
+          <div class="text-body" style="font-size:12px;margin-top:0.25rem;">${(r.result || '').substring(0, 100)}</div>
+          <div class="text-secondary" style="font-size:10px;margin-top:0.25rem;">${r.ms || 0}ms</div>
+        </div>`).join('');
+      const progress = total > 0
+        ? `<div class="text-muted" style="width:100%;margin-bottom:0.5rem;">${UX.spinner(12)} ${s.progress}/${total} — ${s.msg || ''}</div>`
+        : '';
+      outputDiv.innerHTML = (s.running ? progress : '') + cards;
+      if (!s.running) return;
+      await new Promise(res => setTimeout(res, 700));
+    }
   }
 };

@@ -79,7 +79,7 @@ const Notify = {
     }
 
     const items = this._items.map(n => {
-      const icon = n.type === 'error' ? '🔴' : n.type === 'warning' ? '🟡' : n.type === 'success' ? '🟢' : '🔵';
+      const icon = n.type === 'error' ? '●' : n.type === 'warning' ? '●' : n.type === 'success' ? '●' : '●';
       const time = n.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       const detailHtml = n.detail ? `<pre class="notify-detail">${this._esc(n.detail)}</pre>` : '';
       const copyText = this._esc(n.msg + (n.detail ? '\n' + n.detail : ''));

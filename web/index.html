@@ -13,11 +13,13 @@
     <aside class="sidebar" id="sidebar"></aside>
     <main class="main-content">
       <div class="page-header">
-        <h2 class="text-heading-h3" id="page-title"></h2>
-        <div id="page-actions"></div>
-        <button id="notify-btn" onclick="Notify.toggle()" aria-label="Notifications">
-          <span id="notify-badge"></span>
-        </button>
+        <h2 class="text-heading-h3" id="page-title" tabindex="-1" aria-live="polite"></h2>
+        <div style="margin-left:auto;display:flex;align-items:center;gap:0.5rem;">
+          <div id="page-actions"></div>
+          <button id="notify-btn" onclick="Notify.toggle()" aria-label="Notifications" title="Notifications">
+            <span id="notify-badge"></span>
+          </button>
+        </div>
       </div>
       <div class="page-body" id="page-body"></div>
     </main>
@@ -33,6 +35,7 @@
   <script src="/js/help-annotations-main.js?v={{VERSION}}"></script>
   <script src="/js/help-annotations-extra.js?v={{VERSION}}"></script>
   <script src="/js/global.js?v={{VERSION}}"></script>
+  <script src="/js/panels.js?v={{VERSION}}"></script>
   <script src="/js/tabs.js?v={{VERSION}}"></script>
   <script src="/js/tabs-extra.js?v={{VERSION}}"></script>
   <script src="/js/app.js?v={{VERSION}}"></script>

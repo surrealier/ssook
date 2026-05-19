@@ -17,6 +17,7 @@ const App = {
     document.getElementById('notify-btn').insertAdjacentHTML('afterbegin', Icons.bell(18));
     this.renderSidebar();
     this.initDarkMode();
+    this.initShortcuts();
     this.switchTab('viewer');
     this.loadSystemInfo();
   },
@@ -124,7 +125,8 @@ const App = {
     // Update header
     const titleEl = document.getElementById('page-title');
     const titleText = tab.title ? I18n.t('nav.' + name) : name;
-    titleEl.innerHTML = titleText + ' <button class="btn btn-ghost" style="padding:0;font-size:14px;min-width:20px;height:20px;line-height:20px;vertical-align:middle;margin-left:0.25rem;" onclick="showHelp(\'' + name + '\')">❓</button>';
+    titleEl.innerHTML = titleText;
+    document.getElementById('page-actions').innerHTML = `<button class="btn btn-ghost btn-sm" onclick="showHelp('${name}')" style="color:var(--text-02);font-size:12px;">Help</button>`;
 
     // 캐시된 HTML이 있으면 복원, 없으면 새로 렌더
     if (tab._cachedHTML) {
@@ -139,6 +141,62 @@ const App = {
       setTimeout(() => body.classList.remove('animate-fade-in'), 200);
       if (tab.init) tab.init();
     }
+
+    // a11y: move focus to the new page title so screen readers announce it.
+    try { titleEl.focus({ preventScroll: true }); } catch (e) {}
+
+    // Re-mount header actions (Logs / cheatsheet pills) — switchTab clobbers
+    // page-actions on every render, so this is the place to put them back.
+    if (this.mountHeaderActions) this.mountHeaderActions();
+  },
+
+  // Keyboard shortcuts: Ctrl+1..9 switch tabs by sidebar order;
+  // "?" opens the cheatsheet modal (Wave 5);
+  // F1 opens contextual help overlay for the current tab.
+  initShortcuts() {
+    if (this._shortcutsBound) return;
+    this._shortcutsBound = true;
+    document.addEventListener('keydown', (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && /^[1-9]$/.test(e.key)) {
+        const idx = +e.key - 1;
+        const items = [].concat(...this._nav.map(([, group]) => group));
+        if (items[idx]) { e.preventDefault(); this.switchTab(items[idx][0]); }
+      } else if (e.key === '?' && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        if (typeof CheatsheetModal !== 'undefined') CheatsheetModal.show();
+      } else if (e.key === 'F1') {
+        e.preventDefault();
+        showHelp(this.currentTab);
+      }
+    });
+  },
+
+  // Header action pills — Wave 5 task queue + log viewer + cheatsheet.
+  mountHeaderActions() {
+    if (typeof TaskQueuePanel !== 'undefined') {
+      try { TaskQueuePanel.mountPill(); } catch (e) {}
+    }
+    const host = document.getElementById('page-actions');
+    if (!host || document.getElementById('ssook-logs-btn')) return;
+    const logs = document.createElement('button');
+    logs.id = 'ssook-logs-btn';
+    logs.className = 'btn btn-ghost btn-sm';
+    logs.title = I18n.t('panels.logs_title');
+    logs.setAttribute('aria-label', I18n.t('panels.logs_title'));
+    logs.style.cssText = 'color:var(--text-02);font-size:12px;';
+    logs.textContent = 'Logs';
+    logs.onclick = () => LogViewerPanel && LogViewerPanel.toggle();
+    host.appendChild(logs);
+    const cs = document.createElement('button');
+    cs.id = 'ssook-cheatsheet-btn';
+    cs.className = 'btn btn-ghost btn-sm';
+    cs.title = I18n.t('cheatsheet.title');
+    cs.setAttribute('aria-label', I18n.t('cheatsheet.title'));
+    cs.style.cssText = 'color:var(--text-02);font-size:12px;';
+    cs.textContent = '?';
+    cs.onclick = () => CheatsheetModal && CheatsheetModal.show();
+    host.appendChild(cs);
   },
 
   setStatus(text, errorDetail) {
@@ -152,10 +210,23 @@ const App = {
     }
   },
 
+  // Drop a notification without overwriting the status bar.
+  // type: 'info' | 'success' | 'warn' | 'error'.
+  // Same (type,msg) within 3s is deduped to avoid flooding on poll loops.
+  _toastSeen: {},
+  toast(type, msg, detail) {
+    const fn = Notify[type] || Notify.info;
+    const key = type + '::' + msg;
+    const now = Date.now();
+    if (this._toastSeen[key] && now - this._toastSeen[key] < 3000) return;
+    this._toastSeen[key] = now;
+    fn.call(Notify, msg, detail);
+  },
+
   async shutdown() {
     if (!confirm(I18n.t('shutdown_confirm'))) return;
     try { await API.post('/api/shutdown'); } catch(e) {}
-    document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-size:1.5rem;color:#888;">Server stopped. You can close this tab.</div>';
+    document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-size:1.5rem;color:var(--text-03);">Server stopped. You can close this tab.</div>';
   },
 
   async loadSystemInfo() {
@@ -163,13 +234,19 @@ const App = {
       const info = await API.sysInfo();
       document.getElementById('status-info').textContent =
         `${info.os || ''} | Python ${info.python || ''} | ORT ${info.ort || ''}`;
-    } catch(e) { console.warn('sysInfo error:', e); }
+    } catch(e) {
+      console.warn('sysInfo error:', e);
+      this.toast('warn', 'System info unavailable', e && e.message);
+    }
     // Load default paths from config
     try {
       const c = await API.config();
       if (c.samples_dir && !G.imgDir) setImgDir(c.samples_dir);
       if (c.default_model_path && !G.model) setModel(c.default_model_path);
-    } catch(e) { console.warn('config load error:', e); }
+    } catch(e) {
+      console.warn('config load error:', e);
+      this.toast('warn', 'Could not load config defaults', e && e.message);
+    }
     this.setStatus(I18n.t('ready'));
   }
 };
