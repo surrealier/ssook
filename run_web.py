@@ -68,9 +68,15 @@ def start_server(port: int):
     logging.getLogger().addHandler(logging.StreamHandler())
     try:
         import uvicorn
-        from server import app
-        uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning",
-                    timeout_keep_alive=30)
+        from server import app, register_uvicorn_server
+        config = uvicorn.Config(app, host="127.0.0.1", port=port,
+                                log_level="warning", timeout_keep_alive=30)
+        server = uvicorn.Server(config)
+        # Register so /api/shutdown and the heartbeat watchdog can flip
+        # `should_exit=True` instead of os._exit. This makes our lifespan
+        # teardown (TaskState.running=False + executor.shutdown) reliable.
+        register_uvicorn_server(server)
+        server.run()
     except Exception as e:
         logging.exception(f"Server crashed: {e}")
 

@@ -97,6 +97,8 @@ class AppConfig:
                 )
 
     def save(self):
+        # Hold the lock for the entire serialize+write so two concurrent
+        # save() calls cannot interleave a partial YAML on disk.
         with self._rw_lock:
             cs_save = {}
             for cls_id, s in self.class_styles.items():
@@ -134,9 +136,13 @@ class AppConfig:
                 "class_styles": cs_save,
                 "custom_model_types": cmt_save,
             }
-        os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
-        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-            yaml.dump(cfg, f, allow_unicode=True)
+            os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
+            # Atomic-ish write: write to .tmp then replace, so an interrupted
+            # save never leaves a half-truncated config file behind.
+            tmp = _CONFIG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                yaml.dump(cfg, f, allow_unicode=True)
+            os.replace(tmp, _CONFIG_PATH)
 
     def get_class_style(self, class_id: int) -> ClassStyle:
         return self.class_styles.get(class_id, ClassStyle())

@@ -12,6 +12,8 @@ from typing import Optional
 
 from core.model_loader import load_model as _load_model
 from core.inference import run_inference, letterbox, preprocess, _padded_to_tensor, run_segmentation
+from server.errors import route_errors
+from server.path_safety import safe_image_file, safe_image_dir, safe_model_file
 from server.state import clip_state, embedder_state, seg_state, quant_state, all_states, executor
 from server.utils import imread, encode_jpeg, glob_images, overlay_segmentation, generate_palette
 
@@ -24,8 +26,9 @@ class CLIPRequest(BaseModel):
     img_dir: str
     labels: str  # comma-separated
 
-clip_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": []}
-all_states["clip"] = clip_state
+# NOTE: clip_state is imported from server.state — do NOT re-declare here.
+# Re-declaring would break /api/force-stop/clip since all_states["clip"] would
+# still point to the original TaskState while routes mutate a different dict.
 
 @router.post("/api/clip/run")
 async def run_clip(req: CLIPRequest):
@@ -33,79 +36,76 @@ async def run_clip(req: CLIPRequest):
         return {"error": "Already running"}
     clip_state.update(running=True, progress=0, total=0, msg="Starting...", results=[])
 
+    @route_errors(state=clip_state, scope="clip")
     def _run():
-        try:
-            from core.clip_inference import CLIPModel, simple_tokenize
-            model = CLIPModel(req.image_encoder, req.text_encoder)
-            labels = [l.strip() for l in req.labels.split(",") if l.strip()]
-            if not labels:
-                clip_state.update(running=False, msg="No labels provided")
+        from core.clip_inference import CLIPModel, simple_tokenize
+        model = CLIPModel(req.image_encoder, req.text_encoder)
+        labels = [l.strip() for l in req.labels.split(",") if l.strip()]
+        if not labels:
+            clip_state.update(running=False, msg="No labels provided")
+            return
+        text_embs = []
+        for label in labels:
+            tokens = simple_tokenize(label)
+            text_embs.append(model.encode_text(tokens))
+        imgs = glob_images(req.img_dir)
+        if not imgs:
+            clip_state.update(running=False, msg="No images found")
+            return
+        clip_state["total"] = len(imgs)
+        clip_state["msg"] = "Running CLIP inference..."
+        label_correct = {l: 0 for l in labels}
+        label_total = {l: 0 for l in labels}
+        detail_log = []
+        for idx, fp in enumerate(imgs):
+            if not clip_state.get("running", True):
+                clip_state.update(msg="Stopped by user")
                 return
-            # Pre-encode text
-            text_embs = []
-            for label in labels:
-                tokens = simple_tokenize(label)
-                text_embs.append(model.encode_text(tokens))
-            imgs = glob_images(req.img_dir)
-            if not imgs:
-                clip_state.update(running=False, msg="No images found")
-                return
-            clip_state["total"] = len(imgs)
-            clip_state["msg"] = "Running CLIP inference..."
-            # Per-label correct count
-            label_correct = {l: 0 for l in labels}
-            label_total = {l: 0 for l in labels}
-            detail_log = []  # per-image detail
-            for idx, fp in enumerate(imgs):
-                frame = imread(fp)
-                if frame is None:
-                    clip_state["progress"] = idx + 1
-                    continue
-                ranked = model.zero_shot_classify(frame, text_embs, labels)
-                # 폴더명 = GT label
-                parent = os.path.basename(os.path.dirname(fp)).lower()
-                top_label = ranked[0][0].lower() if ranked else ""
-                correct = False
-                for l in labels:
-                    if parent == l.lower():
-                        label_total[l] += 1
-                        if top_label == l.lower():
-                            label_correct[l] += 1
-                            correct = True
-                detail_log.append({
-                    "file": os.path.basename(fp),
-                    "gt": parent,
-                    "pred": ranked[0][0] if ranked else "—",
-                    "score": round(ranked[0][1], 4) if ranked else 0,
-                    "correct": correct,
-                    "top3": [(r[0], round(r[1], 4)) for r in ranked[:3]],
-                })
+            frame = imread(fp)
+            if frame is None:
                 clip_state["progress"] = idx + 1
-            # Results
-            results = []
-            total_correct = 0
-            total_count = 0
+                continue
+            ranked = model.zero_shot_classify(frame, text_embs, labels)
+            parent = os.path.basename(os.path.dirname(fp)).lower()
+            top_label = ranked[0][0].lower() if ranked else ""
+            correct = False
             for l in labels:
-                tc = label_total[l]
-                cc = label_correct[l]
-                total_correct += cc
-                total_count += tc
-                acc = round(cc / tc * 100, 2) if tc > 0 else 0
-                results.append({"label": l, "total": tc, "correct": cc, "accuracy": acc})
-            overall_acc = round(total_correct / total_count * 100, 2) if total_count > 0 else 0
-            results.append({"label": "Overall", "total": total_count, "correct": total_correct, "accuracy": overall_acc})
-            clip_state["results"] = results
-            clip_state["detail"] = detail_log[:500]  # 최대 500개
-            clip_state.update(running=False, msg="Complete")
-        except Exception as e:
-            clip_state.update(running=False, msg=f"Error: {e}")
+                if parent == l.lower():
+                    label_total[l] += 1
+                    if top_label == l.lower():
+                        label_correct[l] += 1
+                        correct = True
+            detail_log.append({
+                "file": os.path.basename(fp),
+                "gt": parent,
+                "pred": ranked[0][0] if ranked else "—",
+                "score": round(ranked[0][1], 4) if ranked else 0,
+                "correct": correct,
+                "top3": [(r[0], round(r[1], 4)) for r in ranked[:3]],
+            })
+            clip_state["progress"] = idx + 1
+        results = []
+        total_correct = 0
+        total_count = 0
+        for l in labels:
+            tc = label_total[l]
+            cc = label_correct[l]
+            total_correct += cc
+            total_count += tc
+            acc = round(cc / tc * 100, 2) if tc > 0 else 0
+            results.append({"label": l, "total": tc, "correct": cc, "accuracy": acc})
+        overall_acc = round(total_correct / total_count * 100, 2) if total_count > 0 else 0
+        results.append({"label": "Overall", "total": total_count, "correct": total_correct, "accuracy": overall_acc})
+        clip_state["results"] = results
+        clip_state["detail"] = detail_log[:500]
+        clip_state.update(running=False, msg="Complete")
 
     executor.submit(_run)
     return {"ok": True}
 
 @router.get("/api/clip/status")
 async def clip_status():
-    return dict(clip_state)
+    return clip_state.snapshot() if hasattr(clip_state, "snapshot") else dict(clip_state)
 
 
 # ── Embedder Evaluation API ────────────────────────────
@@ -115,8 +115,7 @@ class EmbedderRequest(BaseModel):
     img_dir: str
     top_k: int = 5
 
-embedder_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": [], "detail": []}
-all_states["embedder"] = embedder_state
+# NOTE: embedder_state is imported from server.state — do NOT re-declare here.
 
 @router.post("/api/embedder/run")
 async def run_embedder(req: EmbedderRequest):
@@ -231,8 +230,10 @@ async def run_embedder(req: EmbedderRequest):
             embedder_state["detail"] = detail_log
             embedder_state.update(running=False, msg="Complete")
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            # Kept inline (broad try block spans most of the worker); upgrade
+            # to @route_errors when the worker is refactored.
+            import logging as _log
+            _log.getLogger("ssook.embedder").exception("embedder worker failed")
             embedder_state.update(running=False, msg=f"Error: {e}")
 
     executor.submit(_run)
@@ -240,86 +241,87 @@ async def run_embedder(req: EmbedderRequest):
 
 @router.get("/api/embedder/status")
 async def embedder_status():
-    return dict(embedder_state)
+    return embedder_state.snapshot() if hasattr(embedder_state, "snapshot") else dict(embedder_state)
+
+class EmbedderCompareRequest(BaseModel):
+    model_path: str
+    img_paths: list[str]
+
 
 @router.post("/api/embedder/compare")
-async def embedder_compare(req: dict):
+async def embedder_compare(req: EmbedderCompareRequest):
     """Compare embeddings of multiple selected images using the loaded embedder model."""
-    model_path = req.get("model_path", "")
-    img_paths = req.get("img_paths", [])
-    if not model_path or len(img_paths) < 2:
-        return {"error": "Need model and at least 2 images"}
-    try:
-        import onnxruntime as ort
-        session = ort.InferenceSession(model_path)
-        inp = session.get_inputs()[0]
-        h = int(inp.shape[2]) if isinstance(inp.shape[2], int) else 224
-        w = int(inp.shape[3]) if isinstance(inp.shape[3], int) else 224
-        embeddings = []
-        names = []
-        for fp in img_paths:
-            img = imread(fp)
-            if img is None:
-                continue
-            img = cv2.resize(img, (w, h))
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            tensor = np.ascontiguousarray(rgb.transpose(2, 0, 1)[np.newaxis], dtype=np.float32) / 255.0
-            out = session.run(None, {inp.name: tensor})
-            emb = out[0].flatten().astype(np.float32)
-            emb = emb / (np.linalg.norm(emb) + 1e-9)
-            embeddings.append(emb)
-            names.append(os.path.basename(fp))
-        if len(embeddings) < 2:
-            return {"error": "Could not read enough images"}
-        # Compute pairwise cosine similarity matrix
-        matrix = []
-        for i in range(len(embeddings)):
-            row = []
-            for j in range(len(embeddings)):
-                sim = float(np.dot(embeddings[i], embeddings[j]))
-                row.append(round(sim, 4))
-            matrix.append(row)
-        return {"names": names, "matrix": matrix}
-    except Exception as e:
-        return {"error": str(e)}
+    if len(req.img_paths) < 2:
+        return {"error": "Need at least 2 images"}
+    safe_model_file(req.model_path)
+    safe_paths = [safe_image_file(p) for p in req.img_paths]
+
+    import onnxruntime as ort
+    session = ort.InferenceSession(req.model_path)
+    inp = session.get_inputs()[0]
+    h = int(inp.shape[2]) if isinstance(inp.shape[2], int) else 224
+    w = int(inp.shape[3]) if isinstance(inp.shape[3], int) else 224
+    embeddings = []
+    names = []
+    for fp in safe_paths:
+        img = imread(fp)
+        if img is None:
+            continue
+        img = cv2.resize(img, (w, h))
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        tensor = np.ascontiguousarray(rgb.transpose(2, 0, 1)[np.newaxis], dtype=np.float32) / 255.0
+        out = session.run(None, {inp.name: tensor})
+        emb = out[0].flatten().astype(np.float32)
+        emb = emb / (np.linalg.norm(emb) + 1e-9)
+        embeddings.append(emb)
+        names.append(os.path.basename(fp))
+    if len(embeddings) < 2:
+        return {"error": "Could not read enough images"}
+    matrix = []
+    for i in range(len(embeddings)):
+        row = [round(float(np.dot(embeddings[i], embeddings[j])), 4) for j in range(len(embeddings))]
+        matrix.append(row)
+    return {"names": names, "matrix": matrix}
+
+
+class BatchAugmentRequest(BaseModel):
+    img_dir: str
+    aug_type: str = "Flip"
 
 
 # ── Batch: Augmentation Preview API ────────────────────
 @router.post("/api/batch/augmentation")
-async def batch_augmentation(req: dict):
-    try:
-        img_dir = req.get("img_dir", "")
-        aug_type = req.get("aug_type", "Flip")
-        imgs = glob_images(img_dir)
-        if not imgs:
-            return {"error": "No images found"}
-        import random
-        fp = random.choice(imgs)
-        frame = imread(fp)
-        if frame is None:
-            return {"error": "Cannot read image"}
-        original = encode_jpeg(frame)
-        if aug_type == "Flip":
-            aug = cv2.flip(frame, 1)
-        elif aug_type == "Rotate":
-            M = cv2.getRotationMatrix2D((frame.shape[1]//2, frame.shape[0]//2), 15, 1.0)
-            aug = cv2.warpAffine(frame, M, (frame.shape[1], frame.shape[0]))
-        elif aug_type == "Brightness":
-            aug = cv2.convertScaleAbs(frame, alpha=1.3, beta=30)
-        elif "Mosaic" in aug_type:
-            h, w = frame.shape[:2]
-            half_h, half_w = h//2, w//2
-            samples = [imread(random.choice(imgs)) for _ in range(4)]
-            samples = [cv2.resize(s, (half_w, half_h)) if s is not None else np.zeros((half_h, half_w, 3), dtype=np.uint8) for s in samples]
-            top = np.hstack([samples[0], samples[1]])
-            bot = np.hstack([samples[2], samples[3]])
-            aug = np.vstack([top, bot])
-        else:
-            aug = frame.copy()
-        augmented = encode_jpeg(aug)
-        return {"original": original, "augmented": augmented, "file": os.path.basename(fp)}
-    except Exception as e:
-        return {"error": str(e)}
+async def batch_augmentation(req: BatchAugmentRequest):
+    img_dir = safe_image_dir(req.img_dir)
+    imgs = glob_images(img_dir)
+    if not imgs:
+        return {"error": "No images found"}
+    import random
+    fp = random.choice(imgs)
+    frame = imread(fp)
+    if frame is None:
+        return {"error": "Cannot read image"}
+    original = encode_jpeg(frame)
+    aug_type = req.aug_type
+    if aug_type == "Flip":
+        aug = cv2.flip(frame, 1)
+    elif aug_type == "Rotate":
+        M = cv2.getRotationMatrix2D((frame.shape[1]//2, frame.shape[0]//2), 15, 1.0)
+        aug = cv2.warpAffine(frame, M, (frame.shape[1], frame.shape[0]))
+    elif aug_type == "Brightness":
+        aug = cv2.convertScaleAbs(frame, alpha=1.3, beta=30)
+    elif "Mosaic" in aug_type:
+        h, w = frame.shape[:2]
+        half_h, half_w = h//2, w//2
+        samples = [imread(random.choice(imgs)) for _ in range(4)]
+        samples = [cv2.resize(s, (half_w, half_h)) if s is not None else np.zeros((half_h, half_w, 3), dtype=np.uint8) for s in samples]
+        top = np.hstack([samples[0], samples[1]])
+        bot = np.hstack([samples[2], samples[3]])
+        aug = np.vstack([top, bot])
+    else:
+        aug = frame.copy()
+    augmented = encode_jpeg(aug)
+    return {"original": original, "augmented": augmented, "file": os.path.basename(fp)}
 
 
 # ── Calibration / Quantization API ─────────────────────
@@ -334,8 +336,7 @@ class QuantizeRequest(BaseModel):
     quant_format: str = "QDQ"        # QDQ | QOperator
     per_channel: bool = True
 
-quant_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": {}}
-all_states["quantize"] = quant_state
+# NOTE: quant_state is imported from server.state — do NOT re-declare here.
 
 @router.post("/api/quantize")
 async def run_quantize(req: QuantizeRequest):
@@ -382,182 +383,184 @@ async def run_quantize(req: QuantizeRequest):
 
 @router.get("/api/quantize/status")
 async def quantize_status():
-    return dict(quant_state)
+    return quant_state.snapshot() if hasattr(quant_state, "snapshot") else dict(quant_state)
+
+
+class InspectModelRequest(BaseModel):
+    path: str
+
+
+class ProfileModelRequest(BaseModel):
+    path: str
+    num_runs: int = 20
+
+
+class InferImageRequest(BaseModel):
+    model_path: str
+    image_path: str
+    conf: float = 0.25
+    model_type: Optional[str] = None
 
 
 # ── Phase 1: Model Inspector API ───────────────────────
 @router.post("/api/inspector/inspect")
-async def api_inspect_model(req: dict):
-    try:
-        path = req.get("path", "")
-        if not path or not os.path.isfile(path):
-            return {"error": "Model file not found"}
-        from core.model_inspector import inspect_model, inspection_to_dict
-        info = inspect_model(path)
-        return inspection_to_dict(info)
-    except Exception as e:
-        return {"error": str(e)}
+async def api_inspect_model(req: InspectModelRequest):
+    path = safe_model_file(req.path)
+    from core.model_inspector import inspect_model, inspection_to_dict
+    from core.model_cache import get_or_compute
+
+    def _do(p):
+        return inspection_to_dict(inspect_model(p))
+
+    return get_or_compute(path, _do)
 
 
 # ── Phase 1: Model Profiler API ────────────────────────
 @router.post("/api/profiler/run")
-async def api_profile_model(req: dict):
-    try:
-        path = req.get("path", "")
-        num_runs = req.get("num_runs", 20)
-        if not path or not os.path.isfile(path):
-            return {"error": "Model file not found"}
-        from core.model_profiler import profile_model, profile_to_dict
-        result = profile_model(path, num_runs=num_runs)
-        return profile_to_dict(result)
-    except Exception as e:
-        return {"error": str(e)}
+async def api_profile_model(req: ProfileModelRequest):
+    path = safe_model_file(req.path)
+    from core.model_profiler import profile_model, profile_to_dict
+    result = profile_model(path, num_runs=req.num_runs)
+    return profile_to_dict(result)
 
 
 # ── Phase 1: Pose Estimation API ───────────────────────
 @router.post("/api/infer/pose")
-async def api_infer_pose(req: dict):
-    try:
-        model_path = req.get("model_path", "")
-        image_path = req.get("image_path", "")
-        conf = req.get("conf", 0.25)
-        model_type = req.get("model_type", "pose_yolo")
-        if not model_path or not image_path:
-            return {"error": "model_path and image_path required"}
-        frame = imread(image_path)
-        if frame is None:
-            return {"error": "Cannot read image"}
-        mi = _load_model(model_path, model_type=model_type)
-        from core.inference import run_pose, COCO_SKELETON, COCO_KPT_NAMES
-        result = run_pose(mi, frame, conf)
-        # Draw on image
-        vis = frame.copy()
-        for i in range(len(result.boxes)):
-            x1, y1, x2, y2 = result.boxes[i].astype(int)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            kpts = result.keypoints[i]
-            for j, (kx, ky, kc) in enumerate(kpts):
-                if kc > 0.5:
-                    cv2.circle(vis, (int(kx), int(ky)), 3, (0, 0, 255), -1)
-            for a, b in COCO_SKELETON:
-                if kpts[a][2] > 0.5 and kpts[b][2] > 0.5:
-                    cv2.line(vis, (int(kpts[a][0]), int(kpts[a][1])),
-                             (int(kpts[b][0]), int(kpts[b][1])), (255, 255, 0), 2)
-        return {
-            "image": encode_jpeg(vis),
-            "num_persons": len(result.boxes),
-            "infer_ms": round(result.infer_ms, 2),
-            "detections": [
-                {"box": result.boxes[i].tolist(),
-                 "score": round(float(result.scores[i]), 3),
-                 "keypoints": result.keypoints[i].tolist()}
-                for i in range(len(result.boxes))
-            ],
-        }
-    except Exception as e:
-        return {"error": str(e)}
+async def api_infer_pose(req: InferImageRequest):
+    model_path = safe_model_file(req.model_path)
+    image_path = safe_image_file(req.image_path)
+    model_type = req.model_type or "pose_yolo"
+    frame = imread(image_path)
+    if frame is None:
+        return {"error": "Cannot read image"}
+    mi = _load_model(model_path, model_type=model_type)
+    from core.inference import run_pose, COCO_SKELETON, COCO_KPT_NAMES
+    result = run_pose(mi, frame, req.conf)
+    vis = frame.copy()
+    for i in range(len(result.boxes)):
+        x1, y1, x2, y2 = result.boxes[i].astype(int)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        kpts = result.keypoints[i]
+        for j, (kx, ky, kc) in enumerate(kpts):
+            if kc > 0.5:
+                cv2.circle(vis, (int(kx), int(ky)), 3, (0, 0, 255), -1)
+        for a, b in COCO_SKELETON:
+            if kpts[a][2] > 0.5 and kpts[b][2] > 0.5:
+                cv2.line(vis, (int(kpts[a][0]), int(kpts[a][1])),
+                         (int(kpts[b][0]), int(kpts[b][1])), (255, 255, 0), 2)
+    return {
+        "image": encode_jpeg(vis),
+        "num_persons": len(result.boxes),
+        "infer_ms": round(result.infer_ms, 2),
+        "detections": [
+            {"box": result.boxes[i].tolist(),
+             "score": round(float(result.scores[i]), 3),
+             "keypoints": result.keypoints[i].tolist()}
+            for i in range(len(result.boxes))
+        ],
+    }
 
 
 # ── Phase 1: Instance Segmentation API ─────────────────
 @router.post("/api/infer/instance-seg")
-async def api_infer_instance_seg(req: dict):
-    try:
-        model_path = req.get("model_path", "")
-        image_path = req.get("image_path", "")
-        conf = req.get("conf", 0.25)
-        model_type = req.get("model_type", "instseg_yolo")
-        if not model_path or not image_path:
-            return {"error": "model_path and image_path required"}
-        frame = imread(image_path)
-        if frame is None:
-            return {"error": "Cannot read image"}
-        mi = _load_model(model_path, model_type=model_type)
-        from core.inference import run_instance_seg
-        result = run_instance_seg(mi, frame, conf)
-        # Draw masks on image
-        vis = frame.copy()
-        colors = generate_palette(max(len(result.masks), 1))
-        for i in range(len(result.masks)):
-            mask = result.masks[i]
-            color = colors[i % len(colors)]
-            overlay = vis.copy()
-            overlay[mask > 0] = color
-            cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
-            x1, y1, x2, y2 = result.boxes[i].astype(int)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-            label = f"cls{result.class_ids[i]} {result.scores[i]:.2f}"
-            cv2.putText(vis, label, (x1, max(y1-4, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        return {
-            "image": encode_jpeg(vis),
-            "num_instances": len(result.boxes),
-            "infer_ms": round(result.infer_ms, 2),
-            "detections": [
-                {"box": result.boxes[i].tolist(),
-                 "score": round(float(result.scores[i]), 3),
-                 "class_id": int(result.class_ids[i])}
-                for i in range(len(result.boxes))
-            ],
-        }
-    except Exception as e:
-        return {"error": str(e)}
+async def api_infer_instance_seg(req: InferImageRequest):
+    model_path = safe_model_file(req.model_path)
+    image_path = safe_image_file(req.image_path)
+    model_type = req.model_type or "instseg_yolo"
+    frame = imread(image_path)
+    if frame is None:
+        return {"error": "Cannot read image"}
+    mi = _load_model(model_path, model_type=model_type)
+    from core.inference import run_instance_seg
+    result = run_instance_seg(mi, frame, req.conf)
+    vis = frame.copy()
+    colors = generate_palette(max(len(result.masks), 1))
+    for i in range(len(result.masks)):
+        mask = result.masks[i]
+        color = colors[i % len(colors)]
+        overlay = vis.copy()
+        overlay[mask > 0] = color
+        cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
+        x1, y1, x2, y2 = result.boxes[i].astype(int)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+        label = f"cls{result.class_ids[i]} {result.scores[i]:.2f}"
+        cv2.putText(vis, label, (x1, max(y1-4, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+    return {
+        "image": encode_jpeg(vis),
+        "num_instances": len(result.boxes),
+        "infer_ms": round(result.infer_ms, 2),
+        "detections": [
+            {"box": result.boxes[i].tolist(),
+             "score": round(float(result.scores[i]), 3),
+             "class_id": int(result.class_ids[i])}
+            for i in range(len(result.boxes))
+        ],
+    }
 
 
 # ── Phase 1: Tracking API ──────────────────────────────
 _trackers = {}
 
+
+class TrackerCreateRequest(BaseModel):
+    tracker_type: str = "bytetrack"
+
+
+class TrackerResetRequest(BaseModel):
+    tracker_id: str
+
+
 @router.post("/api/tracking/create")
-async def api_tracking_create(req: dict):
-    try:
-        tracker_type = req.get("tracker_type", "bytetrack")
-        from core.tracking import create_tracker
-        tid = str(uuid.uuid4())[:8]
-        _trackers[tid] = create_tracker(tracker_type)
-        return {"tracker_id": tid, "type": tracker_type}
-    except Exception as e:
-        return {"error": str(e)}
+async def api_tracking_create(req: TrackerCreateRequest):
+    from core.tracking import create_tracker
+    tid = str(uuid.uuid4())[:8]
+    _trackers[tid] = create_tracker(req.tracker_type)
+    return {"tracker_id": tid, "type": req.tracker_type}
 
 
 @router.post("/api/tracking/reset")
-async def api_tracking_reset(req: dict):
-    tid = req.get("tracker_id", "")
-    if tid in _trackers:
-        _trackers[tid].reset()
+async def api_tracking_reset(req: TrackerResetRequest):
+    if req.tracker_id in _trackers:
+        _trackers[req.tracker_id].reset()
         return {"status": "ok"}
     return {"error": "Tracker not found"}
 
 
 # ── HuggingFace Hub API ────────────────────────────────
+class HFSearchRequest(BaseModel):
+    query: str = ""
+    task: str = ""
+    limit: int = 20
+
+
+class HFFilesRequest(BaseModel):
+    repo_id: str
+
+
+class HFDownloadRequest(BaseModel):
+    repo_id: str
+    filename: str
+
 
 @router.post("/api/hf/search")
-async def hf_search(req: dict):
-    try:
-        from core.hf_downloader import search_models
-        results = search_models(req.get("query", ""), req.get("task", ""), req.get("limit", 20))
-        return {"results": results}
-    except Exception as e:
-        return {"error": str(e)}
+async def hf_search(req: HFSearchRequest):
+    from core.hf_downloader import search_models
+    return {"results": search_models(req.query, req.task, req.limit)}
 
 
 @router.post("/api/hf/files")
-async def hf_files(req: dict):
-    try:
-        from core.hf_downloader import list_onnx_files
-        files = list_onnx_files(req.get("repo_id", ""))
-        return {"files": files}
-    except Exception as e:
-        return {"error": str(e)}
+async def hf_files(req: HFFilesRequest):
+    from core.hf_downloader import list_onnx_files
+    return {"files": list_onnx_files(req.repo_id)}
 
 
 @router.post("/api/hf/download")
-async def hf_download(req: dict):
-    try:
-        from core.hf_downloader import download_model
-        path = await asyncio.get_event_loop().run_in_executor(
-            executor, download_model, req["repo_id"], req["filename"]
-        )
-        return {"path": path}
-    except Exception as e:
-        return {"error": str(e)}
+async def hf_download(req: HFDownloadRequest):
+    from core.hf_downloader import download_model
+    path = await asyncio.get_event_loop().run_in_executor(
+        executor, download_model, req.repo_id, req.filename
+    )
+    return {"path": path}
 
 
 @router.get("/api/hf/cached")
@@ -569,28 +572,88 @@ async def hf_cached():
         return {"error": str(e)}
 
 
-# ── Launch ──────────────────────────────────────────────
-def main():
-    import uvicorn
-    port = int(os.environ.get("PORT", 8765))
-    print(f"\n  ssook running at http://localhost:{port}\n")
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+class SegmentationRunRequest(BaseModel):
+    model_path: str
+    img_dir: str
+    gt_mask_dir: str
+    num_classes: int = 80
+    conf: float = 0.25
 
 
-if __name__ == "__main__":
-    main()
-@router.post("/api/force-stop/{task_id}")
-async def force_stop(task_id: str):
-    """비동기 작업 강제 중지 — running 플래그를 False로 리셋"""
-    if task_id == "all":
-        for s in all_states.values():
-            s["running"] = False
-        return {"ok": True, "msg": "All tasks stopped"}
-    state = all_states.get(task_id)
-    if not state:
-        return {"error": f"Unknown task: {task_id}"}
-    state["running"] = False
-    state["msg"] = "Stopped by user"
-    return {"ok": True}
+# ── Segmentation Evaluation API ─────────────────────────
+@router.post("/api/segmentation/run")
+async def api_segmentation_run(req: SegmentationRunRequest):
+    """Run segmentation evaluation (async with progress)."""
+    model_path = safe_model_file(req.model_path)
+    img_dir = safe_image_dir(req.img_dir)
+    gt_mask_dir = safe_image_dir(req.gt_mask_dir)
+
+    seg_state.update(running=True, progress=0, total=0, msg="Starting...", results=[])
+
+    @route_errors(state=seg_state, scope="seg")
+    def _run():
+        images = glob_images(img_dir)
+        seg_state["total"] = len(images)
+        if not images:
+            seg_state.update(running=False, msg="No images found")
+            return
+
+        mi = _load_model(model_path, model_type="segmentation")
+        from core.evaluation import evaluate_segmentation
+        results = evaluate_segmentation(
+            mi, images, gt_mask_dir, req.num_classes, req.conf,
+            progress_cb=lambda i, msg: seg_state.update(progress=i, msg=msg),
+            stop_flag=lambda: not seg_state["running"],
+        )
+        seg_state.update(running=False, msg="Complete", results=results)
+
+    executor.submit(_run)
+    return {"ok": True, "msg": "Segmentation evaluation started"}
 
 
+@router.get("/api/segmentation/status")
+async def api_segmentation_status():
+    """Get segmentation evaluation progress."""
+    return seg_state.snapshot() if hasattr(seg_state, 'snapshot') else dict(seg_state)
+
+
+# ── Infer Save Crops (single image) ────────────────────
+@router.post("/api/infer/save-crops")
+async def api_infer_save_crops(req: dict):
+    """Run inference on a single image and save detection crops."""
+    model_path = req.get("model_path", "")
+    image_path = req.get("image_path", "")
+    conf = req.get("conf", 0.25)
+
+    if not model_path or not image_path:
+        return {"error": "model_path and image_path required"}
+
+    frame = imread(image_path)
+    if frame is None:
+        return {"error": f"Cannot read image: {image_path}"}
+
+    try:
+        mi = _load_model(model_path)
+        result = run_inference(mi, frame, conf)
+        if not hasattr(result, 'boxes') or len(result.boxes) == 0:
+            return {"ok": True, "count": 0, "path": ""}
+
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = os.path.join("snapshots", f"crops_{ts}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        h, w = frame.shape[:2]
+        names = getattr(mi, 'names', {}) or {}
+        saved = 0
+        for i, (box, score, cid) in enumerate(zip(result.boxes, result.scores, result.class_ids)):
+            x1, y1, x2, y2 = max(0, int(box[0])), max(0, int(box[1])), min(w, int(box[2])), min(h, int(box[3]))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            cls_name = names.get(int(cid), str(int(cid)))
+            crop = frame[y1:y2, x1:x2]
+            cv2.imwrite(os.path.join(out_dir, f"{i:03d}_{cls_name}_{score:.2f}.jpg"), crop)
+            saved += 1
+        return {"ok": True, "path": out_dir, "count": saved}
+    except Exception as e:
+        return {"error": str(e)}

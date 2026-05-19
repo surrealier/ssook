@@ -13,9 +13,11 @@ from pydantic import BaseModel
 from core.app_config import AppConfig
 from core.inference import run_inference, run_classification, run_segmentation
 from core.model_loader import load_model as _load_core
+from server.errors import route_errors
 from server.model_manager import ensure_model, get_model, get_model_meta, load_fresh
-from server.state import executor
-from server.utils import imread, generate_palette, get_color, draw_label, overlay_segmentation
+from server.path_safety import safe_label_dir, safe_image_dir, safe_image_file, safe_model_file
+from server.state import executor, vlm_state
+from server.utils import imread, generate_palette, get_color, draw_label, overlay_segmentation, glob_images
 
 router = APIRouter()
 
@@ -37,10 +39,23 @@ class InferRequest(BaseModel):
     clip_labels: Optional[str] = None
     clip_text_encoder: Optional[str] = None
     vlm_prompt: Optional[str] = None
+    vlm_task: Optional[str] = "caption"  # caption | vqa | grounding
+    vlm_text_encoder: Optional[str] = None  # CLIP text encoder for VLM backend
+    vlm_candidates: Optional[str] = None  # comma-separated answer candidates (VQA)
 
 
 class VideoInfoRequest(BaseModel):
     path: str
+
+
+class VLMBatchRequest(BaseModel):
+    model_path: str
+    text_encoder: str
+    img_dir: str
+    prompt: Optional[str] = None
+    task: str = "caption"  # caption | vqa | grounding
+    candidates: Optional[str] = None
+    max_images: int = 50
 
 
 # ── Model load / info ───────────────────────────────────
@@ -71,12 +86,18 @@ async def model_classes(req: ModelClassesRequest):
         return {"error": str(e)}
 
 
+class GtClassesRequest(BaseModel):
+    label_dir: str
+
+
 @router.post("/api/gt/classes")
-async def gt_classes(req: dict):
-    label_dir = req.get("label_dir", "")
-    if not os.path.isdir(label_dir):
+async def gt_classes(req: GtClassesRequest):
+    # Empty input → empty result (unchanged friendly fallback).
+    if not req.label_dir:
         return {"classes": []}
-    class_ids = set()
+    # Boundary check: must exist, must be a dir, no traversal.
+    label_dir = safe_label_dir(req.label_dir)
+    class_ids: set[int] = set()
     for f in os.listdir(label_dir):
         if not f.endswith(".txt"):
             continue
@@ -89,6 +110,71 @@ async def gt_classes(req: dict):
                     except ValueError:
                         pass
     return {"classes": sorted(class_ids)}
+
+
+class ClassifyRequest(BaseModel):
+    path: str
+
+
+@router.post("/api/model/classify")
+async def model_classify(req: ClassifyRequest):
+    """Auto-detect task_type from an ONNX file's I/O signature.
+
+    Used by the frontend's drag-and-drop loader to route the user to the
+    right tab without forcing them to pick a model_type manually.
+    """
+    path = safe_model_file(req.path)
+    from core.model_classifier import classify
+    return classify(path)
+
+
+@router.post("/api/model/find-partner")
+async def model_find_partner(req: ClassifyRequest):
+    """Find the matching CLIP partner encoder in the same directory.
+
+    Removes a manual step in the VLM tab: drop the image encoder, and
+    ssook auto-populates the text encoder field if it can find one.
+    """
+    path = safe_model_file(req.path)
+    from core.model_pairing import find_partner
+    return find_partner(path)
+
+
+# ── Class label catalogues ──────────────────────────────
+@router.get("/api/classes/catalog")
+async def classes_catalog():
+    """List built-in label catalogues (COCO80, VOC20, ImageNet1k...)."""
+    from core.class_catalog import list_catalogs
+    return {"catalogs": list_catalogs()}
+
+
+@router.get("/api/classes/catalog/{name}")
+async def classes_catalog_get(name: str):
+    """Fetch the full label list for one catalogue."""
+    from core.class_catalog import get, as_class_names
+    labels = get(name)
+    if labels is None:
+        return {"error": f"Unknown catalog: {name}", "code": "CATALOG_UNKNOWN"}
+    return {"name": name, "labels": labels, "class_names": as_class_names(name)}
+
+
+class SuggestCatalogRequest(BaseModel):
+    num_classes: int
+
+
+@router.post("/api/classes/suggest")
+async def classes_suggest(req: SuggestCatalogRequest):
+    """Suggest a catalogue based on the model's class count.
+
+    Frontend: after loading a model with no class_names, call this with
+    the detected count and offer a 1-click apply.
+    """
+    from core.class_catalog import suggest, get
+    name = suggest(req.num_classes)
+    if name is None:
+        return {"name": None, "labels": None,
+                "msg": f"No built-in catalogue matches num_classes={req.num_classes}"}
+    return {"name": name, "labels": get(name)}
 
 
 @router.post("/api/model/infer-shapes")
@@ -160,13 +246,39 @@ def _infer_image_sync(req: InferRequest):
                         "infer_ms": round(infer_ms, 2), "classes": {}}
 
         if model.task_type == "vlm":
+            from core.vlm_inference import get_backend
+            t0 = _time.perf_counter()
+            text_encoder = req.vlm_text_encoder or req.clip_text_encoder
+            # Path safety: VLM endpoints accept user-supplied encoder paths.
+            try:
+                safe_model_file(req.model_path)
+                if text_encoder:
+                    safe_model_file(text_encoder)
+                if req.image_path:
+                    safe_image_file(req.image_path)
+            except Exception as e:
+                return {"error": f"Invalid path: {e}"}
+            try:
+                backend = get_backend(req.model_path, text_encoder=text_encoder)
+                task = (req.vlm_task or "caption").lower()
+                prompt = req.vlm_prompt or ""
+                if task == "vqa":
+                    cands = [c for c in (req.vlm_candidates or "").split(",") if c.strip()]
+                    text_result = backend.vqa(frame, prompt, candidates=cands or None)
+                    overlay = f"A: {text_result[:60]}"
+                else:  # caption / grounding (grounding falls back to caption in v1)
+                    text_result = backend.caption(frame, hint=prompt or None)
+                    overlay = text_result[:80]
+            except Exception as e:
+                return {"error": f"VLM inference failed: {e}"}
+            infer_ms = (_time.perf_counter() - t0) * 1000
             vis = frame.copy()
-            prompt = req.vlm_prompt or "Describe this image."
-            cv2.putText(vis, f"VLM: {prompt[:60]}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(vis, overlay, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
             return {"image": base64.b64encode(buf).decode(), "detections": 0,
-                    "vlm_result": f"VLM inference not yet implemented (prompt: {prompt})",
-                    "infer_ms": 0, "classes": {}}
+                    "vlm_result": text_result,
+                    "vlm_task": task,
+                    "infer_ms": round(infer_ms, 2), "classes": {}}
 
         if model.task_type == "classification":
             result = run_classification(model, frame)
@@ -221,6 +333,75 @@ def _infer_image_sync(req: InferRequest):
                             for cid in np.unique(result.class_ids)} if len(result.class_ids) else {}}
     except Exception as e:
         return {"error": str(e)}
+
+
+# ── VLM batch (async) ────────────────────────────────────
+@router.post("/api/vlm/batch")
+async def vlm_batch(req: VLMBatchRequest):
+    """Run VLM (caption/VQA) over a folder in the background.
+
+    Status is exposed via GET /api/vlm/status. Force-stop via
+    POST /api/force-stop/vlm.
+    """
+    if vlm_state.get("running"):
+        return {"error": "VLM batch already running", "code": "VLM_BUSY"}
+    model_path = safe_model_file(req.model_path)
+    text_encoder = safe_model_file(req.text_encoder)
+    img_dir = safe_image_dir(req.img_dir)
+    imgs = glob_images(img_dir)
+    if not imgs:
+        return {"error": "No images found", "code": "EMPTY_DIR"}
+    imgs = imgs[: max(1, min(req.max_images, 500))]
+
+    vlm_state.update(running=True, progress=0, total=len(imgs), msg="Starting...", results=[])
+
+    @route_errors(state=vlm_state, scope="vlm")
+    def _run():
+        from core.vlm_inference import get_backend
+        from core.run_record import RunRecorder
+        from core.paths import tmp_dir
+        out_dir = tmp_dir("vlm")
+        with RunRecorder(run_type="vlm_batch", output_dir=out_dir,
+                         inputs={"task": req.task, "prompt": req.prompt,
+                                 "candidates": req.candidates,
+                                 "img_dir": img_dir, "max_images": len(imgs)},
+                         model_path=model_path) as rec:
+            vlm_state["trace_id"] = rec.trace_id
+            backend = get_backend(model_path, text_encoder=text_encoder)
+            task = (req.task or "caption").lower()
+            cands = [c for c in (req.candidates or "").split(",") if c.strip()]
+            results = []
+            for i, fp in enumerate(imgs):
+                if not vlm_state.get("running", True):
+                    rec.note(f"Stopped at {i}/{len(imgs)}")
+                    vlm_state.update(msg="Stopped by user")
+                    break
+                frame = imread(fp)
+                if frame is None:
+                    vlm_state["progress"] = i + 1
+                    continue
+                t0 = _time.perf_counter()
+                try:
+                    if task == "vqa":
+                        text = backend.vqa(frame, req.prompt or "", candidates=cands or None)
+                    else:
+                        text = backend.caption(frame, hint=req.prompt or None)
+                except Exception as e:
+                    text = f"(error: {e})"
+                ms = round((_time.perf_counter() - t0) * 1000, 1)
+                results.append({"file": os.path.basename(fp), "result": text, "ms": ms})
+                vlm_state["progress"] = i + 1
+                vlm_state["msg"] = f"{i+1}/{len(imgs)}"
+                vlm_state["results"] = results
+            vlm_state.update(running=False, msg="Complete")
+
+    executor.submit(_run)
+    return {"ok": True, "total": len(imgs)}
+
+
+@router.get("/api/vlm/status")
+async def vlm_status():
+    return vlm_state.snapshot() if hasattr(vlm_state, "snapshot") else dict(vlm_state)
 
 
 # ── Video Info ───────────────────────────────────────────

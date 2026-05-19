@@ -18,8 +18,7 @@ from server.utils import imread, glob_images, encode_jpeg
 router = APIRouter()
 
 # ── Data: Explorer API ──────────────────────────────────
-explorer_state = {"running": False, "progress": 0, "total": 0, "msg": "", "data": None}
-
+# NOTE: explorer_state imported from server.state — do NOT re-declare.
 @router.post("/api/data/explorer")
 async def data_explorer(req: dict):
     img_dir = req.get("img_dir", "")
@@ -272,7 +271,7 @@ async def data_splitter(req: SplitterRequest):
 
 @router.get("/api/data/splitter/status")
 async def splitter_status():
-    return dict(splitter_state)
+    return splitter_state.snapshot() if hasattr(splitter_state, 'snapshot') else dict(splitter_state)
 
 
 # ── Data: Converter API ────────────────────────────────
@@ -421,7 +420,7 @@ async def data_converter(req: ConverterRequest):
 
 @router.get("/api/data/converter/status")
 async def converter_status():
-    return dict(converter_state)
+    return converter_state.snapshot() if hasattr(converter_state, 'snapshot') else dict(converter_state)
 
 
 # ── Data: Remapper API ─────────────────────────────────
@@ -480,7 +479,7 @@ async def data_remapper(req: RemapperRequest):
 
 @router.get("/api/data/remapper/status")
 async def remapper_status():
-    return dict(remapper_state)
+    return remapper_state.snapshot() if hasattr(remapper_state, 'snapshot') else dict(remapper_state)
 
 
 # ── Data: Merger API ───────────────────────────────────
@@ -501,23 +500,7 @@ async def data_merger(req: MergerRequest):
     def _run():
         try:
             import shutil
-            import cv2
-            import numpy as np
-
-            def compute_dhash(path: str) -> int | None:
-                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-                if img is None:
-                    return None
-                resized = cv2.resize(img, (9, 8), interpolation=cv2.INTER_AREA)
-                diff = resized[:, 1:] > resized[:, :-1]
-                bits = diff.flatten()
-                h = 0
-                for b in bits:
-                    h = (h << 1) | int(b)
-                return h
-
-            def hamming(a: int, b: int) -> int:
-                return bin(a ^ b).count("1")
+            from core.hashing import compute_dhash, hamming
 
             os.makedirs(os.path.join(req.output_dir, "images"), exist_ok=True)
             os.makedirs(os.path.join(req.output_dir, "labels"), exist_ok=True)
@@ -564,7 +547,7 @@ async def data_merger(req: MergerRequest):
 
 @router.get("/api/data/merger/status")
 async def merger_status():
-    return dict(merger_state)
+    return merger_state.snapshot() if hasattr(merger_state, 'snapshot') else dict(merger_state)
 
 
 # ── Data: Sampler API ──────────────────────────────────
@@ -689,6 +672,6 @@ async def data_sampler(req: SamplerRequest):
 
 @router.get("/api/data/sampler/status")
 async def sampler_status():
-    return dict(sampler_state)
+    return sampler_state.snapshot() if hasattr(sampler_state, 'snapshot') else dict(sampler_state)
 
 

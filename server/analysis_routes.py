@@ -242,7 +242,7 @@ async def run_error_analysis(req: ErrorAnalysisRequest):
 
 @router.get("/api/analysis/error-analysis/status")
 async def error_analysis_status():
-    return dict(error_analysis_state)
+    return error_analysis_state.snapshot() if hasattr(error_analysis_state, 'snapshot') else dict(error_analysis_state)
 
 
 # ── 3. Confidence Optimizer API ─────────────────────────
@@ -365,7 +365,7 @@ async def run_conf_optimizer(req: ConfOptimizerRequest):
 
 @router.get("/api/analysis/conf-optimizer/status")
 async def conf_optimizer_status():
-    return dict(conf_opt_state)
+    return conf_opt_state.snapshot() if hasattr(conf_opt_state, 'snapshot') else dict(conf_opt_state)
 
 
 # ── 4. Embedding Viewer API ────────────────────────────
