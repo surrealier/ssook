@@ -72,9 +72,29 @@ a = Analysis(
         'uvicorn.lifespan', 'uvicorn.lifespan.on',
         'fastapi', 'starlette', 'pydantic', 'anyio',
         'cv2', 'numpy', 'yaml', 'psutil',
-        'core.app_config', 'core.model_loader', 'core.inference',
-        'core.benchmark_runner', 'core.evaluation', 'core.ep_selector',
-        'server',
+        # Auto-synced by tools/sync_pyinstaller_spec.py — keep "core.*" / "server.*"
+        # blocks below in sync when adding new modules.
+        # core.* (auto-sync block)
+        'core.app_config', 'core.benchmark_runner', 'core.bottleneck_analyzer',
+        'core.class_catalog', 'core.clip_inference', 'core.diagnosis_charts', 'core.env',
+        'core.ep_manager', 'core.ep_selector', 'core.ep_worker', 'core.evaluation',
+        'core.exports', 'core.hashing', 'core.hf_downloader', 'core.inference',
+        'core.logging_setup', 'core.model_cache', 'core.model_classifier',
+        'core.model_diagnosis', 'core.model_inspector', 'core.model_loader',
+        'core.model_pairing', 'core.model_profiler', 'core.optimization_pipeline',
+        'core.optimizer_registry', 'core.optimizers', 'core.optimizers.channel_pruning',
+        'core.optimizers.graph_optimizer', 'core.optimizers.mixed_precision',
+        'core.optimizers.weight_pruning', 'core.paths', 'core.quantizer', 'core.run_record',
+        'core.tracking', 'core.vlm_inference',
+
+        # server.* (auto-sync block)
+        'server', 'server.analysis_routes', 'server.benchmark_routes', 'server.config_routes',
+        'server.data_routes', 'server.errors', 'server.eval_routes', 'server.extra_routes',
+        'server.middleware', 'server.model_manager', 'server.model_routes',
+        'server.optimization_routes', 'server.path_safety', 'server.quality_routes',
+        'server.state', 'server.system_routes', 'server.utils', 'server.viewer_routes',
+
+        # End auto-sync.
         'webview', 'webview.platforms', 'webview.platforms.edgechromium',
         'clr_loader', 'pythonnet',
     ],
