@@ -128,6 +128,22 @@ _HW_CHECKS = {
 }
 
 
+# ── System onnxruntime probe ────────────────────────────
+
+def _detect_system_provider(priority: list) -> str:
+    """Probe system-installed onnxruntime for available GPU providers."""
+    try:
+        import onnxruntime as ort
+        available = ort.get_available_providers()
+        for key in priority:
+            prov = _EP_PROVIDER_MAP.get(key)
+            if prov and prov in available:
+                return prov
+    except Exception:
+        pass
+    return "CPUExecutionProvider"
+
+
 # ── Main entry point ────────────────────────────────────
 
 def select_and_activate() -> str:
@@ -190,19 +206,28 @@ def select_and_activate() -> str:
         ep_result["provider"] = _EP_PROVIDER_MAP.get(selected, "CPUExecutionProvider")
         print(f"[EP Selector] selected: {selected} -> {ep_path}")
     else:
-        # Nothing bundled at all -- fall through to system onnxruntime
+        # No bundled EP — probe system onnxruntime for GPU providers
+        sys_provider = _detect_system_provider(priority)
         ep_result["selected"] = "system"
-        ep_result["provider"] = "CPUExecutionProvider"
-        print("[EP Selector] no ep_runtimes bundled, using system onnxruntime")
+        ep_result["provider"] = sys_provider
+        if sys_provider != "CPUExecutionProvider":
+            # System has GPU support — no warnings needed
+            ep_result["skipped"] = []
+            print(f"[EP Selector] using system onnxruntime -> {sys_provider}")
+        else:
+            # System onnxruntime is CPU-only — keep skipped for diagnostics
+            print("[EP Selector] using system onnxruntime (CPU only)")
 
-    # Fallback detection
-    top = priority[0] if priority else None
-    if ep_result["selected"] not in (top, None):
+    # Fallback detection: only flag if actually stuck on CPU
+    if ep_result["provider"] == "CPUExecutionProvider" and priority and priority[0] != "cpu":
         ep_result["fallback"] = True
         if ep_result["skipped"]:
             first = ep_result["skipped"][0]
             ep_result["fallback_reason"] = first["reason"]
             ep_result["fallback_fix"] = first["fix"]
+        else:
+            ep_result["fallback_reason"] = "No GPU-capable onnxruntime found"
+            ep_result["fallback_fix"] = "pip install onnxruntime-gpu  (requires CUDA 12 + cuDNN 9)"
 
     return ep_result["selected"]
 
