@@ -1,4 +1,5 @@
 """벤치마크 러너: 전처리/추론/후처리 단계별 성능 측정 (Warmup 포함)"""
+import gc
 import json
 import os
 import subprocess
@@ -195,8 +196,29 @@ def run_benchmark_core(
 
     total_steps = sum(cfg.warmup + cfg.iterations for cfg in configs)
     done = 0
+    # 직전 모델 — 다음 모델을 로드하기 전에 세션을 해제해 메모리 peak를 억제한다.
+    prev_info = None
+
+    def _release(info) -> None:
+        """ORT 세션과 캐시 버퍼 참조를 끊고 GC를 유도한다.
+
+        WHY: load_model은 호출마다 새 InferenceSession을 만들고 캐시하지 않으므로
+        (core/model_loader), 참조만 끊으면 ORT가 GPU/CPU 메모리를 해제한다.
+        모델 수에 상한을 두지 않는 대신, 모델 사이마다 세션을 비워 다수 모델
+        벤치마크에서 VRAM/RAM이 단조 누적돼 CUDA OOM 나는 것을 방지한다.
+        """
+        if info is not None:
+            info.session = None
+            info._batch_buf = None
+            info._frame_buffer = []
+        gc.collect()
 
     for cfg in configs:
+        # 다음 모델 로드 전에 직전 세션을 해제 — 두 세션이 동시에 상주(peak 2배)하지 않게.
+        if prev_info is not None:
+            _release(prev_info)
+            prev_info = None
+
         if is_stopped():
             break
 
@@ -209,6 +231,10 @@ def run_benchmark_core(
             done += cfg.warmup + cfg.iterations
             on_progress(done, total_steps, f"[{model_name}] 로드 실패 — 건너뜀")
             continue
+
+        # 로드 성공 — 다음 iteration(또는 루프 종료 후)에 해제할 대상으로 등록.
+        # 이렇게 두면 아래 어떤 continue/break 경로로 빠져도 세션이 정리된다.
+        prev_info = model_info
 
         if model_info.session is None:
             on_error(f"[{model_name}] 세션 없음 — 건너뜀")
@@ -363,6 +389,10 @@ def run_benchmark_core(
             gpu_mem_total=sampler.gpu_mem_total,
         )
         on_result(result)
+
+    # 마지막으로 처리한 모델의 세션도 해제 (루프 내 정리는 '다음 로드 직전'이므로).
+    if prev_info is not None:
+        _release(prev_info)
 
 
 if _HAS_QT:
