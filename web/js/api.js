@@ -75,6 +75,7 @@ const API = {
   videoInfo:  (path)   => API.post('/api/video/info', { path }),
   listDir:    (params) => API.post('/api/fs/list', params),
   selectFile: (opts)   => API.post('/api/fs/select', opts || {}),
+  selectFilesMulti: (opts) => API.post('/api/fs/select-multi', opts || {}),
   selectDir:  ()       => API.post('/api/fs/select-dir'),
   evaluate:   (params) => API.post('/api/evaluation/run', params),
 

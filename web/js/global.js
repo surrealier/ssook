@@ -235,15 +235,23 @@ async function pickFile(inputId, filters) {
   });
 }
 
-/* Add model slot to multi-model container */
+/* Add model slot(s) to multi-model container.
+   Uses the native multi-select dialog so several models can be added at once;
+   falls back gracefully to a single path if the dialog returns only one. */
 let _slotN = 0;
 async function addModelSlot(containerId, listId) {
-  _showFileBrowser('file', ['.onnx'], (path) => {
-    _addOneSlot(containerId, listId, path);
-  });
+  try {
+    const r = await API.selectFilesMulti({ filters: '*.onnx' });
+    if (r.error) { console.error('File dialog error:', r.error); return; }
+    for (const path of (r.paths || [])) _addOneSlot(containerId, listId, path);
+  } catch (err) {
+    console.error('File dialog error:', err);
+  }
 }
 function _addOneSlot(containerId, listId, path) {
   const c = document.getElementById(containerId);
+  // Skip duplicates so multi-select (or repeated adds) don't create twin rows.
+  if (getSlotModels(containerId).includes(path)) return;
   const hint = document.getElementById(listId + '-hint');
   if (hint) hint.remove();
   const id = ++_slotN;
