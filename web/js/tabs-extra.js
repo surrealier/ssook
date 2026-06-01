@@ -9,10 +9,10 @@ function escHtml(s) {
 }
 
 /* Build a ' — showing N of M' suffix when a worker capped its returned results.
-   Backends set status.truncated=true and status.total_count=<full count>. Returns '' otherwise. */
+   Backends set status.truncated=true and status.total_found=<full count>. Returns '' otherwise. */
 function truncationNote(status, shownCount) {
   if (!status || !status.truncated) return '';
-  const total = status.total_count != null ? status.total_count : shownCount;
+  const total = status.total_found != null ? status.total_found : shownCount;
   return ' — ' + t('results_truncated', { n: shownCount, total });
 }
 
@@ -2346,9 +2346,11 @@ Tabs['vlm'] = {
       model_type: 'vlm',
       backend: inputs.backend,
       vlm_task: inputs.task,
-      prompt: inputs.prompt,
-      candidates: inputs.candidates,
-      text_encoder: inputs.textEncoder,
+      // InferRequest uses the vlm_-prefixed names (model_routes.py:44-47); the
+      // unprefixed runBatch/VLMBatchRequest names are intentionally different.
+      vlm_prompt: inputs.prompt,
+      vlm_candidates: inputs.candidates,
+      vlm_text_encoder: inputs.textEncoder,
       model_id: inputs.modelId,
       endpoint_url: inputs.endpoint,
       api_key: inputs.apiKey,
