@@ -76,3 +76,12 @@ ep_packages/
 ep_venvs/
 benchmark_results.*
 eval_report.*
+
+# Local-only scripts / scratch (not part of the published project)
+render_results_video.py
+run_batch_inference.py
+skills-lock.json
+inference_results/
+inference_videos/
+.playwright-mcp/
+_triage.txt
