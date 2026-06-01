@@ -1,5 +1,21 @@
 /* tabs-extra.js — Remaining tab renderers using shared helpers */
 
+/* Escape server-supplied strings before innerHTML interpolation (mirrors notify.js _esc).
+   WHY: filenames from third-party datasets can carry HTML/JS payloads → DOM-XSS. */
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : s;
+  return d.innerHTML;
+}
+
+/* Build a ' — showing N of M' suffix when a worker capped its returned results.
+   Backends set status.truncated=true and status.total_count=<full count>. Returns '' otherwise. */
+function truncationNote(status, shownCount) {
+  if (!status || !status.truncated) return '';
+  const total = status.total_count != null ? status.total_count : shownCount;
+  return ' — ' + t('results_truncated', { n: shownCount, total });
+}
+
 /* ── Generic functional tab builder ─────────────────── */
 function makeTab(opts) {
   return {
@@ -91,6 +107,10 @@ Tabs['model-compare'] = {
             </div>
           </div>
           ${imgDirInput('cmp-img')}
+          <div class="form-group" style="margin-top:0.75rem;max-width:200px;">
+            <label class="form-label" for="cmp-conf">${t('cmp.conf')}</label>
+            <input type="number" class="form-input input-normal" id="cmp-conf" value="0.25" min="0.01" max="0.99" step="0.05">
+          </div>
           <div style="display:flex;gap:0.5rem;margin-top:1rem;">
             <button class="btn btn-primary" onclick="Tabs['model-compare'].run()">${t('run')}</button>
             <button class="btn btn-danger btn-sm" id="cmp-stop" disabled onclick="API.post('/api/force-stop/compare',{});Tabs['model-compare']._polling=false">${t('stop')}</button>
@@ -121,7 +141,7 @@ Tabs['model-compare'] = {
         model_a: a, model_b: b,
         model_type_a: document.getElementById('cmp-type-a').value,
         model_type_b: document.getElementById('cmp-type-b').value,
-        img_dir: imgDir, conf: 0.25
+        img_dir: imgDir, conf: +(document.getElementById('cmp-conf')?.value || 0.25)
       });
       if (r.error) { App.setStatus('Error: '+r.error); return; }
       this._polling = true; this._poll();
@@ -364,7 +384,7 @@ Tabs['embedding-viewer'] = {
           ${imgDirInput('ev-img')}
           <div class="form-group" style="margin-top:0.75rem;">
             <label class="form-label">${t('ev.method')}</label>
-            <select class="form-input input-normal" id="ev-method" style="width:auto;"><option>t-SNE</option><option>UMAP</option><option>PCA</option></select>
+            <select class="form-input input-normal" id="ev-method" style="width:auto;"><option value="tsne">t-SNE</option><option value="umap">UMAP</option><option value="pca">PCA</option></select>
           </div>
           <div style="display:flex;gap:0.5rem;margin-top:1rem;">
             <button class="btn btn-primary" onclick="Tabs['embedding-viewer'].run()">${t('run')}</button>
@@ -445,7 +465,8 @@ Tabs.segmentation = {
     const label_dir = document.getElementById('seg-lbl')?.value || G.lblDir;
     if (!model_path || !img_dir) { App.setStatus(t('common.select_model_img')); return; }
     try {
-      const r = await API.post('/api/segmentation/run', { model_path, img_dir, label_dir });
+      // Backend's SegmentationRunRequest reads gt_mask_dir (falling back to label_dir); send both.
+      const r = await API.post('/api/segmentation/run', { model_path, img_dir, gt_mask_dir: label_dir, label_dir });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
@@ -460,7 +481,7 @@ Tabs.segmentation = {
       const segPt = document.getElementById('seg-prog-text'); if (segPt) segPt.textContent = prog + '%';
       if (msgEl) msgEl.textContent = s.msg || `${s.progress}/${s.total}`;
       if (s.running) setTimeout(() => this._poll(), 500);
-      else App.setStatus(s.msg || 'Complete');
+      else App.setStatus((s.msg || 'Complete') + (s.skipped ? ` (${t('spec.skipped', {n: s.skipped})})` : ''));
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
   _showDetail() {
@@ -532,6 +553,10 @@ Tabs.clip = {
             <label class="form-label">${t('clip.labels')}</label>
             <input type="text" class="form-input input-normal" placeholder="${t('clip.labels_ph')}" id="clip-labels">
           </div>
+          <div class="form-group" style="margin-top:0.75rem;">
+            <label class="form-label" for="clip-prompt-template">${t('clip.prompt_template')}</label>
+            <input type="text" class="form-input input-normal" placeholder="${t('clip.prompt_template_ph')}" id="clip-prompt-template" value="a photo of a {}">
+          </div>
           <button class="btn btn-primary" style="margin-top:1rem;" id="clip-run-btn" onclick="Tabs.clip.run()">${t('run')}</button>
         </div>
         <div>
@@ -550,12 +575,14 @@ Tabs.clip = {
     const txtEnc = document.getElementById('clip-txt-enc')?.value;
     const imgDir = document.getElementById('clip-img')?.value || G.imgDir;
     const labels = document.getElementById('clip-labels')?.value;
+    const promptTemplate = document.getElementById('clip-prompt-template')?.value || '';
     if (!imgEnc || !txtEnc || !imgDir || !labels) {
       App.setStatus(t('clip.fill_all')); return;
     }
     try {
       const r = await API.post('/api/clip/run', {
-        image_encoder: imgEnc, text_encoder: txtEnc, img_dir: imgDir, labels
+        image_encoder: imgEnc, text_encoder: txtEnc, img_dir: imgDir, labels,
+        prompt_template: promptTemplate
       });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       this._poll();
@@ -579,7 +606,7 @@ Tabs.clip = {
       }
       if (s.running) setTimeout(() => this._poll(), 500);
       else {
-        App.setStatus(s.msg || 'Complete');
+        App.setStatus((s.msg || 'Complete') + (s.skipped ? ` (${t('spec.skipped', {n: s.skipped})})` : ''));
         if (this._detail && this._detail.length) {
           const btn = document.getElementById('clip-run-btn');
           if (btn) btn.insertAdjacentHTML('afterend',
@@ -662,7 +689,7 @@ Tabs.embedder = {
         ).join('');
       }
       if (s.running) setTimeout(() => this._poll(), 500);
-      else App.setStatus(s.msg || 'Complete');
+      else App.setStatus((s.msg || 'Complete') + (s.skipped ? ` (${t('spec.skipped', {n: s.skipped})})` : ''));
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
   _showDetail() {
@@ -784,7 +811,17 @@ Tabs.converter = {
       const convPt = document.getElementById('conv-prog-text'); if (convPt) convPt.textContent = pct + '%';
       if (m) m.textContent = s.msg || `${s.progress}/${s.total}`;
       if (s.running) setTimeout(() => this._poll(), 500);
-      else App.setStatus(s.msg + (s.results ? ` — ${JSON.stringify(s.results)}` : ''));
+      else {
+        // DATA-06: converter skips labels whose source image dimensions are unknown
+        // (separate labels/images dirs) and labels whose image was never found.
+        // Surface those counts instead of a silent 640×640 fallback.
+        const res = s.results || {};
+        const notes = [];
+        if (res.converted !== undefined) notes.push(`${res.converted} ${t('conv.converted')}`);
+        if (res.missing_image) notes.push(t('conv.missing_image', {n: res.missing_image}));
+        if (res.skipped_no_size) notes.push(t('conv.skipped_no_size', {n: res.skipped_no_size}));
+        App.setStatus((s.msg || 'Complete') + (notes.length ? ` — ${notes.join(', ')}` : ''));
+      }
     } catch(e) { console.warn('poll error:', e); }
   }
 };
@@ -812,6 +849,7 @@ Tabs.remapper = {
               <span id="remap-pbar-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span>
             </div>
           </div>
+          <div id="remap-reindex-result" style="display:none;margin-top:0.75rem;"></div>
         </div>
       </div>`;
   },
@@ -839,6 +877,20 @@ Tabs.remapper = {
       if (p) p.style.width = '100%'; if (pt) pt.textContent = '100%';
       if (s.results) App.setStatus(`Remap complete — ${s.results.files} files, ${s.results.labels} labels`);
       else App.setStatus(s.msg || 'Complete');
+      // DATA-04: surface the applied reindex map (old class id → new contiguous id).
+      const rmap = s.results && s.results.reindex_map;
+      const box = document.getElementById('remap-reindex-result');
+      if (box) {
+        if (rmap && Object.keys(rmap).length) {
+          const rows = Object.entries(rmap)
+            .map(([oldId, newId]) => `<span class="badge" style="margin:2px;">${escHtml(oldId)} → ${escHtml(newId)}</span>`)
+            .join(' ');
+          box.innerHTML = `<div class="text-label" style="margin-bottom:0.25rem;">${t('remap.reindex_map')}</div><div style="font-size:12px;">${rows}</div>`;
+          box.style.display = 'block';
+        } else {
+          box.style.display = 'none';
+        }
+      }
       setTimeout(() => { const w = document.getElementById('remap-pbar-wrap'); if (w) w.style.display = 'none'; }, 1000);
     } catch(e) { setTimeout(() => this._poll(), 500); }
   }
@@ -1015,9 +1067,9 @@ Tabs.anomaly = {
       const m = document.getElementById('anom-msg'); if (m) m.textContent = s.msg || '';
       if (!s.running && s.results) {
         document.getElementById('anom-results').innerHTML = s.results.length
-          ? s.results.map(r => `<tr><td>${r.file}</td><td>${r.type}</td><td style="font-size:11px;">${r.details}</td><td>${r.severity}</td></tr>`).join('')
+          ? s.results.map(r => `<tr><td>${escHtml(r.file)}</td><td>${escHtml(r.type)}</td><td style="font-size:11px;">${escHtml(r.details)}</td><td>${escHtml(r.severity)}</td></tr>`).join('')
           : '<tr><td colspan="4" class="text-secondary" style="text-align:center;">' + t('anomaly.none') + '</td></tr>';
-        App.setStatus(s.msg);
+        App.setStatus((s.msg || '') + truncationNote(s, s.results.length));
       } else if (s.running) setTimeout(() => this._poll(), 500);
     } catch(e) { console.warn('poll error:', e); }
   }
@@ -1057,8 +1109,8 @@ Tabs.quality = {
       const m = document.getElementById('qual-msg'); if (m) m.textContent = s.msg || '';
       if (!s.running && s.results) {
         document.getElementById('qual-results').innerHTML = s.results.map(r =>
-          `<tr><td>${r.file}</td><td>${r.blur}</td><td>${r.brightness}</td><td>${r.entropy}</td><td>${r.aspect}</td><td>${r.issues}</td></tr>`).join('');
-        App.setStatus(s.msg);
+          `<tr><td>${escHtml(r.file)}</td><td>${r.blur}</td><td>${r.brightness}</td><td>${r.entropy}</td><td>${r.aspect}</td><td>${escHtml(r.issues)}</td></tr>`).join('');
+        App.setStatus((s.msg || '') + truncationNote(s, s.results.length));
       } else if (s.running) setTimeout(() => this._poll(), 500);
     } catch(e) { console.warn('poll error:', e); }
   }
@@ -1099,9 +1151,9 @@ Tabs.duplicate = {
       const m = document.getElementById('dup-msg'); if (m) m.textContent = s.msg || '';
       if (!s.running && s.results) {
         document.getElementById('dup-results').innerHTML = s.results.length
-          ? s.results.map(r => `<tr><td>${r.group}</td><td>${r.image_a}</td><td>${r.image_b}</td><td>${r.distance}</td></tr>`).join('')
+          ? s.results.map(r => `<tr><td>${r.group}</td><td>${escHtml(r.image_a)}</td><td>${escHtml(r.image_b)}</td><td>${r.distance}</td></tr>`).join('')
           : '<tr><td colspan="4" class="text-secondary" style="text-align:center;">' + t('dup.none') + '</td></tr>';
-        App.setStatus(s.msg);
+        App.setStatus((s.msg || '') + truncationNote(s, s.results.length));
       } else if (s.running) setTimeout(() => this._poll(), 500);
     } catch(e) {}
   }
@@ -1159,9 +1211,9 @@ Tabs.leaky = {
       if (!s.running && s.results) {
         if (lp) lp.style.width = '100%'; if (lpt) lpt.textContent = '100%';
         document.getElementById('leak-results').innerHTML = s.results.length
-          ? s.results.map(r => `<tr><td>${r.pair}</td><td>${r.duplicates}</td><td style="font-size:11px;">${r.files}</td></tr>`).join('')
+          ? s.results.map(r => `<tr><td>${escHtml(r.pair)}</td><td>${r.duplicates}</td><td style="font-size:11px;">${escHtml(r.files)}</td></tr>`).join('')
           : '<tr><td colspan="3" class="text-secondary" style="text-align:center;">' + t('leaky.none') + '</td></tr>';
-        App.setStatus(s.msg || 'Complete');
+        App.setStatus((s.msg || 'Complete') + truncationNote(s, s.results.length));
       } else if (s.running) setTimeout(() => this._poll(), 500);
     } catch(e) {}
   }
@@ -1189,7 +1241,7 @@ Tabs.similarity = {
     const img_dir = document.getElementById('sim-img')?.value || G.imgDir;
     if (!img_dir) { App.setStatus(t('eval.select_images')); return; }
     try {
-      const r = await API.post('/api/quality/similarity', { img_dir, query: document.getElementById('sim-query')?.value || '', top_k: +document.getElementById('sim-k').value });
+      const r = await API.post('/api/quality/similarity', { img_dir, query_path: document.getElementById('sim-query')?.value || '', top_k: +document.getElementById('sim-k').value });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
@@ -1203,8 +1255,8 @@ Tabs.similarity = {
       const m = document.getElementById('sim-msg'); if (m) m.textContent = s.msg || '';
       if (!s.running && s.results) {
         document.getElementById('sim-results').innerHTML = s.results.map(r =>
-          `<tr><td>${r.rank}</td><td>${r.image}</td><td>${r.distance}</td></tr>`).join('');
-        App.setStatus(s.msg || 'Complete');
+          `<tr><td>${r.rank}</td><td>${escHtml(r.image)}</td><td>${r.distance}</td></tr>`).join('');
+        App.setStatus((s.msg || 'Complete') + truncationNote(s, s.results.length));
       } else if (s.running) setTimeout(() => this._poll(), 500);
     } catch(e) {}
   }
@@ -1219,7 +1271,6 @@ Tabs.augmentation = {
         <div class="card" style="padding:1.5rem;">
           <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('aug.title')}</h3>
           ${imgDirInput('aug-img')}
-          ${lblDirInput('aug-lbl')}
           <div class="form-group" style="margin-top:0.75rem;">
             <label class="form-label">${t('aug.type')}</label>
             <select class="form-input input-normal" id="aug-type">
@@ -1227,6 +1278,7 @@ Tabs.augmentation = {
               <option>Brightness</option>
             </select>
           </div>
+          <p class="text-secondary" style="margin-top:0.75rem;font-size:12px;">${t('aug.preview_only')}</p>
           <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.augmentation.run()">${t('aug.preview')}</button>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
@@ -1254,11 +1306,19 @@ Tabs.augmentation = {
 Tabs['pose'] = {
   title: true,
   render() {
+    // SPEC-04: backend is single-image; expose a single-image picker (not a dir) so the
+    // selected file is actually what gets inferred (was silently using dir's first image).
     return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('pose.title')}</h3>
         ${modelInput('pose-model')}
-        ${imgDirInput('pose-img')}
+        <div class="form-group" style="margin-top:0.75rem;">
+          <label class="form-label" for="pose-img">${t('cmt.test_image')}</label>
+          <div style="display:flex;gap:0.5rem;">
+            <input type="text" class="form-input input-normal" style="flex:1;" id="pose-img">
+            <button class="btn btn-secondary btn-sm" onclick="pickFile('pose-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
+          </div>
+        </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:0.75rem;">
           <div class="form-group"><label class="form-label">${t('pose.model_type')}</label>
             <select class="form-input input-normal" id="pose-model-type">
@@ -1268,6 +1328,8 @@ Tabs['pose'] = {
             </select></div>
           <div class="form-group"><label class="form-label">${t('settings.conf')}</label>
             <input type="number" class="form-input input-normal" id="pose-conf" value="0.25" min="0.01" max="0.99" step="0.05"></div>
+          <div class="form-group"><label class="form-label" for="pose-kpt-conf">${t('spec.kpt_conf')}</label>
+            <input type="number" class="form-input input-normal" id="pose-kpt-conf" value="0.5" min="0.01" max="0.99" step="0.05"></div>
         </div>
         <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.pose.run()">${t('pose.run')}</button>
       </div>
@@ -1278,16 +1340,17 @@ Tabs['pose'] = {
   },
   async run() {
     const model_path = document.getElementById('pose-model')?.value || G.model;
-    const img_dir = document.getElementById('pose-img')?.value || G.imgDir;
+    const image_path = document.getElementById('pose-img')?.value;
     if (!model_path) { App.setStatus(t('select_model')); return; }
-    if (!img_dir) { App.setStatus(t('eval.select_images')); return; }
+    if (!image_path) { App.setStatus(t('eval.select_images')); return; }
+    // Keypoint visibility threshold (sent to backend AND used for the visible-count below).
+    const kptConf = parseFloat(document.getElementById('pose-kpt-conf').value) || 0.5;
     App.setStatus(t('pose.running'));
     try {
-      const imgs = await API.post('/api/list-files', {dir: img_dir, exts: ['.jpg','.jpeg','.png','.bmp']});
-      const image_path = (imgs.files && imgs.files.length) ? imgs.files[0] : img_dir;
       const r = await API.post('/api/infer/pose', {
         model_path, image_path,
         conf: parseFloat(document.getElementById('pose-conf').value) || 0.25,
+        kpt_conf: kptConf,
         model_type: document.getElementById('pose-model-type').value,
       });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
@@ -1296,7 +1359,7 @@ Tabs['pose'] = {
       if (r.detections && r.detections.length) {
         html += '<div class="table-container" style="margin-top:0.75rem;"><table><thead><tr><th>#</th><th>Score</th><th>Keypoints (visible)</th></tr></thead><tbody>';
         r.detections.forEach((d, i) => {
-          const visible = d.keypoints.filter(k => k[2] > 0.5).length;
+          const visible = d.keypoints.filter(k => k[2] > kptConf).length;
           html += `<tr><td>${i+1}</td><td>${d.score}</td><td>${visible}/17</td></tr>`;
         });
         html += '</tbody></table></div>';
@@ -1315,7 +1378,13 @@ Tabs['instance-seg'] = {
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('instseg.title')}</h3>
         ${modelInput('iseg-model')}
-        ${imgDirInput('iseg-img')}
+        <div class="form-group" style="margin-top:0.75rem;">
+          <label class="form-label" for="iseg-img">${t('cmt.test_image')}</label>
+          <div style="display:flex;gap:0.5rem;">
+            <input type="text" class="form-input input-normal" style="flex:1;" id="iseg-img">
+            <button class="btn btn-secondary btn-sm" onclick="pickFile('iseg-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
+          </div>
+        </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:0.75rem;">
           <div class="form-group"><label class="form-label">${t('instseg.model_type')}</label>
             <select class="form-input input-normal" id="iseg-model-type">
@@ -1334,13 +1403,11 @@ Tabs['instance-seg'] = {
   },
   async run() {
     const model_path = document.getElementById('iseg-model')?.value || G.model;
-    const img_dir = document.getElementById('iseg-img')?.value || G.imgDir;
+    const image_path = document.getElementById('iseg-img')?.value;
     if (!model_path) { App.setStatus(t('select_model')); return; }
-    if (!img_dir) { App.setStatus(t('eval.select_images')); return; }
+    if (!image_path) { App.setStatus(t('eval.select_images')); return; }
     App.setStatus(t('instseg.running'));
     try {
-      const imgs = await API.post('/api/list-files', {dir: img_dir, exts: ['.jpg','.jpeg','.png','.bmp']});
-      const image_path = (imgs.files && imgs.files.length) ? imgs.files[0] : img_dir;
       const r = await API.post('/api/infer/instance-seg', {
         model_path, image_path,
         conf: parseFloat(document.getElementById('iseg-conf').value) || 0.25,
@@ -1371,8 +1438,17 @@ Tabs['tracking'] = {
             </select></div>
         </div>
         <p class="text-secondary" style="margin-top:0.75rem;font-size:12px;">${t('tracking.desc')}</p>
+        ${modelInput('track-model')}
+        <div class="form-group" style="margin-top:0.75rem;">
+          <label class="form-label" for="track-img">${t('cmt.test_image')}</label>
+          <div style="display:flex;gap:0.5rem;">
+            <input type="text" class="form-input input-normal" style="flex:1;" id="track-img">
+            <button class="btn btn-secondary btn-sm" onclick="pickFile('track-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
+          </div>
+        </div>
         <div style="display:flex;gap:0.5rem;margin-top:1rem;">
           <button class="btn btn-primary" onclick="Tabs.tracking.create()">${t('tracking.create')}</button>
+          <button class="btn btn-secondary" onclick="Tabs.tracking.update()">${t('tracking.step')}</button>
           <button class="btn btn-secondary" onclick="Tabs.tracking.reset()">${t('tracking.reset')}</button>
         </div>
       </div>
@@ -1388,6 +1464,33 @@ Tabs['tracking'] = {
       this._trackerId = r.tracker_id;
       document.getElementById('track-result').innerHTML = `<div class="text-secondary">${t('tracking.created')}: <strong>${r.tracker_id}</strong> (${r.type})</div>`;
       App.setStatus(t('tracking.created_status'));
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  },
+  async update() {
+    if (!this._trackerId) { App.setStatus(t('tracking.no_tracker')); return; }
+    const model_path = document.getElementById('track-model')?.value || G.model;
+    const image_path = document.getElementById('track-img')?.value;
+    if (!model_path) { App.setStatus(t('select_model')); return; }
+    if (!image_path) { App.setStatus(t('eval.select_images')); return; }
+    App.setStatus(t('tracking.stepping'));
+    try {
+      const r = await API.post('/api/tracking/update', { tracker_id: this._trackerId, model_path, image_path });
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      const tracks = r.tracks || [];
+      let html = `<div class="text-secondary" style="margin-bottom:0.75rem;">${t('tracking.active_tracks')}: ${tracks.length}</div>`;
+      if (tracks.length) {
+        html += '<div class="table-container"><table><thead><tr><th>ID</th><th>Box</th><th>Trajectory</th></tr></thead><tbody>';
+        tracks.forEach(trk => {
+          const box = Array.isArray(trk.box) ? trk.box.map(v => Math.round(v)).join(', ') : '';
+          const traj = Array.isArray(trk.trajectory) ? trk.trajectory.length : 0;
+          html += `<tr><td>${escHtml(trk.id)}</td><td>${escHtml(box)}</td><td>${traj}</td></tr>`;
+        });
+        html += '</tbody></table></div>';
+      } else {
+        html += `<span class="text-muted">${t('tracking.no_tracks')}</span>`;
+      }
+      document.getElementById('track-result').innerHTML = html;
+      App.setStatus(t('tracking.step_done'));
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
   async reset() {
@@ -1442,11 +1545,23 @@ Tabs['inspector'] = {
       html += `</ul><strong>Outputs:</strong><ul style="margin:0.25rem 0;">`;
       (r.outputs||[]).forEach(o => { html += `<li>${o.name}: [${o.shape.join(', ')}] (${o.dtype})</li>`; });
       html += '</ul></div></div>';
-      // EP compatibility
+      // EP compatibility — show per-EP op-support ratio. EPs not in the heuristic
+      // table report known=false / supported_ratio=null → render 'unknown', not 100%.
       html += `<div class="card-flat" style="padding:1rem;">
         <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.ep')}</div>
         <div style="font-size:12px;">`;
-      (r.compatible_eps||[]).forEach(ep => { html += `<span class="badge" style="margin:2px;">${ep}</span> `; });
+      const epCompat = r.ep_compatibility || {};
+      const epNames = Object.keys(epCompat);
+      if (epNames.length) {
+        epNames.forEach(ep => {
+          const info = epCompat[ep] || {};
+          const unknown = info.known === false || info.supported_ratio == null;
+          const label = unknown ? t('inspector.ep_unknown') : Math.round(info.supported_ratio * 100) + '%';
+          html += `<span class="badge" style="margin:2px;">${escHtml(ep)}: ${label}</span> `;
+        });
+      } else {
+        (r.compatible_eps||[]).forEach(ep => { html += `<span class="badge" style="margin:2px;">${escHtml(ep)}</span> `; });
+      }
       html += '</div></div>';
       // Op counts (top 10)
       html += `<div class="card-flat" style="padding:1rem;">
@@ -1481,9 +1596,19 @@ Tabs['profiler'] = {
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('profiler.title')}</h3>
         ${modelInput('prof-model')}
-        <div class="form-group" style="margin-top:0.75rem;">
-          <label class="form-label">${t('profiler.num_runs')}</label>
-          <input type="number" class="form-input input-normal" id="prof-runs" value="20" min="5" max="200" style="width:120px;">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-top:0.75rem;">
+          <div class="form-group"><label class="form-label" for="prof-provider">${t('profiler.provider')}</label>
+            <select class="form-input input-normal" id="prof-provider">
+              <option value="">${t('profiler.provider_auto')}</option>
+              <option value="CPUExecutionProvider">CPU</option>
+              <option value="CUDAExecutionProvider">CUDA</option>
+              <option value="TensorrtExecutionProvider">TensorRT</option>
+              <option value="DmlExecutionProvider">DirectML</option>
+            </select></div>
+          <div class="form-group"><label class="form-label" for="prof-warmup">${t('profiler.warmup')}</label>
+            <input type="number" class="form-input input-normal" id="prof-warmup" value="10" min="0" max="100"></div>
+          <div class="form-group"><label class="form-label" for="prof-runs">${t('profiler.num_runs')}</label>
+            <input type="number" class="form-input input-normal" id="prof-runs" value="50" min="5" max="500"></div>
         </div>
         <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.profiler.run()">${t('profiler.run')}</button>
       </div>
@@ -1499,7 +1624,12 @@ Tabs['profiler'] = {
     if (!path) { App.setStatus(t('select_model')); return; }
     App.setStatus(t('profiler.running'));
     try {
-      const r = await API.post('/api/profiler/run', {path, num_runs: parseInt(document.getElementById('prof-runs').value)||20});
+      const r = await API.post('/api/profiler/run', {
+        path,
+        num_runs: parseInt(document.getElementById('prof-runs').value)||50,
+        warmup: parseInt(document.getElementById('prof-warmup').value)||10,
+        provider: document.getElementById('prof-provider')?.value || '',
+      });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       const P = this;
       let html = '';
@@ -1509,6 +1639,7 @@ Tabs['profiler'] = {
       html += `<div class="card-flat" style="padding:1rem;">
         <div class="text-label" style="margin-bottom:0.5rem;">${t('profiler.latency')}</div>
         <table style="width:100%;font-size:12px;">
+          <tr><td class="text-secondary">${t('profiler.provider')}</td><td><strong>${escHtml(r.provider || '—')}</strong></td></tr>
           <tr><td class="text-secondary">Avg</td><td><strong>${r.avg_infer_ms} ms</strong></td></tr>
           <tr><td class="text-secondary">Min / Max</td><td>${r.min_infer_ms} / ${r.max_infer_ms} ms</td></tr>
           <tr><td class="text-secondary">P50 / P95 / P99</td><td>${r.p50_ms} / ${r.p95_ms} / ${r.p99_ms}</td></tr>
@@ -2059,20 +2190,39 @@ Tabs['diagnose'] = {
   }
 };
 
-/* ── VLM Tab (CLIP-based v1) ────────────────────────── */
+/* ── VLM Tab (pluggable backends) ───────────────────── */
 Tabs['vlm'] = {
   title: true,
   render() {
     return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('vlm.title')}</h3>
+        <div class="form-group">
+          <label class="form-label" for="vlm-backend">${t('vlm.backend')}</label>
+          <select class="form-input input-normal" id="vlm-backend" onchange="Tabs.vlm._onBackendChange()">
+            <option value="clip">CLIP</option>
+          </select>
+          <div class="text-secondary" id="vlm-backend-note" style="font-size:11px;margin-top:0.25rem;"></div>
+        </div>
         ${modelInput('vlm-model')}
-        <div class="form-group" style="margin-top:0.75rem;">
+        <div class="form-group" id="vlm-text-encoder-group" style="margin-top:0.75rem;">
           <label class="form-label" for="vlm-text-encoder">${t('vlm.text_encoder')}</label>
           <div style="display:flex;gap:0.5rem;">
             <input type="text" class="form-input input-normal" style="flex:1;" id="vlm-text-encoder" placeholder="${t('vlm.text_encoder_hint')}">
             <button class="btn btn-secondary btn-sm" onclick="pickFile('vlm-text-encoder', 'ONNX (*.onnx)')">${t('browse')}</button>
           </div>
+        </div>
+        <div class="form-group" id="vlm-model-id-group" style="margin-top:0.75rem;display:none;">
+          <label class="form-label" for="vlm-model-id">${t('vlm.model_id')}</label>
+          <input type="text" class="form-input input-normal" id="vlm-model-id" placeholder="${t('vlm.model_id_hint')}">
+        </div>
+        <div class="form-group" id="vlm-endpoint-group" style="margin-top:0.75rem;display:none;">
+          <label class="form-label" for="vlm-endpoint">${t('vlm.endpoint')}</label>
+          <input type="text" class="form-input input-normal" id="vlm-endpoint" placeholder="${t('vlm.endpoint_hint')}">
+        </div>
+        <div class="form-group" id="vlm-api-key-group" style="margin-top:0.75rem;display:none;">
+          <label class="form-label" for="vlm-api-key">${t('vlm.api_key')}</label>
+          <input type="password" class="form-input input-normal" id="vlm-api-key" placeholder="${t('vlm.api_key_hint')}" autocomplete="off">
         </div>
         ${imgDirInput('vlm-img')}
         <div class="form-group" style="margin-top:0.75rem;">
@@ -2091,6 +2241,14 @@ Tabs['vlm'] = {
           <label class="form-label" for="vlm-candidates">${t('vlm.candidates')}</label>
           <input type="text" class="form-input input-normal" id="vlm-candidates" placeholder="${t('vlm.candidates_hint')}" value="yes,no">
         </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1rem;margin-top:0.75rem;">
+          <div class="form-group"><label class="form-label" for="vlm-maxtok">${t('vlm.max_new_tokens')}</label>
+            <input type="number" class="form-input input-normal" id="vlm-maxtok" value="128" min="1" max="4096"></div>
+          <div class="form-group"><label class="form-label" for="vlm-temp">${t('vlm.temperature')}</label>
+            <input type="number" class="form-input input-normal" id="vlm-temp" value="0.0" min="0" max="2" step="0.1"></div>
+          <div class="form-group"><label class="form-label" for="vlm-max-images">${t('vlm.max_images')}</label>
+            <input type="number" class="form-input input-normal" id="vlm-max-images" value="50" min="1" max="500"></div>
+        </div>
         <div style="margin-top:1rem;display:flex;gap:0.5rem;">
           <button class="btn btn-primary" id="vlm-run" onclick="Tabs.vlm.run()">${t('run')}</button>
           <button class="btn btn-secondary" id="vlm-batch" onclick="Tabs.vlm.runBatch()">${t('vlm.batch')}</button>
@@ -2103,6 +2261,43 @@ Tabs['vlm'] = {
       </div>
     </div>`;
   },
+  async init() {
+    // Populate the backend dropdown from the server's capability probe. Unavailable
+    // backends stay selectable but are annotated with their missing deps.
+    const sel = document.getElementById('vlm-backend');
+    if (!sel || typeof API.vlmBackends !== 'function') { this._onBackendChange(); return; }
+    try {
+      const r = await API.vlmBackends();
+      const backends = (r && r.backends) || [];
+      if (backends.length) {
+        this._backends = backends;
+        sel.innerHTML = backends.map(b => {
+          const tag = b.available ? '' : ` (${t('vlm.unavailable')})`;
+          return `<option value="${escHtml(b.name)}">${escHtml(b.name)}${tag}</option>`;
+        }).join('');
+      }
+    } catch(e) { /* leave the default CLIP-only option */ }
+    this._onBackendChange();
+  },
+  _backends: [],
+  _onBackendChange() {
+    const backend = document.getElementById('vlm-backend')?.value || 'clip';
+    const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? '' : 'none'; };
+    // CLIP needs an ONNX text encoder; transformers/openai need a model id; openai also an endpoint+key.
+    show('vlm-text-encoder-group', backend === 'clip');
+    show('vlm-model-id-group', backend === 'transformers' || backend === 'openai');
+    show('vlm-endpoint-group', backend === 'openai');
+    show('vlm-api-key-group', backend === 'openai');
+    const note = document.getElementById('vlm-backend-note');
+    if (note) {
+      const info = (this._backends || []).find(b => b.name === backend);
+      if (info && !info.available) {
+        note.textContent = t('vlm.missing_deps') + ': ' + (info.missing_deps || []).join(', ');
+      } else {
+        note.textContent = '';
+      }
+    }
+  },
   _onTaskChange() {
     const task = document.getElementById('vlm-task').value;
     const g = document.getElementById('vlm-candidates-group');
@@ -2110,31 +2305,55 @@ Tabs['vlm'] = {
   },
   _readInputs() {
     return {
+      backend: document.getElementById('vlm-backend')?.value || 'clip',
       model: document.getElementById('vlm-model')?.value || G.model,
       textEncoder: document.getElementById('vlm-text-encoder')?.value || '',
+      modelId: document.getElementById('vlm-model-id')?.value || '',
+      endpoint: document.getElementById('vlm-endpoint')?.value || '',
+      apiKey: document.getElementById('vlm-api-key')?.value || '',
       imgDir: document.getElementById('vlm-img')?.value || G.imgDir,
       task: document.getElementById('vlm-task')?.value || 'caption',
       prompt: document.getElementById('vlm-prompt')?.value || '',
       candidates: document.getElementById('vlm-candidates')?.value || '',
+      maxNewTokens: +(document.getElementById('vlm-maxtok')?.value || 128),
+      temperature: +(document.getElementById('vlm-temp')?.value || 0),
+      maxImages: +(document.getElementById('vlm-max-images')?.value || 50),
     };
   },
   _validate(inputs) {
-    const r = Form.validate([
-      { el: 'vlm-model',         required: true, msg: t('vlm.err_model') },
-      { el: 'vlm-text-encoder',  required: true, msg: t('vlm.err_text_encoder') },
-      { el: 'vlm-img',           required: true, msg: t('vlm.err_imgdir') },
-    ]);
-    return r.ok;
+    // Required fields are backend-specific (CONTRACT): clip→text encoder ONNX,
+    // transformers→model id, openai→model id + endpoint. Model path/img dir always.
+    const checks = [
+      { el: 'vlm-img', required: true, msg: t('vlm.err_imgdir') },
+    ];
+    if (inputs.backend === 'clip') {
+      checks.unshift({ el: 'vlm-model', required: true, msg: t('vlm.err_model') });
+      checks.push({ el: 'vlm-text-encoder', required: true, msg: t('vlm.err_text_encoder') });
+    } else if (inputs.backend === 'transformers') {
+      checks.push({ el: 'vlm-model-id', required: true, msg: t('vlm.err_model_id') });
+    } else if (inputs.backend === 'openai') {
+      checks.push({ el: 'vlm-model-id', required: true, msg: t('vlm.err_model_id') });
+      checks.push({ el: 'vlm-endpoint', required: true, msg: t('vlm.err_endpoint') });
+    }
+    return Form.validate(checks).ok;
   },
   _payload(inputs, imagePath) {
+    // Maps to InferRequest's VLM branch (model_routes.py). api_key flows through but
+    // is never echoed back / logged by the server (CONTRACT).
     return {
       model_path: inputs.model,
       image_path: imagePath,
-      vlm_prompt: inputs.prompt,
-      vlm_task: inputs.task,
-      vlm_text_encoder: inputs.textEncoder,
-      vlm_candidates: inputs.candidates,
       model_type: 'vlm',
+      backend: inputs.backend,
+      vlm_task: inputs.task,
+      prompt: inputs.prompt,
+      candidates: inputs.candidates,
+      text_encoder: inputs.textEncoder,
+      model_id: inputs.modelId,
+      endpoint_url: inputs.endpoint,
+      api_key: inputs.apiKey,
+      max_new_tokens: inputs.maxNewTokens,
+      temperature: inputs.temperature,
     };
   },
   async run() {
@@ -2149,7 +2368,7 @@ Tabs['vlm'] = {
           return;
         }
         const imgPath = files.files[0];
-        const r = await API.post('/api/model/infer', this._payload(inputs, imgPath));
+        const r = await API.post('/api/infer/image', this._payload(inputs, imgPath));
         if (r.error) { App.setStatus('Error: ' + r.error); return; }
         const resultDiv = document.getElementById('vlm-result');
         const outputDiv = document.getElementById('vlm-output');
@@ -2161,10 +2380,10 @@ Tabs['vlm'] = {
           </div>
           <div style="flex:1;min-width:200px;">
             <div class="form-label" style="margin-bottom:0.5rem;">${promptLabel}</div>
-            <div class="text-body" style="margin-bottom:1rem;padding:0.5rem;background:var(--background-tint-02);border-radius:6px;">${inputs.prompt || '(none)'}</div>
+            <div class="text-body" style="margin-bottom:1rem;padding:0.5rem;background:var(--background-tint-02);border-radius:6px;">${escHtml(inputs.prompt) || '(none)'}</div>
             <div class="form-label" style="margin-bottom:0.5rem;">${t('vlm.result')}</div>
-            <div class="text-body" style="padding:0.5rem;background:var(--background-tint-02);border-radius:6px;">${r.vlm_result || t('vlm.no_response')}</div>
-            <div class="text-secondary" style="margin-top:0.5rem;">Task: ${r.vlm_task || inputs.task} · Inference: ${r.infer_ms || 0}ms</div>
+            <div class="text-body" style="padding:0.5rem;background:var(--background-tint-02);border-radius:6px;">${r.vlm_result ? escHtml(r.vlm_result) : t('vlm.no_response')}</div>
+            <div class="text-secondary" style="margin-top:0.5rem;">Task: ${escHtml(r.vlm_task || inputs.task)} · Inference: ${r.infer_ms || 0}ms</div>
           </div>`;
         App.setStatus(t('vlm.complete'));
       } finally {
@@ -2182,12 +2401,18 @@ Tabs['vlm'] = {
         // Kick off the async batch on the server; results stream via /api/vlm/status.
         const start = await API.vlmBatch({
           model_path: inputs.model,
+          backend: inputs.backend,
           text_encoder: inputs.textEncoder,
+          model_id: inputs.modelId,
+          endpoint_url: inputs.endpoint,
+          api_key: inputs.apiKey,
           img_dir: inputs.imgDir,
           prompt: inputs.prompt,
           task: inputs.task,
           candidates: inputs.candidates,
-          max_images: 50,
+          max_new_tokens: inputs.maxNewTokens,
+          temperature: inputs.temperature,
+          max_images: inputs.maxImages,
         });
         if (start.error) {
           App.toast('error', start.error, start.code || '');
@@ -2220,8 +2445,8 @@ Tabs['vlm'] = {
       const results = s.results || [];
       const cards = results.map(r => `
         <div style="width:220px;border:1px solid var(--border-01);border-radius:8px;overflow:hidden;padding:0.5rem;">
-          <div class="text-secondary truncate">${r.file}</div>
-          <div class="text-body" style="font-size:12px;margin-top:0.25rem;">${(r.result || '').substring(0, 100)}</div>
+          <div class="text-secondary truncate">${escHtml(r.file)}</div>
+          <div class="text-body" style="font-size:12px;margin-top:0.25rem;">${escHtml((r.result || '').substring(0, 100))}</div>
           <div class="text-secondary" style="font-size:10px;margin-top:0.25rem;">${r.ms || 0}ms</div>
         </div>`).join('');
       const progress = total > 0

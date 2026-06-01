@@ -17,10 +17,6 @@ Tabs.viewer = {
               <label class="form-label" style="font-size:10px;margin:0;white-space:nowrap;">${t('settings.model_type')}</label>
               <select class="form-input input-normal" id="v-model-type" style="flex:1;height:30px;font-size:10px;min-width:0;overflow:hidden;text-overflow:ellipsis;padding:0 6px;" onchange="Tabs.viewer._onModelTypeChange()"></select>
             </div>
-            <div style="display:flex;gap:0.25rem;align-items:center;margin-bottom:0.4rem;">
-              <label class="form-label" style="font-size:10px;margin:0;white-space:nowrap;">${t('viewer.batch')}</label>
-              <input type="number" class="form-input input-normal" value="1" min="1" max="16" id="v-batch-size" style="flex:1;height:26px;font-size:10px;" onchange="Tabs.viewer._onBatchChange()">
-            </div>
             <div style="margin-bottom:0;">
               <div style="display:flex;align-items:center;gap:0.25rem;">
                 <label class="form-label" style="font-size:10px;margin:0;white-space:nowrap;">${t('settings.conf')}</label>
@@ -174,7 +170,6 @@ Tabs.viewer = {
           }
           mt.value = c.model_type || 'yolo';
         }
-        document.getElementById('v-batch-size').value = c.batch_size || 1;
         const cs = document.getElementById('v-conf-slider');
         cs.value = Math.round((c.conf_threshold || 0.25) * 100);
         document.getElementById('v-conf-value').textContent = (c.conf_threshold || 0.25).toFixed(2);
@@ -274,9 +269,6 @@ Tabs.viewer = {
       const isDet = !v.startsWith('cls_') && !v.startsWith('seg_') && !v.startsWith('clip_') && !v.startsWith('emb_') && !v.startsWith('vlm_') && !v.startsWith('pose_') && !v.startsWith('instseg_');
       trackerRow.style.display = isDet ? 'flex' : 'none';
     }
-  },
-  async _onBatchChange() {
-    await API.post('/api/config', { batch_size: +document.getElementById('v-batch-size').value });
   },
   async _onConfChange() {
     const v = this._getConf();
@@ -491,7 +483,13 @@ Tabs.viewer = {
       const seek = document.getElementById('v-seek');
       if (seek && !seek.matches(':active')) seek.value = s.frame_idx;
       if (s.playing && !s.paused) setTimeout(() => this._pollStatus(), 300);
-      else if (!s.playing) { App.setStatus(t('viewer.playback_done')); this._resetAll(); }
+      else if (!s.playing) {
+        // Distinguish a stream error (backend set sess.error) from normal completion —
+        // both end with playing=false, so error would otherwise look like a clean finish.
+        if (s.error) App.setStatus(t('viewer.stream_error', { error: s.error }), s.error);
+        else App.setStatus(t('viewer.playback_done'));
+        this._resetAll();
+      }
     } catch(e) {}
   },
   _resetAll() {
@@ -1143,6 +1141,14 @@ Tabs.evaluation = {
                 <label class="form-label">${t('common.confidence')}</label>
                 <input type="number" class="form-input input-normal" value="0.25" min="0.01" max="1.0" step="0.05" id="eval-conf" style="width:100px;">
               </div>
+              <div class="form-group">
+                <label class="form-label">${t('eval.cm_iou')}</label>
+                <input type="number" class="form-input input-normal" value="0.5" min="0.05" max="0.95" step="0.05" id="eval-cm-iou" style="width:100px;">
+              </div>
+            </div>
+            <div class="form-group" id="eval-classmap-group" style="margin-top:0.75rem;">
+              <label class="form-label">${t('eval.classmap')}</label>
+              <textarea class="form-input" id="eval-classmap" rows="3" style="font-size:12px;" placeholder="0: person&#10;1: car&#10;2: dog" title="${t('eval.classmap_help')}"></textarea>
             </div>
           </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:0.75rem;">
@@ -1198,7 +1204,7 @@ Tabs.evaluation = {
     const segOpts = document.getElementById('eval-seg-opts');
     const clipOpts = document.getElementById('eval-clip-opts');
     const embedOpts = document.getElementById('eval-embed-opts');
-    const cmGroup = document.getElementById('eval-classmap-group');
+    // eval-classmap-group lives inside eval-det-opts, so it toggles with detection automatically.
     if (detOpts) detOpts.style.display = task === 'detection' ? '' : 'none';
     if (segOpts) segOpts.style.display = task === 'segmentation' ? '' : 'none';
     if (clipOpts) clipOpts.style.display = task === 'clip' ? '' : 'none';
@@ -1294,6 +1300,7 @@ Tabs.evaluation = {
 
       const r = await API.post('/api/evaluation/run-async', {
         models, img_dir: imgDir, label_dir: lblDir, conf,
+        cm_iou: parseFloat(document.getElementById('eval-cm-iou')?.value || '0.5'),
         per_model_mappings: result.mappings,
         mapped_only: result.mapped_only,
         task: document.getElementById('eval-task')?.value || 'detection',
@@ -1591,9 +1598,17 @@ Tabs.evaluation = {
     if (!c) return;
     const detResults = results.filter(r => r.confusion_matrix && r.confusion_classes && r.confusion_classes.length > 0);
     if (!detResults.length) { c.innerHTML = ''; return; }
+    // For very wide matrices a full (n+1)² table explodes the DOM, so collapse to the
+    // most-active classes plus an aggregated 'other' bucket.
+    const TOP_N = 50;
     const sections = detResults.map(r => {
-      const classes = r.confusion_classes;
-      const mat = r.confusion_matrix;
+      let classes = r.confusion_classes;
+      let mat = r.confusion_matrix;
+      let collapsedNote = '';
+      if (classes.length > TOP_N) {
+        ({ classes, mat } = this._collapseConfusion(classes, mat, TOP_N));
+        collapsedNote = ' ' + t('results_truncated', { shown: TOP_N, total: r.confusion_classes.length });
+      }
       const n = classes.length;
       const labels = [...classes.map(String), 'BG'];
       const maxVal = Math.max(1, ...mat.flat());
@@ -1610,16 +1625,43 @@ Tabs.evaluation = {
       return `<div class="card" style="padding:1.5rem;margin-top:1rem;overflow-x:auto;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">Confusion Matrix — ${r.name}</h3>
         <table style="border-collapse:collapse;"><thead><tr><th style="padding:4px 6px;"></th>${headerCells}</tr></thead><tbody>${rows}</tbody></table>
-        <div class="text-secondary" style="margin-top:0.5rem;font-size:11px;">Rows = GT class, Cols = predicted class. BG = background (FN/FP).</div>
+        <div class="text-secondary" style="margin-top:0.5rem;font-size:11px;">Rows = GT class, Cols = predicted class. BG = background (FN/FP).${collapsedNote}</div>
       </div>`;
     }).join('');
     c.innerHTML = sections;
   },
-  stop() {
+  // Collapse a (n+1)×(n+1) confusion matrix (last index = BG) to the topN most-active
+  // classes plus an aggregated 'other' bucket, preserving BG as the final row/col.
+  _collapseConfusion(classes, mat, topN) {
+    const n = classes.length;
+    const activity = classes.map((_, i) => {
+      let sum = 0;
+      for (let j = 0; j <= n; j++) sum += (mat[i]?.[j] || 0) + (mat[j]?.[i] || 0);
+      return { idx: i, sum };
+    });
+    activity.sort((a, b) => b.sum - a.sum);
+    const keep = activity.slice(0, topN).map(a => a.idx).sort((a, b) => a - b);
+    const keepSet = new Set(keep);
+    // New axis order: kept class indices, then 'other' (-1), then BG (n).
+    const axis = [...keep, -1, n];
+    const remap = (orig) => orig === n ? axis.length - 1 : (keepSet.has(orig) ? keep.indexOf(orig) : keep.length);
+    const size = axis.length;
+    const out = Array.from({ length: size }, () => new Array(size).fill(0));
+    for (let i = 0; i <= n; i++) {
+      for (let j = 0; j <= n; j++) {
+        out[remap(i)][remap(j)] += (mat[i]?.[j] || 0);
+      }
+    }
+    return { classes: [...keep.map(i => classes[i]), 'other'], mat: out };
+  },
+  async stop() {
     this._polling = false;
+    // Stopping client polling alone leaves the backend worker running; tell it to halt.
+    try { await API.get('/api/eval/stop'); } catch(e) {}
     document.getElementById('eval-run-btn').disabled = false;
     document.getElementById('eval-run-btn').textContent = t('eval.run');
     document.getElementById('eval-stop-btn').disabled = true;
+    App.setStatus(t('stopped'));
   },
   showDetail(idx) {
     const r = this._lastResults[idx];
@@ -1737,10 +1779,11 @@ Tabs.explorer = {
             ${imgDirInput('exp-img')}
             ${lblDirInput('exp-lbl')}
             <div class="form-group" style="margin:0;">
-              <label class="form-label">Limit</label>
+              <label class="form-label">${I18n.getLang()==='ko'?'스캔 한도':'Scan limit'}</label>
               <input type="number" class="form-input input-normal" id="exp-limit" value="5000" min="1" max="50000" style="width:90px;">
             </div>
             <button class="btn btn-primary" style="height:36px;" onclick="Tabs.explorer.load()">${t('explorer.load')}</button>
+            <button class="btn btn-danger btn-sm" id="exp-stop-btn" style="height:36px;display:none;" onclick="Tabs.explorer.stop()">${t('stop')}</button>
           </div>
           <div id="exp-pbar-wrap" style="display:none;margin-top:0.75rem;">
             <div class="progress-track" style="height:20px;position:relative;">
@@ -1800,12 +1843,19 @@ Tabs.explorer = {
     App.setStatus(t('viewer.loading'));
     const pbarWrap = document.getElementById('exp-pbar-wrap');
     if (pbarWrap) pbarWrap.style.display = 'block';
+    const stopBtn = document.getElementById('exp-stop-btn');
+    if (stopBtn) stopBtn.style.display = '';
     try {
       const limit = Math.min(parseInt(document.getElementById('exp-limit')?.value || '5000', 10), 50000) || 5000;
       const r = await API.post('/api/data/explorer', { img_dir, label_dir, limit });
-      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      if (r.error) { App.setStatus('Error: ' + r.error); if (stopBtn) stopBtn.style.display = 'none'; return; }
       this._pollLoad();
-    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); if (stopBtn) stopBtn.style.display = 'none'; }
+  },
+  async stop() {
+    // Cooperative cancel — the scan loop re-checks explorer_state['running'] each image.
+    try { await API.post('/api/force-stop/explorer', {}); } catch(e) {}
+    App.setStatus(t('stopped'));
   },
   async _pollLoad() {
     try {
@@ -1821,11 +1871,13 @@ Tabs.explorer = {
       }
       if (pbar) pbar.style.width = '100%';
       if (pbarText) pbarText.textContent = '100%';
+      const stopBtn = document.getElementById('exp-stop-btn');
+      if (stopBtn) stopBtn.style.display = 'none';
       if (s.files) {
         this._data = s;
         this._buildClassFilter(s.class_counts || {});
         this._renderView();
-        App.setStatus(`Loaded ${s.total} images`);
+        App.setStatus(s.msg && s.msg !== 'Complete' ? s.msg : `Loaded ${s.total} images`);
       } else {
         App.setStatus(s.msg || 'Error');
       }
@@ -1856,10 +1908,12 @@ Tabs.explorer = {
     return selected;
   },
   _applyFilter() {
+    this._page = 0;
     this._renderView();
   },
   _onViewChange() {
     this._viewMode = document.getElementById('exp-view-mode')?.value || 'list';
+    this._page = 0;
     this._renderView();
   },
   _filterFiles() {
@@ -1888,16 +1942,17 @@ Tabs.explorer = {
     // Update stats
     const stats = document.getElementById('exp-stats');
     if (stats) {
-      stats.innerHTML = `Total: ${this._data.total}<br>Shown: ${filtered.length}<br>Classes: ${Object.keys(this._data.class_counts || {}).length}`;
+      let html = `Total: ${this._data.total}<br>Shown: ${filtered.length}<br>Classes: ${Object.keys(this._data.class_counts || {}).length}`;
+      // Surface skipped/corrupt counts so silent label-parse failures are visible (DATA-13).
+      const bad = this._data.bad_lines || 0, corrupt = this._data.corrupt_files || 0;
+      if (bad || corrupt) html += `<br><span style="color:var(--color-warning,#e6a700);">Bad lines: ${bad} · Unreadable: ${corrupt}</span>`;
+      stats.innerHTML = html;
     }
     if (mode === 'list') {
-      gallery.style.display = 'grid';
-      gallery.innerHTML = filtered.map((f, i) =>
-        `<div class="card-flat" style="padding:0.5rem;font-size:11px;text-align:center;cursor:pointer;" ondblclick="Tabs.explorer._preview(${i})">
-          <div style="font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${f.name}">${f.name}</div>
-          <div class="text-secondary">${f.boxes} boxes</div>
-        </div>`).join('') || '<div class="text-secondary" style="grid-column:1/-1;text-align:center;padding:2rem;">' + t('common.no_results') + '</div>';
+      // _filteredFiles is the full filtered list (stable indices for _preview); the gallery
+      // renders only the current page so we never inject up to 50k DOM nodes at once (DATA-12).
       this._filteredFiles = filtered;
+      this._renderGalleryPage();
     } else if (mode === 'chart_box' || mode === 'chart_image') {
       gallery.style.display = 'block';
       const counts = mode === 'chart_box' ? (this._data.class_counts || {}) : (this._data.img_class_counts || {});
@@ -1995,6 +2050,44 @@ Tabs.explorer = {
       }).join('')}</div>`;
   },
   _filteredFiles: [],
+  _page: 0,
+  _pageSize: 500,
+  _renderGalleryPage() {
+    const gallery = document.getElementById('exp-gallery');
+    if (!gallery) return;
+    gallery.style.display = 'grid';
+    const files = this._filteredFiles;
+    if (!files.length) {
+      gallery.innerHTML = '<div class="text-secondary" style="grid-column:1/-1;text-align:center;padding:2rem;">' + t('common.no_results') + '</div>';
+      return;
+    }
+    const pageCount = Math.ceil(files.length / this._pageSize);
+    if (this._page >= pageCount) this._page = 0;
+    const start = this._page * this._pageSize;
+    const slice = files.slice(start, start + this._pageSize);
+    // ondblclick uses the absolute index so _preview/_filteredFiles stays correct across pages.
+    const cards = slice.map((f, i) => {
+      const abs = start + i;
+      return `<div class="card-flat" style="padding:0.5rem;font-size:11px;text-align:center;cursor:pointer;" ondblclick="Tabs.explorer._preview(${abs})">
+          <div style="font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${f.name}">${f.name}</div>
+          <div class="text-secondary">${f.boxes} boxes</div>
+        </div>`;
+    }).join('');
+    let pager = '';
+    if (pageCount > 1) {
+      pager = `<div style="grid-column:1/-1;display:flex;align-items:center;justify-content:center;gap:0.5rem;padding:0.75rem 0;">
+        <button class="btn btn-secondary btn-sm" ${this._page <= 0 ? 'disabled' : ''} onclick="Tabs.explorer._changePage(-1)">◀</button>
+        <span class="text-secondary" style="font-size:12px;">${this._page + 1} / ${pageCount}</span>
+        <button class="btn btn-secondary btn-sm" ${this._page >= pageCount - 1 ? 'disabled' : ''} onclick="Tabs.explorer._changePage(1)">▶</button>
+      </div>`;
+    }
+    gallery.innerHTML = cards + pager;
+  },
+  _changePage(delta) {
+    this._page += delta;
+    if (this._page < 0) this._page = 0;
+    this._renderGalleryPage();
+  },
   _exportStats() {
     window.open('/api/data/explorer/export-stats', '_blank');
   },
@@ -2048,9 +2141,17 @@ Tabs.splitter = {
             <span id="split-pbar-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span>
           </div>
         </div>
-        <button class="btn btn-primary" onclick="Tabs.splitter.run()">${t('splitter.run')}</button>
+        <div style="display:flex;gap:0.5rem;">
+          <button class="btn btn-primary" onclick="Tabs.splitter.run()">${t('splitter.run')}</button>
+          <button class="btn btn-danger btn-sm" id="split-stop-btn" style="display:none;" onclick="Tabs.splitter.stop()">${t('stop')}</button>
+        </div>
         <div id="split-result" class="text-secondary"></div>
       </div>`;
+  },
+  async stop() {
+    // Cooperative cancel — the copy loop re-checks splitter_state['running'] each file.
+    try { await API.post('/api/force-stop/splitter', {}); } catch(e) {}
+    App.setStatus(t('stopped'));
   },
   async init() {
     // Strategy description update
@@ -2073,12 +2174,14 @@ Tabs.splitter = {
     const strategy = document.getElementById('split-strategy')?.value || 'random';
     const pbarWrap = document.getElementById('split-pbar-wrap');
     if (pbarWrap) pbarWrap.style.display = 'block';
+    const stopBtn = document.getElementById('split-stop-btn');
+    if (stopBtn) stopBtn.style.display = '';
     App.setStatus('Splitting...');
     try {
       const r = await API.post('/api/data/splitter', { img_dir, label_dir, output_dir, train, val, test, strategy });
-      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      if (r.error) { App.setStatus('Error: ' + r.error); if (stopBtn) stopBtn.style.display = 'none'; return; }
       this._poll();
-    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); if (stopBtn) stopBtn.style.display = 'none'; }
   },
   async _poll() {
     try {
@@ -2094,10 +2197,17 @@ Tabs.splitter = {
       }
       if (pbar) pbar.style.width = '100%';
       if (pbarText) pbarText.textContent = '100%';
+      const stopBtn = document.getElementById('split-stop-btn');
+      if (stopBtn) stopBtn.style.display = 'none';
       if (s.results) {
         const res = document.getElementById('split-result');
-        if (res) res.innerHTML = `Done — Train: ${s.results.train||0}, Val: ${s.results.val||0}, Test: ${s.results.test||0}`;
-        App.setStatus(`Split complete — Train: ${s.results.train||0}, Val: ${s.results.val||0}, Test: ${s.results.test||0}`);
+        const r = s.results;
+        const counts = `Train: ${r.train||0}, Val: ${r.val||0}, Test: ${r.test||0}`;
+        // Echo the normalized ratios so the user sees what the backend actually used (DATA-10).
+        let ratioNote = '';
+        if (r.ratios) ratioNote = ` (ratios — train ${r.ratios.train}, val ${r.ratios.val}, test ${r.ratios.test})`;
+        if (res) res.innerHTML = `Done — ${counts}${ratioNote}`;
+        App.setStatus(`Split complete — ${counts}`);
       } else {
         App.setStatus(s.msg || 'Complete');
       }

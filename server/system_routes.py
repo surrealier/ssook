@@ -55,35 +55,47 @@ async def system_hw():
             info.update(gpu_name="N/A", gpu_util=0, gpu_mem_used=0, gpu_mem_total=0, gpu_temp=0)
     else:
         info.update(gpu_name="N/A", gpu_util=0, gpu_mem_used=0, gpu_mem_total=0, gpu_temp=0)
-    # 메모리 자동 정리: RSS가 시스템 RAM의 50% 초과 시 캐시 정리
-    import psutil as _ps
-    total_ram = _ps.virtual_memory().total
-    if proc.memory_info().rss > total_ram * 0.5:
-        _auto_cleanup_memory()
+    # 메모리 자동 정리: RSS가 시스템 RAM의 50% 초과 시 캐시 정리.
+    # cleanup 내부 버그가 HW 폴링 엔드포인트를 절대 500 못 시키도록 방어.
+    try:
+        total_ram = psutil.virtual_memory().total
+        if proc.memory_info().rss > total_ram * 0.5:
+            _auto_cleanup_memory()
+    except Exception:
+        pass
     return info
 
 
 _MEM_CLEANUP_INTERVAL = 0  # 마지막 정리 시각
 
 def _auto_cleanup_memory():
-    """메모리 압박 시 자동 캐시 정리"""
+    """메모리 압박 시 자동 캐시 정리.
+
+    참조 심볼은 모두 다른 모듈 소유라 함수 내부에서 지연 import한다
+    (모듈 로드 시 순환 import 회피 + 가장 필요한 시점에만 비용 지불).
+    """
     global _MEM_CLEANUP_INTERVAL
     now = time.time()
     if now - _MEM_CLEANUP_INTERVAL < 30:  # 30초 내 중복 정리 방지
         return
     _MEM_CLEANUP_INTERVAL = now
+
+    from server import utils
+    from server.state import compare_state, embedding_state
+    from server.viewer_routes import _cleanup_stale_sessions
+
     # stale 비디오 세션 정리
     _cleanup_stale_sessions()
-    # compare 결과 정리 (실행 중이 아닌 경우)
-    if not _compare_state.get("running"):
-        _compare_state["results"] = []
+    # compare 결과 정리 (실행 중이 아닌 경우) — TaskState 락 경유 read/write
+    if not compare_state.snapshot().get("running"):
+        compare_state["results"] = []
     # embedding 이미지 정리
-    if not _embedding_state.get("running"):
-        _embedding_state["image"] = None
-    # 글로벌 팔레트 캐시 축소
-    global _palette_cache
-    _palette_cache = _palette_cache[:20] if len(_palette_cache) > 20 else _palette_cache
-    import gc
+    if not embedding_state.snapshot().get("running"):
+        embedding_state["image"] = None
+    # 글로벌 팔레트 캐시 축소 (utils 소유 헬퍼; 미배포 시 안전하게 skip)
+    trim = getattr(utils, "trim_palette_cache", None)
+    if trim is not None:
+        trim(20)
     gc.collect()
     print("[Memory] Auto cleanup triggered")
 
@@ -150,17 +162,39 @@ class FileSelectRequest(BaseModel):
     filters: Optional[str] = None
 
 
+def _ps_single_quote(value: str) -> str:
+    """Escape a string for a PowerShell single-quoted literal.
+
+    The dialog script interpolates user-controlled values (title, filter
+    string from req.filters) into a PS source string passed to
+    `powershell -Command`. Inside a single-quoted PS literal the ONLY
+    metacharacter is `'`, which is escaped by doubling it. Without this a
+    crafted filter such as `'; <cmd>; '` would break out of the literal
+    and execute arbitrary commands.
+    """
+    return str(value).replace("'", "''")
+
+
+def _applescript_double_quote(value: str) -> str:
+    """Escape a string for an AppleScript double-quoted literal.
+
+    Backslash first (so we don't double-escape), then the double quote.
+    """
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _native_file_dialog(title="Select File", filters=None, multiple=False, directory=False):
     """OS 네이티브 파일 다이얼로그. Windows/macOS/Linux 지원."""
     import subprocess, sys
     system = platform.system()
 
     if system == "Windows":
+        title_esc = _ps_single_quote(title)
         if directory:
             script = (
                 "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null;"
                 "$d = New-Object System.Windows.Forms.FolderBrowserDialog;"
-                f"$d.Description = '{title}';"
+                f"$d.Description = '{title_esc}';"
                 "$d.ShowNewFolderButton = $true;"
                 "if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath } else { '' }"
             )
@@ -171,11 +205,12 @@ def _native_file_dialog(title="Select File", filters=None, multiple=False, direc
                 for f in _parse_filters(filters):
                     parts.append(f"{f[0]}|{f[1].replace(' ', ';')}")
                 filter_str = "|".join(parts) + "|All files (*.*)|*.*"
+            filter_esc = _ps_single_quote(filter_str)
             script = (
                 "Add-Type -AssemblyName System.Windows.Forms;"
                 "$d = New-Object System.Windows.Forms.OpenFileDialog;"
-                f"$d.Title = '{title}';"
-                f"$d.Filter = '{filter_str}';"
+                f"$d.Title = '{title_esc}';"
+                f"$d.Filter = '{filter_esc}';"
                 f"$d.Multiselect = {'$true' if multiple else '$false'};"
                 "if ($d.ShowDialog() -eq 'OK') {"
                 + ("  $d.FileNames -join '|'" if multiple else "  $d.FileName") +
@@ -191,16 +226,17 @@ def _native_file_dialog(title="Select File", filters=None, multiple=False, direc
         return path
 
     elif system == "Darwin":
+        title_esc = _applescript_double_quote(title)
         if directory:
             script = 'tell application "System Events" to activate\n'
-            script += f'set f to choose folder with prompt "{title}"\nreturn POSIX path of f'
+            script += f'set f to choose folder with prompt "{title_esc}"\nreturn POSIX path of f'
         elif multiple:
             script = 'tell application "System Events" to activate\n'
-            script += f'set f to choose file with prompt "{title}" with multiple selections allowed\n'
+            script += f'set f to choose file with prompt "{title_esc}" with multiple selections allowed\n'
             script += 'set out to ""\nrepeat with p in f\nset out to out & POSIX path of p & "\\n"\nend repeat\nreturn out'
         else:
             script = 'tell application "System Events" to activate\n'
-            script += f'set f to choose file with prompt "{title}"\nreturn POSIX path of f'
+            script += f'set f to choose file with prompt "{title_esc}"\nreturn POSIX path of f'
         result = subprocess.run(
             ["osascript", "-e", script],
             capture_output=True, text=True, timeout=120

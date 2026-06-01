@@ -4,7 +4,62 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import pytest
-from core.evaluation import evaluate_segmentation, evaluate_classification, evaluate_embedder
+from core.evaluation import (
+    evaluate_segmentation, evaluate_classification, evaluate_embedder,
+    evaluate_dataset, evaluate_map50_95, _match_greedy,
+)
+
+
+class TestMatchGreedy:
+    def test_picks_best_unmatched(self):
+        iou = np.array([0.9, 0.6])
+        mask = np.zeros(2, dtype=bool)
+        assert _match_greedy(iou, mask, 0.5) == 0
+        assert mask[0] and not mask[1]
+        # second prediction with same row must now claim col 1, not re-book col 0
+        assert _match_greedy(iou, mask, 0.5) == 1
+        assert mask[1]
+
+    def test_below_threshold_returns_minus_one(self):
+        iou = np.array([0.4])
+        mask = np.zeros(1, dtype=bool)
+        assert _match_greedy(iou, mask, 0.5) == -1
+        assert not mask[0]
+
+    def test_empty_row(self):
+        assert _match_greedy(np.empty(0), np.empty(0, dtype=bool), 0.5) == -1
+
+
+class TestEvaluateDetection:
+    def test_clustered_two_box_perfect(self):
+        # EVAL-01: two GT, two perfectly matched preds -> map both 1.0 (no double-booking)
+        gt = {"img": [(0, 0.2, 0.2, 0.1, 0.1), (0, 0.8, 0.8, 0.1, 0.1)]}
+        pred = {"img": [(0, 0.2, 0.2, 0.1, 0.1, 0.9), (0, 0.8, 0.8, 0.1, 0.1, 0.8)]}
+        r50 = evaluate_dataset(gt, pred, 0.5)
+        assert r50["__overall__"]["ap"] == pytest.approx(1.0, abs=1e-6)
+        assert r50["__overall__"]["recall"] == pytest.approx(1.0, abs=1e-6)
+        assert evaluate_map50_95(gt, pred) == pytest.approx(1.0, abs=1e-6)
+
+    def test_single_perfect_match(self):
+        gt = {"i": [(0, 0.5, 0.5, 0.2, 0.2)]}
+        pred = {"i": [(0, 0.5, 0.5, 0.2, 0.2, 0.9)]}
+        assert evaluate_map50_95(gt, pred) == pytest.approx(1.0, abs=1e-6)
+
+    def test_map5095_le_map50_invariant(self):
+        gt = {"a": [(0, 0.5, 0.5, 0.2, 0.2), (0, 0.1, 0.1, 0.1, 0.1)]}
+        pred = {"a": [(0, 0.52, 0.52, 0.2, 0.2, 0.9), (0, 0.3, 0.3, 0.15, 0.15, 0.5)]}
+        m50 = evaluate_dataset(gt, pred, 0.5)["__overall__"]["ap"]
+        m5095 = evaluate_map50_95(gt, pred)
+        assert m5095 <= m50 + 1e-9
+
+    def test_no_double_booking_two_preds_one_gt(self):
+        # One GT, two overlapping preds -> exactly one TP (the higher score), one FP
+        gt = {"i": [(0, 0.5, 0.5, 0.2, 0.2)]}
+        pred = {"i": [(0, 0.5, 0.5, 0.2, 0.2, 0.9), (0, 0.51, 0.51, 0.2, 0.2, 0.4)]}
+        r = evaluate_dataset(gt, pred, 0.5)["__overall__"]
+        assert r["recall"] == pytest.approx(1.0, abs=1e-6)
+        # precision = 1 TP / 2 preds = 0.5
+        assert r["precision"] == pytest.approx(0.5, abs=1e-3)
 
 
 class TestEvaluateSegmentation:

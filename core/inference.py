@@ -549,12 +549,18 @@ def postprocess_custom(outputs: list, cmt, conf: float,
     coord_keys = {"x1", "y1", "x2", "y2", "x_center", "y_center", "width", "height"}
     coord_idx = {}
     conf_indices = []
+    # conf_class 역할의 숫자 suffix가 실제 class id. argmax는 선택된 열 중 위치(0..n-1)만
+    # 반환하므로, sparse/비연속 슬롯(conf_class0, conf_class5)에서는 위치를 실제 class id로
+    # 되돌릴 매핑이 필요. suffix가 없는 conf_class는 수집 순서를 fallback class id로 사용.
+    class_index_map = []
     single_conf_idx = -1
     class_id_idx = -1
     for i, role in enumerate(attr_roles):
         if role in coord_keys:
             coord_idx[role] = i
         elif role.startswith("conf_class"):
+            suffix = role[len("conf_class"):]
+            class_index_map.append(int(suffix) if suffix.isdigit() else len(conf_indices))
             conf_indices.append(i)
         elif role == "objectness":
             coord_idx["objectness"] = i
@@ -579,7 +585,9 @@ def postprocess_custom(outputs: list, cmt, conf: float,
         if "objectness" in coord_idx:
             class_scores = class_scores * data[:, coord_idx["objectness"]:coord_idx["objectness"]+1]
         max_scores = class_scores.max(axis=1)
-        class_ids = class_scores.argmax(axis=1).astype(np.int32)
+        # argmax는 선택 열 내 위치를 주므로 class_index_map으로 실제 class id로 변환
+        class_index_arr = np.asarray(class_index_map, dtype=np.int32)
+        class_ids = class_index_arr[class_scores.argmax(axis=1)]
         mask = max_scores > conf
         if not mask.any():
             return DetectionResult.empty()

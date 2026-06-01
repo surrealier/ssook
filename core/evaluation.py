@@ -34,6 +34,29 @@ def _yolo_to_xyxy(cx, cy, w, h):
     return (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
 
 
+def _match_greedy(iou_row: np.ndarray, matched_mask: np.ndarray, thr: float) -> int:
+    """Greedy 1:1 매칭: 이미 매칭된 GT 열을 제외한 뒤 best IoU GT를 선택.
+
+    Both evaluate_dataset and evaluate_map50_95 share this so the same
+    prediction sees an *unbooked* GT only (re-masked argmax), preventing a
+    single GT from being double-booked by two predictions (the cause of
+    EVAL-01: map@50:95 systematically undercounting clustered objects).
+
+    Returns the matched GT column index and sets matched_mask[idx]=True,
+    or -1 when no unmatched GT clears thr. Callers must pass predictions in
+    descending score order so the highest-scoring prediction claims first.
+    """
+    if iou_row.size == 0:
+        return -1
+    # 이미 매칭된 GT는 후보에서 제외 (재-마스킹된 greedy).
+    candidate = np.where(matched_mask, -1.0, iou_row)
+    best_j = int(np.argmax(candidate))
+    if candidate[best_j] >= thr:
+        matched_mask[best_j] = True
+        return best_j
+    return -1
+
+
 def _compute_ap(recalls, precisions):
     mrec = np.concatenate(([0.0], recalls, [1.0]))
     mpre = np.concatenate(([1.0], precisions, [0.0]))
@@ -62,7 +85,7 @@ def evaluate_dataset(gt_data, pred_data, iou_thres=0.5):
         gt_per_img = {}
         for stem in set(list(gt_data.keys()) + list(pred_data.keys())):
             gt_boxes = [_yolo_to_xyxy(b[1], b[2], b[3], b[4]) for b in gt_data.get(stem, []) if b[0] == cid]
-            gt_per_img[stem] = {"boxes": gt_boxes, "matched": [False] * len(gt_boxes)}
+            gt_per_img[stem] = {"boxes": gt_boxes, "matched": np.zeros(len(gt_boxes), dtype=bool)}
             for b in pred_data.get(stem, []):
                 if b[0] == cid:
                     score = b[5] if len(b) > 5 else 0.0
@@ -75,22 +98,14 @@ def evaluate_dataset(gt_data, pred_data, iou_thres=0.5):
 
         tp_list = []
         for _score, stem, pbox in preds:
-            best_iou = 0
-            best_j = -1
             gt_entry = gt_per_img[stem]
             gt_boxes_list = gt_entry["boxes"]
             if gt_boxes_list:
                 iou_row = _compute_iou_matrix([pbox], gt_boxes_list)[0]
-                for j in range(len(gt_boxes_list)):
-                    if gt_entry["matched"][j]:
-                        iou_row[j] = 0.0
-                best_j = int(np.argmax(iou_row))
-                best_iou = float(iou_row[best_j])
-            if best_iou >= iou_thres and best_j >= 0 and not gt_entry["matched"][best_j]:
-                gt_entry["matched"][best_j] = True
-                tp_list.append(1)
+                matched_j = _match_greedy(iou_row, gt_entry["matched"], iou_thres)
             else:
-                tp_list.append(0)
+                matched_j = -1
+            tp_list.append(1 if matched_j >= 0 else 0)
 
         tp_arr = np.array(tp_list)
         tp_cum = np.cumsum(tp_arr)
@@ -150,29 +165,23 @@ def evaluate_map50_95(gt_data, pred_data):
         if n_gt == 0 and len(preds) == 0:
             continue
 
-        # 각 pred에 대해 best IoU를 한 번만 계산
-        pred_ious = []  # (best_iou, best_gt_idx_in_stem, stem)
+        # 각 pred의 GT IoU 행을 한 번만 계산 (threshold 반복마다 재계산 회피).
+        pred_rows = []  # (iou_row: np.ndarray, stem)
         for _score, stem, pbox in preds:
             gt_boxes_list = gt_per_img[stem]
-            if gt_boxes_list:
-                iou_row = _compute_iou_matrix([pbox], gt_boxes_list)[0]
-                best_j = int(np.argmax(iou_row))
-                best_iou = float(iou_row[best_j])
-            else:
-                best_j = -1
-                best_iou = 0.0
-            pred_ious.append((best_iou, best_j, stem))
+            iou_row = (_compute_iou_matrix([pbox], gt_boxes_list)[0]
+                       if gt_boxes_list else np.empty(0, dtype=np.float32))
+            pred_rows.append((iou_row, stem))
 
-        # 각 threshold에 대해 매칭 (greedy, IoU 내림차순 이미 정렬됨)
+        # 각 threshold에서 evaluate_dataset과 동일한 re-masked greedy 매칭.
+        # (점수순 정렬 완료 — 최고점 예측이 먼저 미매칭 GT를 점유.)
         for iou_t in iou_thresholds:
-            matched = {stem: set() for stem in gt_per_img}
+            matched_masks = {stem: np.zeros(len(gt_per_img[stem]), dtype=bool)
+                             for stem in gt_per_img}
             tp_list = []
-            for (best_iou, best_j, stem) in pred_ious:
-                if best_iou >= iou_t and best_j >= 0 and best_j not in matched[stem]:
-                    matched[stem].add(best_j)
-                    tp_list.append(1)
-                else:
-                    tp_list.append(0)
+            for (iou_row, stem) in pred_rows:
+                matched_j = _match_greedy(iou_row, matched_masks[stem], iou_t)
+                tp_list.append(1 if matched_j >= 0 else 0)
 
             if not tp_list:
                 ap_per_thresh[iou_t].append(0.0)

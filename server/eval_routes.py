@@ -11,9 +11,19 @@ from pydantic import BaseModel
 
 from core.model_loader import load_model as _load_model
 from core.inference import run_inference, run_classification, run_segmentation, run_embedding
-from core.evaluation import evaluate_dataset, evaluate_map50_95, evaluate_classification, evaluate_segmentation, evaluate_embedder
+from core.evaluation import (
+    evaluate_dataset, evaluate_map50_95, evaluate_classification,
+    evaluate_segmentation, evaluate_embedder,
+    _compute_iou_matrix, _match_greedy, _yolo_to_xyxy,
+)
 from server.state import eval_state, all_states, executor
 from server.utils import imread, glob_images
+from server.path_safety import (
+    safe_image_dir,
+    safe_label_dir,
+    safe_model_file,
+    UnsafePathError,
+)
 
 router = APIRouter()
 
@@ -25,6 +35,11 @@ def _build_confusion_matrix(gt_data, pred_data, iou_thres=0.5):
 
     Returns (matrix, classes) where matrix is (n+1)x(n+1) with the last
     index representing background (FP/FN). Rows=GT, cols=predicted.
+
+    Matching is class-agnostic on purpose: a prediction may match a GT of a
+    *different* class so the misclassification lands in an off-diagonal cell.
+    Uses the shared vectorized IoU + greedy helper (EVAL-07) so we don't
+    recompute IoU with a scalar triple-loop alongside evaluate_dataset.
     """
     all_cls: set = set()
     for boxes in list(gt_data.values()) + list(pred_data.values()):
@@ -39,52 +54,33 @@ def _build_confusion_matrix(gt_data, pred_data, iou_thres=0.5):
     size = n + 1
     matrix = [[0] * size for _ in range(size)]
 
-    def _iou(a, b):
-        x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
-        x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
-        inter = max(0, x2 - x1) * max(0, y2 - y1)
-        ua = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
-        return inter / (ua + 1e-9)
-
-    def _to_xyxy(b):
-        cx, cy, w, h = b[1], b[2], b[3], b[4]
-        return (cx - w/2, cy - h/2, cx + w/2, cy + h/2)
-
     stems = set(list(gt_data.keys()) + list(pred_data.keys()))
     for stem in stems:
         gts = gt_data.get(stem, [])
         preds = pred_data.get(stem, [])
         if not gts and not preds:
             continue
-        gt_boxes = [_to_xyxy(b) for b in gts]
+        gt_boxes = [_yolo_to_xyxy(b[1], b[2], b[3], b[4]) for b in gts]
         gt_cls = [b[0] for b in gts]
-        pred_boxes = [_to_xyxy(b) for b in preds]
+        pred_boxes = [_yolo_to_xyxy(b[1], b[2], b[3], b[4]) for b in preds]
         pred_cls = [b[0] for b in preds]
         scores = [b[5] if len(b) > 5 else 0.0 for b in preds]
         order = sorted(range(len(preds)), key=lambda i: -scores[i])
 
-        gt_matched = [False] * len(gts)
+        iou_mat = _compute_iou_matrix(pred_boxes, gt_boxes)  # (P, G)
+        gt_matched = np.zeros(len(gts), dtype=bool)
         pred_matched = [False] * len(preds)
 
         for pi in order:
-            best_iou = 0.0
-            best_j = -1
-            for j, gb in enumerate(gt_boxes):
-                if gt_matched[j]:
-                    continue
-                iou = _iou(pred_boxes[pi], gb)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_j = j
-            if best_iou >= iou_thres and best_j >= 0:
-                gt_matched[best_j] = True
+            best_j = _match_greedy(iou_mat[pi], gt_matched, iou_thres)
+            if best_j >= 0:
                 pred_matched[pi] = True
                 gi = cls_idx.get(gt_cls[best_j], bg)
                 pi2 = cls_idx.get(pred_cls[pi], bg)
                 matrix[gi][pi2] += 1
 
-        for j, matched in enumerate(gt_matched):
-            if not matched:
+        for j in range(len(gts)):
+            if not gt_matched[j]:
                 matrix[cls_idx.get(gt_cls[j], bg)][bg] += 1
         for pi, matched in enumerate(pred_matched):
             if not matched:
@@ -105,6 +101,7 @@ class EvalAsyncRequest(BaseModel):
     per_model_mappings: Optional[dict] = None  # {model_name: {model_cls_id: gt_cls_id}}
     mapped_only: bool = True
     task: str = "detection"            # detection | classification | segmentation | clip | embedder
+    cm_iou: float = 0.5                # confusion-matrix IoU threshold (EVAL-08)
     num_classes: int = 80              # for segmentation
     gt_mask_dir: str = ""              # for segmentation
     text_encoder_path: str = ""        # for clip
@@ -113,11 +110,40 @@ class EvalAsyncRequest(BaseModel):
     top_k: int = 5                     # for embedder
 
 
+def _safe_model_paths(models: list) -> list:
+    """Validate each model entry's path (EVAL-04). Mutates entry dicts in
+    place with the resolved path so the worker loads only vetted files."""
+    safe_entries: list = []
+    for entry in models:
+        raw = entry if isinstance(entry, str) else entry.get("path", "")
+        resolved = safe_model_file(raw)
+        if isinstance(entry, str):
+            safe_entries.append(resolved)
+        else:
+            new_entry = dict(entry)
+            new_entry["path"] = resolved
+            safe_entries.append(new_entry)
+    return safe_entries
+
+
 @router.post("/api/evaluation/run-async")
 async def run_evaluation_async(req: EvalAsyncRequest):
     """비동기 평가 실행 (#6 pbar + #7 모델타입/클래스 지정)"""
     if eval_state["running"]:
         return {"error": "Evaluation already running"}
+
+    # 경로 안전성 검증을 워커 제출 전(boundary)에 수행 — 사용자에게 즉시 명확한 에러 (EVAL-04).
+    try:
+        req.img_dir = safe_image_dir(req.img_dir)
+        if req.label_dir:
+            req.label_dir = safe_label_dir(req.label_dir)
+        if req.gt_mask_dir:
+            req.gt_mask_dir = safe_label_dir(req.gt_mask_dir)
+        if req.query_dir:
+            req.query_dir = safe_image_dir(req.query_dir)
+        req.models = _safe_model_paths(req.models)
+    except UnsafePathError as exc:
+        return {"error": f"Unsafe path: {exc}"}
 
     eval_state.update(running=True, progress=0, total=1, msg="Starting...", model_name="", results=[])
 
@@ -163,8 +189,9 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                 eval_state.update(running=False, msg="No images found")
                 return
 
-            # GT 로드
+            # GT 로드 — 손상된 라벨 라인은 건너뛰고 카운트만 (EVAL-05).
             gt_data = {}
+            gt_skipped = 0
             for fp in img_files:
                 stem = os.path.splitext(os.path.basename(fp))[0]
                 txt = os.path.join(req.label_dir, stem + ".txt")
@@ -173,65 +200,60 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                     with open(txt) as f:
                         for line in f:
                             parts = line.strip().split()
-                            if len(parts) >= 5:
+                            if len(parts) < 5:
+                                continue
+                            try:
                                 boxes.append((int(parts[0]), *map(float, parts[1:5])))
+                            except ValueError:
+                                # 헤더 라인·비숫자 토큰 — 한 줄 오류로 전체 run을 중단하지 않음.
+                                gt_skipped += 1
                 gt_data[stem] = boxes
 
-            total_work = len(img_files) * len(req.models)
+            total_work = len(img_files)
             eval_state["total"] = total_work
             done = 0
 
-            # 이미지 캐시: 첫 번째 모델 평가 시 로드, 이후 모델에서 재사용 (최대 500장)
-            _IMG_CACHE_LIMIT = 500
-            _img_cache = {}
-
+            # 모델을 먼저 로드하고, 이미지를 1회만 디코드해 모든 모델에 적용 (loop inversion, EVAL-06).
+            # 이전 고정-500 캐시는 500장 초과 시 모델마다 재디코드 + 멀티-GB 점유 문제가 있었음.
+            loaded = []  # [(name, mi, mapping, mapped_only)]
             for entry in req.models:
                 model_path = entry if isinstance(entry, str) else entry.get("path", "")
                 model_type = "yolo" if isinstance(entry, str) else entry.get("model_type", "yolo")
                 name = os.path.basename(model_path)
-                eval_state["model_name"] = name
-
                 try:
                     mi = _load_model(model_path, model_type=model_type)
+                    mi._frame_buffer = []
                 except Exception as exc:
                     eval_state["results"].append({"name": name, "error": str(exc)})
-                    done += len(img_files)
-                    eval_state["progress"] = done
                     continue
-
-                # per-model class mapping
                 pm = (req.per_model_mappings or {}).get(name, {})
-                # convert string keys to int
                 mapping = {int(k): int(v) for k, v in pm.items()} if pm else {}
-                mapped_only = req.mapped_only
+                loaded.append((name, mi, mapping, req.mapped_only))
 
-                # GT 필터링 (매핑된 클래스만)
-                if mapping and mapped_only:
-                    allowed_gt = set(mapping.values())
-                    gt_eval = {s: [b for b in boxes if b[0] in allowed_gt]
-                               for s, boxes in gt_data.items()}
-                else:
-                    gt_eval = gt_data
+            if not loaded:
+                eval_state.update(running=False, msg="No models loaded")
+                return
 
-                pred_data = {}
-                mi._frame_buffer = []
-                for fp in img_files:
-                    if fp in _img_cache:
-                        frame = _img_cache[fp]
-                    else:
-                        frame = imread(fp)
-                        if frame is not None and len(_img_cache) < _IMG_CACHE_LIMIT:
-                            _img_cache[fp] = frame
-                    if frame is None:
-                        done += 1
-                        continue
-                    h, w = frame.shape[:2]
+            eval_state["model_name"] = ", ".join(name for name, _, _, _ in loaded)
+            pred_per_model = {name: {} for name, _, _, _ in loaded}
+
+            for fp in img_files:
+                # 협조적 취소: Stop 후 running=False면 즉시 종료 (EVAL-02).
+                if not eval_state["running"]:
+                    eval_state.update(running=False, msg="Stopped")
+                    return
+                frame = imread(fp)
+                done += 1
+                eval_state["progress"] = done
+                if frame is None:
+                    continue
+                h, w = frame.shape[:2]
+                stem = os.path.splitext(os.path.basename(fp))[0]
+                for name, mi, mapping, mapped_only in loaded:
                     res = run_inference(mi, frame, req.conf)
-                    stem = os.path.splitext(os.path.basename(fp))[0]
                     boxes = []
                     for box, score, cid in zip(res.boxes, res.scores, res.class_ids):
                         cid = int(cid)
-                        # 클래스 리매핑
                         if mapping:
                             if cid in mapping:
                                 cid = mapping[cid]
@@ -241,10 +263,18 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                         cx = ((x1+x2)/2)/w; cy = ((y1+y2)/2)/h
                         bw = (x2-x1)/w; bh = (y2-y1)/h
                         boxes.append((cid, cx, cy, bw, bh, float(score)))
-                    pred_data[stem] = boxes
-                    done += 1
-                    eval_state["progress"] = done
-                    eval_state["msg"] = f"{name}: {done}/{total_work}"
+                    pred_per_model[name][stem] = boxes
+                eval_state["msg"] = f"{done}/{total_work}" + (f" ({gt_skipped} GT lines skipped)" if gt_skipped else "")
+
+            for name, _, mapping, mapped_only in loaded:
+                # GT 필터링 (매핑된 클래스만)
+                if mapping and mapped_only:
+                    allowed_gt = set(mapping.values())
+                    gt_eval = {s: [b for b in boxes if b[0] in allowed_gt]
+                               for s, boxes in gt_data.items()}
+                else:
+                    gt_eval = gt_data
+                pred_data = pred_per_model[name]
 
                 res50 = evaluate_dataset(gt_eval, pred_data, 0.5)
                 map5095 = evaluate_map50_95(gt_eval, pred_data)
@@ -261,7 +291,7 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                         "f1": round(v.get("f1", 0), 6),
                         "tp": v.get("tp", 0), "fp": v.get("fp", 0), "fn": v.get("fn", 0),
                     }
-                conf_matrix, conf_classes = _build_confusion_matrix(gt_eval, pred_data)
+                conf_matrix, conf_classes = _build_confusion_matrix(gt_eval, pred_data, req.cm_iou)
                 eval_state["results"].append({
                     "name": name,
                     "map50": round(ov.get("ap", 0) * 100, 4),
@@ -274,8 +304,8 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                     "confusion_classes": conf_classes,
                 })
 
-            _img_cache.clear()
-            eval_state.update(running=False, msg="Complete")
+            complete_msg = "Complete" + (f" ({gt_skipped} GT lines skipped)" if gt_skipped else "")
+            eval_state.update(running=False, msg=complete_msg)
             _auto_save_results()
         except Exception as e:
             eval_state.update(running=False, msg=f"Error: {e}")
@@ -322,6 +352,8 @@ async def run_evaluation_async(req: EvalAsyncRequest):
 
                 pred_data = {}
                 for fp in img_files:
+                    if not eval_state["running"]:
+                        eval_state.update(running=False, msg="Stopped"); return
                     frame = imread(fp)
                     if frame is None: done += 1; continue
                     stem = os.path.splitext(os.path.basename(fp))[0]
@@ -376,16 +408,27 @@ async def run_evaluation_async(req: EvalAsyncRequest):
 
                 from core.inference import run_segmentation
                 agg_pred, agg_gt = [], []
+                mask_skipped = 0
+                mask_dir = req.gt_mask_dir or req.label_dir
                 for fp in img_files:
+                    if not eval_state["running"]:
+                        eval_state.update(running=False, msg="Stopped"); return
                     frame = imread(fp)
                     if frame is None: done += 1; continue
                     stem = os.path.splitext(os.path.basename(fp))[0]
-                    # GT mask
-                    gt_path = os.path.join(req.gt_mask_dir or req.label_dir, stem + ".png")
-                    if not os.path.isfile(gt_path):
-                        done += 1; continue
+                    # GT mask: 확장자 후보 + 원본 이미지 ext 중 첫 존재 선택 (SPEC-08).
+                    src_ext = os.path.splitext(fp)[1]
+                    gt_path = None
+                    for cand_ext in (".png", ".bmp", ".tif", ".tiff", ".jpg", src_ext):
+                        p = os.path.join(mask_dir, stem + cand_ext)
+                        if os.path.isfile(p):
+                            gt_path = p
+                            break
+                    if gt_path is None:
+                        mask_skipped += 1; done += 1; continue
                     gt_mask = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
-                    if gt_mask is None: done += 1; continue
+                    if gt_mask is None:
+                        mask_skipped += 1; done += 1; continue
                     # Predict
                     seg_res = run_segmentation(mi, frame)
                     if seg_res and seg_res.mask is not None:
@@ -394,7 +437,9 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                             pred_mask = cv2.resize(pred_mask.astype(np.uint8), (gt_mask.shape[1], gt_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
                         agg_pred.append(pred_mask)
                         agg_gt.append(gt_mask)
-                    done += 1; eval_state.update(progress=done, msg=f"{name}: {done}/{total_work}")
+                    done += 1
+                    skip_note = f" ({mask_skipped} masks skipped)" if mask_skipped else ""
+                    eval_state.update(progress=done, msg=f"{name}: {done}/{total_work}{skip_note}")
 
                 if agg_pred:
                     # Per-image evaluation, then average
@@ -426,9 +471,12 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                         "mDice": round(mdice * 100, 4),
                         "detail": detail,
                         "num_images": len(agg_pred),
+                        "masks_skipped": mask_skipped,
                     })
                 else:
-                    eval_state["results"].append({"name": name, "task": "segmentation", "error": "No valid predictions"})
+                    eval_state["results"].append({"name": name, "task": "segmentation",
+                                                  "error": "No valid predictions",
+                                                  "masks_skipped": mask_skipped})
             eval_state.update(running=False, msg="Complete")
         except Exception as e:
             eval_state.update(running=False, msg=f"Error: {e}")
@@ -469,6 +517,8 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                     done += len(img_files); eval_state["progress"] = done; continue
                 top1 = 0; top5 = 0; total = 0
                 for fp in img_files:
+                    if not eval_state["running"]:
+                        eval_state.update(running=False, msg="Stopped"); return
                     stem = os.path.splitext(os.path.basename(fp))[0]
                     if stem not in gt_data: done += 1; continue
                     frame = imread(fp)
@@ -530,6 +580,8 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                     done += len(gallery_files) + len(query_files); eval_state["progress"] = done; continue
                 g_embs, g_labels, q_embs, q_labels = [], [], [], []
                 for fp in gallery_files:
+                    if not eval_state["running"]:
+                        eval_state.update(running=False, msg="Stopped"); return
                     stem = os.path.splitext(os.path.basename(fp))[0]
                     frame = imread(fp)
                     if frame is not None:
@@ -538,6 +590,8 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                             g_embs.append(res.embedding); g_labels.append(gt_g.get(stem, -1))
                     done += 1; eval_state.update(progress=done, msg=f"{name}: gallery")
                 for fp in query_files:
+                    if not eval_state["running"]:
+                        eval_state.update(running=False, msg="Stopped"); return
                     stem = os.path.splitext(os.path.basename(fp))[0]
                     frame = imread(fp)
                     if frame is not None:
@@ -630,28 +684,40 @@ async def run_evaluation(req: EvalRequest):
         from core.evaluation import evaluate_dataset, evaluate_map50_95
         import glob, cv2
 
+        # 경로 안전성 검증 (EVAL-04).
+        try:
+            img_dir = safe_image_dir(req.img_dir)
+            label_dir = safe_label_dir(req.label_dir)
+            model_paths = [safe_model_file(m) for m in req.models]
+        except UnsafePathError as exc:
+            return {"error": f"Unsafe path: {exc}"}
+
         exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
         img_files = []
         for e in exts:
-            img_files.extend(glob.glob(os.path.join(req.img_dir, e)))
+            img_files.extend(glob.glob(os.path.join(img_dir, e)))
         img_files.sort()
 
-        # Load GT
+        # Load GT — 손상된 라벨 라인은 건너뜀 (EVAL-05).
         gt_data = {}
         for fp in img_files:
             stem = os.path.splitext(os.path.basename(fp))[0]
-            txt = os.path.join(req.label_dir, stem + ".txt")
+            txt = os.path.join(label_dir, stem + ".txt")
             boxes = []
             if os.path.isfile(txt):
                 with open(txt) as f:
                     for line in f:
                         parts = line.strip().split()
-                        if len(parts) >= 5:
+                        if len(parts) < 5:
+                            continue
+                        try:
                             boxes.append((int(parts[0]), *map(float, parts[1:5])))
+                        except ValueError:
+                            continue
             gt_data[stem] = boxes
 
         results = []
-        for model_path in req.models:
+        for model_path in model_paths:
             name = os.path.basename(model_path)
             try:
                 mi = _load_model(model_path)
@@ -773,9 +839,22 @@ async def eval_history():
 
 @router.get("/api/eval/load/{filename}")
 async def eval_load(filename: str):
-    """Load a saved evaluation result."""
+    """Load a saved evaluation result.
+
+    Path-param is untrusted (EVAL-04): reject any separator/`..`, force a
+    `.json` extension, and confirm the realpath stays inside the history dir
+    so a crafted name can't read arbitrary files (Windows backslash escapes).
+    """
     import json
-    path = os.path.join(_EVAL_HISTORY_DIR, filename)
+    # A bare filename never contains a path separator or parent ref.
+    if os.path.basename(filename) != filename or ".." in filename:
+        return {"error": "Invalid filename"}
+    if not filename.endswith(".json"):
+        return {"error": "Invalid filename"}
+    history_root = os.path.realpath(_EVAL_HISTORY_DIR)
+    path = os.path.realpath(os.path.join(history_root, filename))
+    if os.path.commonpath([history_root, path]) != history_root:
+        return {"error": "Invalid filename"}
     if not os.path.isfile(path):
         return {"error": "File not found"}
     with open(path, encoding="utf-8") as f:

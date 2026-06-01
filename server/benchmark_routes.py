@@ -11,6 +11,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from core.benchmark_runner import BenchmarkConfig, run_benchmark_core
+from server.path_safety import UnsafePathError, safe_model_file
 from server.state import bench_state, executor
 
 router = APIRouter()
@@ -41,7 +42,14 @@ async def run_benchmark(req: BenchmarkRequest):
         configs = []
         codec_map = {}  # config index -> codec name
         idx = 0
-        for path in req.models:
+        skipped: list = []
+        for raw_path in req.models:
+            # 사용자 제공 모델 경로는 로드 전에 boundary에서 정규화·검증 (traversal/임의 경로 차단).
+            try:
+                path = safe_model_file(raw_path)
+            except UnsafePathError as e:
+                skipped.append({"error": f"{os.path.basename(str(raw_path))}: {e}"})
+                continue
             # Detect model_type per model: if input has 9 channels, use configured seq_ type
             # otherwise use default "yolo"
             mt = "yolo"
@@ -68,6 +76,9 @@ async def run_benchmark(req: BenchmarkRequest):
                 codec_map[idx] = codec
                 idx += 1
         bench_state["total"] = sum(c.warmup + c.iterations for c in configs)
+        # 검증 실패한 모델 경로는 결과 목록에 에러로 노출 (조용히 누락하지 않음).
+        for entry in skipped:
+            bench_state["results"].append(entry)
 
         # Pre-encode dummy frames per codec
         import time as _time
@@ -121,16 +132,24 @@ async def run_benchmark(req: BenchmarkRequest):
                     times.append((_time.perf_counter() - t0) * 1000.0)
                 decode_ms = round(float(np.mean(times)), 3)
             elif buf is not None and codec in ("h264", "h265"):
-                times = []
-                for _ in range(100):
-                    t0 = _time.perf_counter()
-                    cap = cv2.VideoCapture(buf)
-                    cap.read()
-                    cap.release()
-                    times.append((_time.perf_counter() - t0) * 1000.0)
-                decode_ms = round(float(np.mean(times)), 3)
+                # 컨테이너를 한 번만 열고 cap.read()만 타이밍 측정 — 매 반복 file-open은
+                # 실제 스트림 디코드가 아닌 container-open 오버헤드를 잰다.
+                cap = cv2.VideoCapture(buf)
+                if cap.isOpened():
+                    times = []
+                    for _ in range(100):
+                        t0 = _time.perf_counter()
+                        ok, _frame = cap.read()
+                        times.append((_time.perf_counter() - t0) * 1000.0)
+                        # 단일 프레임 mp4이므로 EOF 도달 시 다음 read를 위해 되감는다.
+                        if not ok:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    decode_ms = round(float(np.mean(times)), 3) if times else 0.0
+                cap.release()
 
-            total_with_decode = round(r.mean_total_ms + decode_ms, 2)
+            # Fixed-batch 모델은 배치 내 프레임 수만큼 디코드가 필요하므로
+            # decode_ms를 batch_size배 해야 throughput이 과대평가되지 않는다.
+            total_with_decode = round(r.mean_total_ms + decode_ms * r.batch_size, 2)
             fps_with_decode = round(r.batch_size * 1000.0 / total_with_decode, 1) if total_with_decode > 0 else 0
 
             bench_state["results"].append({
@@ -151,6 +170,7 @@ async def run_benchmark(req: BenchmarkRequest):
                 "cpu_pct": round(r.cpu_pct, 1),
                 "ram_mb": round(r.ram_mb),
                 "gpu_pct": r.gpu_pct,
+                "gpu_pct_peak": r.gpu_pct_peak,
                 "gpu_mem_used": r.gpu_mem_used,
                 "gpu_mem_total": r.gpu_mem_total,
             })

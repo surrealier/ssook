@@ -73,8 +73,18 @@ def _get_opset_ir(path: str) -> tuple[int, int, str, str, str]:
         return 0, 0, "", "", ""
 
 
-def inspect_model(path: str) -> ModelInspection:
-    """Inspect an ONNX model file and return detailed information."""
+def inspect_model(path: str, *, test_eps: bool = False, gpu_lock=None) -> ModelInspection:
+    """Inspect an ONNX model file and return detailed information.
+
+    `test_eps`: when True, actually instantiate a session per available EP to
+    confirm it can load the model (memory-spiky and slow). Default False uses
+    the heuristic op-support table only — accelerator EPs are reported as
+    "compatible if the op set is covered" without a real session.
+
+    `gpu_lock`: optional context-manager lock the caller passes to serialise
+    GPU-backed EP load tests (e.g. server's task_locks['gpu_infer']). Kept as a
+    parameter so core/ stays free of server imports.
+    """
     file_size_mb = os.path.getsize(path) / (1024 * 1024)
     file_name = os.path.basename(path)
 
@@ -111,7 +121,7 @@ def inspect_model(path: str) -> ModelInspection:
     # Parameters
     num_params = _count_parameters(path)
 
-    # EP compatibility — which EPs can load + op-level fallback analysis
+    # EP compatibility — op-level support analysis (+ optional real load test).
     available_eps = ort.get_available_providers()
     compatible_eps = []
     ep_compat = {}
@@ -119,30 +129,46 @@ def inspect_model(path: str) -> ModelInspection:
     total_ops = num_nodes
 
     for ep in available_eps:
-        try:
-            test_sess = ort.InferenceSession(path, providers=[ep])
+        # CPU is the universal fallback — it runs every op. Report it as fully
+        # supported rather than "unknown" (it has no curated op table).
+        if ep == "CPUExecutionProvider":
+            ep_compat[ep] = {
+                "supported_ops": sorted(all_ops),
+                "fallback_ops": [],
+                "supported_ratio": 1.0,
+                "known": True,
+            }
             compatible_eps.append(ep)
-            # Check which ops ran on this EP vs CPU fallback
-            try:
-                # ORT doesn't expose per-node EP assignment directly,
-                # so we use known EP op support lists as heuristic
-                ep_supported = _get_ep_supported_ops(ep)
-                if ep_supported is not None:
-                    supported = all_ops & ep_supported
-                    fallback = all_ops - ep_supported
-                    supported_count = sum(op_counts.get(op, 0) for op in supported)
-                    ep_compat[ep] = {
-                        "supported_ops": sorted(supported),
-                        "fallback_ops": sorted(fallback),
-                        "supported_ratio": round(supported_count / max(total_ops, 1), 3),
-                    }
-                else:
-                    ep_compat[ep] = {"supported_ops": [], "fallback_ops": [], "supported_ratio": 1.0}
-            except Exception:
-                ep_compat[ep] = {"supported_ops": [], "fallback_ops": [], "supported_ratio": 1.0}
-            del test_sess
-        except Exception:
-            pass
+            continue
+
+        ep_supported = _get_ep_supported_ops(ep)
+        if ep_supported is not None:
+            supported = all_ops & ep_supported
+            fallback = all_ops - ep_supported
+            supported_count = sum(op_counts.get(op, 0) for op in supported)
+            ep_compat[ep] = {
+                "supported_ops": sorted(supported),
+                "fallback_ops": sorted(fallback),
+                "supported_ratio": round(supported_count / max(total_ops, 1), 3),
+                "known": True,
+            }
+        else:
+            # Unknown EP: we have no op table, so we can't claim any ratio.
+            # Report ratio=None + known=false so the UI renders "unknown"
+            # instead of a misleading 100%.
+            ep_compat[ep] = {
+                "supported_ops": [],
+                "fallback_ops": [],
+                "supported_ratio": None,
+                "known": False,
+            }
+
+        # Accelerator EPs: only do the expensive real-load test when requested.
+        if test_eps:
+            loaded = _ep_loads(path, ep, gpu_lock=gpu_lock)
+            ep_compat[ep]["loads"] = loaded
+            if loaded:
+                compatible_eps.append(ep)
 
     return ModelInspection(
         file_name=file_name,
@@ -203,6 +229,29 @@ _EP_OPS = {
 def _get_ep_supported_ops(ep_name: str):
     """Return set of supported ops for an EP, or None if unknown."""
     return _EP_OPS.get(ep_name)
+
+
+# GPU-backed EPs whose real-load test contends for device memory — serialise
+# those behind the shared gpu_infer lock so we don't spike VRAM concurrently.
+_GPU_EPS = {"CUDAExecutionProvider", "TensorrtExecutionProvider",
+            "ROCMExecutionProvider", "MIGraphXExecutionProvider", "DmlExecutionProvider"}
+
+
+def _ep_loads(path: str, ep: str, *, gpu_lock=None) -> bool:
+    """Return True if the model instantiates a session on `ep` (real test)."""
+    def _try() -> bool:
+        try:
+            ort.InferenceSession(path, providers=[ep])
+            return True
+        except Exception:
+            return False
+
+    # GPU-backed EP load tests contend for device memory; the caller may pass a
+    # lock to serialise them. Without one we still run, just unguarded.
+    if ep in _GPU_EPS and gpu_lock is not None:
+        with gpu_lock:
+            return _try()
+    return _try()
 
 
 def inspection_to_dict(info: ModelInspection) -> dict:

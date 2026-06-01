@@ -14,6 +14,12 @@ from pydantic import BaseModel
 from core.model_loader import load_model as _load_model
 from core.inference import run_inference, letterbox, preprocess
 from core.evaluation import evaluate_dataset
+from server.path_safety import (
+    safe_image_dir,
+    safe_label_dir,
+    safe_model_file,
+    safe_image_file,
+)
 from server.state import compare_state, error_analysis_state, conf_opt_state, embedding_state, executor
 from server.utils import imread, encode_jpeg, draw_detections, glob_images
 
@@ -31,12 +37,16 @@ class ModelCompareRequest(BaseModel):
 
 @router.post("/api/analysis/model-compare")
 async def run_model_compare(req: ModelCompareRequest):
+    # 경로 검증은 워커 제출 전(요청 스레드)에서 — UnsafePathError가 전역 핸들러의 봉투로 반환되게.
+    model_a = safe_model_file(req.model_a)
+    model_b = safe_model_file(req.model_b)
+    img_dir = safe_image_dir(req.img_dir)
+
     if compare_state["running"]:
         return {"error": "Already running"}
     compare_state.update(running=True, progress=0, total=0, msg="Starting...", results=[], images=[])
 
     # 이전 비교 임시 파일 정리
-    import tempfile, shutil
     _cmp_dir = os.path.join(tempfile.gettempdir(), "ssook_compare")
     if os.path.isdir(_cmp_dir):
         shutil.rmtree(_cmp_dir, ignore_errors=True)
@@ -47,12 +57,12 @@ async def run_model_compare(req: ModelCompareRequest):
         from core.model_loader import load_model as _load
         from core.inference import run_inference
         try:
-            mi_a = _load(req.model_a, model_type=req.model_type_a)
-            mi_b = _load(req.model_b, model_type=req.model_type_b)
+            mi_a = _load(model_a, model_type=req.model_type_a)
+            mi_b = _load(model_b, model_type=req.model_type_b)
         except Exception as e:
             compare_state.update(running=False, msg=f"Load error: {e}")
             return
-        imgs = glob_images(req.img_dir)
+        imgs = glob_images(img_dir)
         if not imgs:
             compare_state.update(running=False, msg="No images found")
             return
@@ -61,6 +71,10 @@ async def run_model_compare(req: ModelCompareRequest):
         names_b = mi_b.names or {}
         try:
             for i, fp in enumerate(imgs):
+                # force-stop 협조: 루프 본문 상단에서 running 재검사 (deleted temp dir에 imwrite 방지).
+                if not compare_state["running"]:
+                    compare_state["msg"] = "Stopped"
+                    return
                 frame = imread(fp)
                 if frame is None:
                     compare_state["progress"] = i + 1
@@ -138,6 +152,10 @@ class ErrorAnalysisRequest(BaseModel):
 
 @router.post("/api/analysis/error-analysis")
 async def run_error_analysis(req: ErrorAnalysisRequest):
+    model_path = safe_model_file(req.model_path)
+    img_dir = safe_image_dir(req.img_dir)
+    label_dir = safe_label_dir(req.label_dir)
+
     if error_analysis_state["running"]:
         return {"error": "Already running"}
     error_analysis_state.update(running=True, progress=0, total=0, msg="Starting...", results={})
@@ -146,11 +164,11 @@ async def run_error_analysis(req: ErrorAnalysisRequest):
         from core.model_loader import load_model as _load
         from core.inference import run_inference
         try:
-            mi = _load(req.model_path, model_type=req.model_type)
+            mi = _load(model_path, model_type=req.model_type)
         except Exception as e:
             error_analysis_state.update(running=False, msg=f"Load error: {e}")
             return
-        imgs = glob_images(req.img_dir)
+        imgs = glob_images(img_dir)
         if not imgs:
             error_analysis_state.update(running=False, msg="No images found")
             return
@@ -171,34 +189,40 @@ async def run_error_analysis(req: ErrorAnalysisRequest):
             fn_stats = {"count": 0, "small": 0, "medium": 0, "large": 0, "top": 0, "center": 0, "bottom": 0}
 
             for i, fp in enumerate(imgs):
+                # force-stop 협조: 루프 본문 상단에서 running 재검사.
+                if not error_analysis_state["running"]:
+                    error_analysis_state["msg"] = "Stopped"
+                    return
                 frame = imread(fp)
                 if frame is None:
                     error_analysis_state["progress"] = i + 1
                     continue
                 h, w = frame.shape[:2]
                 res = run_inference(mi, frame, req.conf)
-                # Load GT
+                # Load GT — parts[0]은 class id. 클래스 인지 매칭을 위해 보존.
                 stem = os.path.splitext(os.path.basename(fp))[0]
-                txt = os.path.join(req.label_dir, stem + ".txt")
-                gt_boxes = []
+                txt = os.path.join(label_dir, stem + ".txt")
+                gt_boxes = []  # [x1, y1, x2, y2, cy_norm, cls]
                 if os.path.isfile(txt):
                     with open(txt) as f:
                         for line in f:
                             parts = line.strip().split()
                             if len(parts) >= 5:
+                                cls = int(float(parts[0]))
                                 cx, cy, bw, bh = map(float, parts[1:5])
                                 x1 = (cx - bw/2) * w; y1 = (cy - bh/2) * h
                                 x2 = (cx + bw/2) * w; y2 = (cy + bh/2) * h
-                                gt_boxes.append([x1, y1, x2, y2, cy])
+                                gt_boxes.append([x1, y1, x2, y2, cy, cls])
 
                 pred_boxes = list(zip(res.boxes, res.scores, res.class_ids))
                 gt_matched = [False] * len(gt_boxes)
                 pred_matched = [False] * len(pred_boxes)
 
-                for pi, (pbox, _, _) in enumerate(pred_boxes):
+                for pi, (pbox, _, pcid) in enumerate(pred_boxes):
                     best_iou, best_gi = 0, -1
                     for gi, gb in enumerate(gt_boxes):
-                        if gt_matched[gi]:
+                        # 클래스가 다르면 매칭 불가 — 오분류(dog 예측 vs cat GT)를 TP로 세지 않게.
+                        if gt_matched[gi] or int(gb[5]) != int(pcid):
                             continue
                         ix1 = max(pbox[0], gb[0]); iy1 = max(pbox[1], gb[1])
                         ix2 = min(pbox[2], gb[2]); iy2 = min(pbox[3], gb[3])
@@ -256,6 +280,10 @@ class ConfOptimizerRequest(BaseModel):
 
 @router.post("/api/analysis/conf-optimizer")
 async def run_conf_optimizer(req: ConfOptimizerRequest):
+    model_path = safe_model_file(req.model_path)
+    img_dir = safe_image_dir(req.img_dir)
+    label_dir = safe_label_dir(req.label_dir)
+
     if conf_opt_state["running"]:
         return {"error": "Already running"}
     conf_opt_state.update(running=True, progress=0, total=0, msg="Starting...", results=[])
@@ -264,11 +292,11 @@ async def run_conf_optimizer(req: ConfOptimizerRequest):
         from core.model_loader import load_model as _load
         from core.inference import run_inference
         try:
-            mi = _load(req.model_path, model_type=req.model_type)
+            mi = _load(model_path, model_type=req.model_type)
         except Exception as e:
             conf_opt_state.update(running=False, msg=f"Load error: {e}")
             return
-        imgs = glob_images(req.img_dir)
+        imgs = glob_images(img_dir)
         if not imgs:
             conf_opt_state.update(running=False, msg="No images found")
             return
@@ -282,6 +310,10 @@ async def run_conf_optimizer(req: ConfOptimizerRequest):
             conf_opt_state["msg"] = "Running inference..."
 
             for idx, fp in enumerate(imgs):
+                # force-stop 협조: 루프 본문 상단에서 running 재검사.
+                if not conf_opt_state["running"]:
+                    conf_opt_state["msg"] = "Stopped"
+                    return
                 frame = imread(fp)
                 if frame is None:
                     conf_opt_state["progress"] = idx + 1
@@ -292,21 +324,22 @@ async def run_conf_optimizer(req: ConfOptimizerRequest):
                     all_preds.append((int(cid), float(score), *box, idx))
                 # Load GT
                 stem = os.path.splitext(os.path.basename(fp))[0]
-                txt = os.path.join(req.label_dir, stem + ".txt")
+                txt = os.path.join(label_dir, stem + ".txt")
                 if os.path.isfile(txt):
                     with open(txt) as f:
                         for line in f:
                             parts = line.strip().split()
                             if len(parts) >= 5:
-                                cid = int(parts[0])
+                                cid = int(float(parts[0]))
                                 cx, cy, bw, bh = map(float, parts[1:5])
                                 x1 = (cx - bw/2) * w; y1 = (cy - bh/2) * h
                                 x2 = (cx + bw/2) * w; y2 = (cy + bh/2) * h
                                 all_gt.append((cid, x1, y1, x2, y2, idx))
                 conf_opt_state["progress"] = idx + 1
 
-            # Group by class
-            class_ids = set(g[0] for g in all_gt)
+            # Group by class — GT 또는 예측 어느 쪽에 나타난 클래스 모두 sweep.
+            # (모델이 예측하나 GT에 없는 클래스도 행을 받게; F1 수식이 gt_cls=[] 처리.)
+            class_ids = set(g[0] for g in all_gt) | set(p[0] for p in all_preds)
             thresholds = np.arange(0.05, 0.951, req.step)
             conf_opt_state["msg"] = "Sweeping thresholds..."
             results = []
@@ -377,14 +410,17 @@ class EmbeddingViewerRequest(BaseModel):
 
 @router.post("/api/analysis/embedding-viewer")
 async def run_embedding_viewer(req: EmbeddingViewerRequest):
+    model_path = safe_model_file(req.model_path)
+    img_dir_safe = safe_image_dir(req.img_dir)
+
     if embedding_state["running"]:
         return {"error": "Already running"}
-    embedding_state.update(running=True, msg="Starting...", image=None)
+    embedding_state.update(running=True, progress=0, total=0, msg="Starting...", image=None)
 
     def _run():
         import onnxruntime as ort
         try:
-            session = ort.InferenceSession(req.model_path)
+            session = ort.InferenceSession(model_path)
         except Exception as e:
             embedding_state.update(running=False, msg=f"Load error: {e}")
             return
@@ -393,7 +429,7 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
         w = int(inp.shape[3]) if isinstance(inp.shape[3], int) else 224
 
         embeddings, labels = [], []
-        img_dir = Path(req.img_dir)
+        img_dir = Path(img_dir_safe)
         exts = {'.jpg', '.jpeg', '.png', '.bmp'}
         files = []
         for sub in sorted(img_dir.iterdir()):
@@ -408,10 +444,17 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
             embedding_state.update(running=False, msg="No images found")
             return
 
+        # total을 루프 전에 설정해야 진행률 바가 0%에 고착되지 않음.
+        embedding_state["total"] = len(files)
         embedding_state["msg"] = f"Extracting embeddings: 0/{len(files)}"
         for i, (fp, label) in enumerate(files):
+            # force-stop 협조: 루프 본문 상단에서 running 재검사.
+            if not embedding_state["running"]:
+                embedding_state["msg"] = "Stopped"
+                return
             img = imread(str(fp))
             if img is None:
+                embedding_state["progress"] = i + 1
                 continue
             img = cv2.resize(img, (w, h))
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -420,6 +463,7 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
             vec = out[0].flatten()
             embeddings.append(vec)
             labels.append(label)
+            embedding_state["progress"] = i + 1
             embedding_state["msg"] = f"Extracting embeddings: {i+1}/{len(files)}"
 
         if len(embeddings) < 2:
@@ -465,13 +509,8 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
         fig.savefig(buf, format='png', dpi=120)
         plt.close(fig)
         buf.seek(0)
-        # 임시 파일로 저장 (메모리 대신 디스크)
-        import tempfile
-        tmp_path = os.path.join(tempfile.gettempdir(), "ssook_embedding.png")
-        with open(tmp_path, "wb") as f:
-            f.write(buf.read())
-        embedding_state["_image_path"] = tmp_path
-        embedding_state["image"] = None  # 메모리에서 제거
+        # base64를 state에 직접 보관 — 고정 전역 temp 경로가 동시 run 간 충돌하던 것을 제거.
+        embedding_state["image"] = base64.b64encode(buf.read()).decode()
         embedding_state.update(running=False, msg="Complete")
 
     executor.submit(_run)
@@ -480,13 +519,7 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
 
 @router.get("/api/analysis/embedding-viewer/status")
 async def embedding_viewer_status():
-    state = dict(embedding_state)
-    # 이미지가 임시 파일에 있으면 로드하여 반환
-    img_path = state.pop("_image_path", None)
-    if img_path and os.path.isfile(img_path) and state.get("image") is None:
-        with open(img_path, "rb") as f:
-            state["image"] = base64.b64encode(f.read()).decode()
-    return state
+    return embedding_state.snapshot() if hasattr(embedding_state, 'snapshot') else dict(embedding_state)
 
 
 # ── 5. Inference Analysis API ──────────────────────────
@@ -499,21 +532,25 @@ class InferenceAnalysisRequest(BaseModel):
 
 @router.post("/api/analysis/inference-analysis")
 async def run_inference_analysis(req: InferenceAnalysisRequest):
+    model_path = safe_model_file(req.model_path)
+    image_path = safe_image_file(req.image_path)
     try:
         from core.model_loader import load_model as _load
-        from core.inference import run_inference, letterbox, preprocess
+        from core.inference import run_inference, letterbox, _padded_to_tensor
         import time as _time
 
-        mi = _load(req.model_path, model_type=req.model_type)
-        frame = imread(req.image_path)
+        mi = _load(model_path, model_type=req.model_type)
+        frame = imread(image_path)
         if frame is None:
             return {"error": "Cannot read image"}
         names = mi.names or {}
 
-        # Pre-process
+        # Pre-process — letterbox 한 번만 계산 후 그 결과로 텐서 구성(중복 forward pass 제거).
         t0 = _time.perf_counter()
         padded, ratio, pad = letterbox(frame, mi.input_size)
-        tensor = preprocess(frame, mi.input_size)
+        # _padded_to_tensor는 스레드별 재사용 버퍼를 반환 — 이후 run_inference가 덮어쓰므로
+        # tensor stats용으로 복사본을 떠둔다.
+        tensor = _padded_to_tensor(padded, mi.input_size).copy()
         pre_ms = (_time.perf_counter() - t0) * 1000
 
         # Inference

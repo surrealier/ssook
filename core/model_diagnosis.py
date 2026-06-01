@@ -78,10 +78,13 @@ class ModelDiagnosisEngine:
             file_size_mb, total_params, quant_analysis,
             pruning_analysis, graph_analysis, architecture, weight_analysis)
 
-        # Health score (0-100)
+        # Health score (0-100) — continuous multiplicative decay so it doesn't
+        # saturate at 0 after a handful of findings. Each critical multiplies by
+        # 0.7, each warning by 0.9; the result is a smooth gradient that still
+        # ranks "many issues" below "a few".
         critical = sum(1 for f in findings if f["severity"] == "critical")
         warnings = sum(1 for f in findings if f["severity"] == "warning")
-        health_score = max(0, 100 - critical * 20 - warnings * 5)
+        health_score = round(100.0 * (0.7 ** critical) * (0.9 ** warnings))
 
         return {
             "summary": {
@@ -101,20 +104,38 @@ class ModelDiagnosisEngine:
         }
 
     def _detect_architecture(self, ops: set, op_counts: dict) -> str:
+        # Count-weighted overlap so a graph with one stray LayerNormalization
+        # doesn't read as a transformer. Each pattern's score is the share of
+        # its ops present, weighted by how often they actually appear.
         scores = {}
         for arch, pattern_ops in _ARCH_PATTERNS.items():
-            overlap = len(ops & pattern_ops)
-            scores[arch] = overlap / len(pattern_ops)
-        best = max(scores, key=scores.get)
-        if scores[best] >= 0.5:
+            hit_count = sum(op_counts.get(op, 0) for op in pattern_ops)
+            present = sum(1 for op in pattern_ops if op_counts.get(op, 0) > 0)
+            scores[arch] = (present / len(pattern_ops)) * (1 + np.log1p(hit_count))
+
+        # A real Attention/MHA node is required to call something a transformer
+        # family arch — LayerNormalization alone is not discriminating.
+        has_attn_node = any(op_counts.get(k, 0) > 0
+                            for k in ("Attention", "MultiHeadAttention"))
+        conv_count = op_counts.get("Conv", 0)
+
+        ordered = sorted(scores.items(), key=lambda x: -x[1])
+        best, best_score = ordered[0]
+        runner_up = ordered[1][1] if len(ordered) > 1 else 0.0
+        # Require a clear margin over the runner-up and a discriminating op for
+        # the winning family before trusting the pattern match.
+        margin_ok = best_score >= runner_up * 1.25 and best_score > 0
+        discriminating = (has_attn_node if best in ("rfdetr", "eva02", "transformer")
+                          else conv_count >= 2)
+        if margin_ok and discriminating:
             return best
-        has_conv = "Conv" in ops
-        has_attn = any(k in ops for k in ("Attention", "MultiHeadAttention", "LayerNormalization"))
-        if has_conv and has_attn:
+
+        # Fallback: structural heuristic with the same discriminating-op rule.
+        if conv_count >= 2 and has_attn_node:
             return "hybrid"
-        if has_conv:
+        if conv_count >= 2:
             return "cnn"
-        if has_attn:
+        if has_attn_node:
             return "transformer"
         return "unknown"
 
@@ -302,13 +323,20 @@ class ModelDiagnosisEngine:
                 "message": f"{graph['memory_bound_ratio']*100:.0f}% of ops are memory-bound. Consider graph optimization.",
             })
 
-        # Weight distribution findings
-        for w in weights:
-            if w["outlier_ratio"] > 0.05:
-                findings.append({
-                    "severity": "warning", "category": "weights",
-                    "message": f"Layer '{w['name']}' has {w['outlier_ratio']*100:.1f}% outliers. May cause quantization accuracy loss.",
-                })
+        # Weight distribution findings — aggregate into one finding instead of
+        # spamming one warning per layer (large models have dozens of layers).
+        outlier_layers = [w for w in weights if w["outlier_ratio"] > 0.05]
+        if outlier_layers:
+            worst = max(outlier_layers, key=lambda w: w["outlier_ratio"])
+            findings.append({
+                "severity": "warning", "category": "weights",
+                "message": (
+                    f"{len(outlier_layers)} layer(s) have >5% weight outliers "
+                    f"(worst: '{worst['name']}' at {worst['outlier_ratio']*100:.1f}%). "
+                    "May cause quantization accuracy loss — consider mixed precision."
+                ),
+                "affected_layers": [w["name"] for w in outlier_layers][:20],
+            })
 
         # Architecture-specific
         if arch == "transformer":

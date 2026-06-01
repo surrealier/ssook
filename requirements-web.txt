@@ -29,3 +29,8 @@ PyYAML>=6.0.0,<7.0
 
 # Optional: HuggingFace Hub model download
 # huggingface-hub>=0.20.0,<1.0
+
+# Optional: generative VLM backends (transformers / OpenAI-compatible).
+# The default CLIP backend is dependency-free; install these only to enable
+# local Qwen-VL (transformers) or Ollama/vLLM/LM Studio (openai) backends:
+#   pip install -r requirements-vlm.txt

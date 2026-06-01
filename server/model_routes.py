@@ -38,10 +38,20 @@ class InferRequest(BaseModel):
     conf: float = 0.25
     clip_labels: Optional[str] = None
     clip_text_encoder: Optional[str] = None
+    # model_type overrides the global cfg.model_type for this request — the VLM
+    # tab sends 'vlm' so we route to the VLM path instead of detection.
+    model_type: Optional[str] = None
     vlm_prompt: Optional[str] = None
     vlm_task: Optional[str] = "caption"  # caption | vqa | grounding
     vlm_text_encoder: Optional[str] = None  # CLIP text encoder for VLM backend
     vlm_candidates: Optional[str] = None  # comma-separated answer candidates (VQA)
+    # Pluggable VLM backend selection.
+    backend: str = "clip"  # clip | transformers | openai
+    model_id: Optional[str] = None  # HF repo / served model name (transformers, openai)
+    endpoint_url: Optional[str] = None  # OpenAI-compatible server base URL (openai)
+    api_key: Optional[str] = None  # bearer token (openai) — NEVER logged
+    max_new_tokens: int = 128
+    temperature: float = 0.0
 
 
 class VideoInfoRequest(BaseModel):
@@ -50,12 +60,19 @@ class VideoInfoRequest(BaseModel):
 
 class VLMBatchRequest(BaseModel):
     model_path: str
-    text_encoder: str
+    text_encoder: Optional[str] = None  # required only for the clip backend
     img_dir: str
     prompt: Optional[str] = None
     task: str = "caption"  # caption | vqa | grounding
     candidates: Optional[str] = None
     max_images: int = 50
+    # Pluggable VLM backend selection (mirrors InferRequest).
+    backend: str = "clip"  # clip | transformers | openai
+    model_id: Optional[str] = None
+    endpoint_url: Optional[str] = None
+    api_key: Optional[str] = None  # bearer token (openai) — NEVER logged
+    max_new_tokens: int = 128
+    temperature: float = 0.0
 
 
 # ── Model load / info ───────────────────────────────────
@@ -210,10 +227,83 @@ async def infer_image(req: InferRequest):
     return await asyncio.get_event_loop().run_in_executor(executor, _infer_image_sync, req)
 
 
+def _vlm_spec(req: InferRequest) -> dict:
+    """Build a make_backend spec from the request, choosing the right encoder.
+
+    vlm_text_encoder takes precedence over clip_text_encoder for the legacy
+    CLIP field name.
+    """
+    return {
+        "backend": req.backend,
+        "model_path": req.model_path,
+        "text_encoder": req.vlm_text_encoder or req.clip_text_encoder,
+        "model_id": req.model_id,
+        "endpoint_url": req.endpoint_url,
+        "api_key": req.api_key,
+    }
+
+
+def _infer_image_vlm(req: InferRequest):
+    """Single-image VLM path. Validates paths up front, then dispatches to the
+    selected backend. Reached when model_type resolves to 'vlm'.
+    """
+    from core.vlm_inference import make_backend
+    backend_name = (req.backend or "clip").lower()
+    # Path safety FIRST — before any imread/session — and use the safe paths.
+    try:
+        safe_img = safe_image_file(req.image_path) if req.image_path else None
+        # Only the clip backend points model_path/text_encoder at local ONNX
+        # files; transformers uses an HF id, openai uses an HTTP endpoint.
+        if backend_name == "clip":
+            safe_model_file(req.model_path)
+            text_encoder = req.vlm_text_encoder or req.clip_text_encoder
+            if text_encoder:
+                safe_model_file(text_encoder)
+    except Exception as e:
+        return {"error": f"Invalid path: {e}"}
+
+    if not safe_img:
+        return {"error": "image_path is required for VLM inference"}
+    frame = imread(safe_img)
+    if frame is None:
+        return {"error": "Cannot read image"}
+
+    t0 = _time.perf_counter()
+    try:
+        backend = make_backend(_vlm_spec(req))
+        task = (req.vlm_task or "caption").lower()
+        prompt = req.vlm_prompt or ""
+        if task == "vqa":
+            cands = [c for c in (req.vlm_candidates or "").split(",") if c.strip()]
+            text_result = backend.answer(frame, prompt, candidates=cands or None,
+                                         max_new_tokens=req.max_new_tokens,
+                                         temperature=req.temperature)
+            overlay = f"A: {text_result[:60]}"
+        else:  # caption / grounding (grounding falls back to caption)
+            text_result = backend.describe(frame, prompt,
+                                           max_new_tokens=req.max_new_tokens,
+                                           temperature=req.temperature)
+            overlay = text_result[:80]
+    except Exception as e:
+        return {"error": f"VLM inference failed: {e}"}
+    infer_ms = (_time.perf_counter() - t0) * 1000
+    vis = frame.copy()
+    cv2.putText(vis, overlay, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return {"image": base64.b64encode(buf).decode(), "detections": 0,
+            "vlm_result": text_result, "vlm_task": task,
+            "infer_ms": round(infer_ms, 2), "classes": {}}
+
+
 def _infer_image_sync(req: InferRequest):
     try:
         cfg = AppConfig()
-        model = ensure_model(req.model_path, cfg.model_type, cfg)
+        # Per-request model_type wins over the global cfg default; the VLM tab
+        # sends 'vlm' so we route to the VLM path instead of detection.
+        model_type = req.model_type or cfg.model_type
+        if model_type == "vlm":
+            return _infer_image_vlm(req)
+        model = ensure_model(req.model_path, model_type, cfg)
         frame = imread(req.image_path)
         if frame is None:
             return {"error": "Cannot read image"}
@@ -246,39 +336,9 @@ def _infer_image_sync(req: InferRequest):
                         "infer_ms": round(infer_ms, 2), "classes": {}}
 
         if model.task_type == "vlm":
-            from core.vlm_inference import get_backend
-            t0 = _time.perf_counter()
-            text_encoder = req.vlm_text_encoder or req.clip_text_encoder
-            # Path safety: VLM endpoints accept user-supplied encoder paths.
-            try:
-                safe_model_file(req.model_path)
-                if text_encoder:
-                    safe_model_file(text_encoder)
-                if req.image_path:
-                    safe_image_file(req.image_path)
-            except Exception as e:
-                return {"error": f"Invalid path: {e}"}
-            try:
-                backend = get_backend(req.model_path, text_encoder=text_encoder)
-                task = (req.vlm_task or "caption").lower()
-                prompt = req.vlm_prompt or ""
-                if task == "vqa":
-                    cands = [c for c in (req.vlm_candidates or "").split(",") if c.strip()]
-                    text_result = backend.vqa(frame, prompt, candidates=cands or None)
-                    overlay = f"A: {text_result[:60]}"
-                else:  # caption / grounding (grounding falls back to caption in v1)
-                    text_result = backend.caption(frame, hint=prompt or None)
-                    overlay = text_result[:80]
-            except Exception as e:
-                return {"error": f"VLM inference failed: {e}"}
-            infer_ms = (_time.perf_counter() - t0) * 1000
-            vis = frame.copy()
-            cv2.putText(vis, overlay, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            return {"image": base64.b64encode(buf).decode(), "detections": 0,
-                    "vlm_result": text_result,
-                    "vlm_task": task,
-                    "infer_ms": round(infer_ms, 2), "classes": {}}
+            # ONNX model auto-detected as VLM but the request omitted
+            # model_type='vlm'; route through the unified backend path.
+            return _infer_image_vlm(req)
 
         if model.task_type == "classification":
             result = run_classification(model, frame)
@@ -345,29 +405,48 @@ async def vlm_batch(req: VLMBatchRequest):
     """
     if vlm_state.get("running"):
         return {"error": "VLM batch already running", "code": "VLM_BUSY"}
-    model_path = safe_model_file(req.model_path)
-    text_encoder = safe_model_file(req.text_encoder)
+    backend_name = (req.backend or "clip").lower()
+    # Path safety: only the clip backend reads local ONNX files; transformers
+    # uses an HF id and openai an HTTP endpoint.
+    model_path = req.model_path
+    text_encoder = req.text_encoder
+    if backend_name == "clip":
+        model_path = safe_model_file(req.model_path)
+        if not req.text_encoder:
+            return {"error": "clip backend requires text_encoder", "code": "VLM_CONFIG"}
+        text_encoder = safe_model_file(req.text_encoder)
     img_dir = safe_image_dir(req.img_dir)
     imgs = glob_images(img_dir)
     if not imgs:
         return {"error": "No images found", "code": "EMPTY_DIR"}
     imgs = imgs[: max(1, min(req.max_images, 500))]
 
+    spec = {
+        "backend": backend_name,
+        "model_path": model_path,
+        "text_encoder": text_encoder,
+        "model_id": req.model_id,
+        "endpoint_url": req.endpoint_url,
+        "api_key": req.api_key,
+    }
     vlm_state.update(running=True, progress=0, total=len(imgs), msg="Starting...", results=[])
 
     @route_errors(state=vlm_state, scope="vlm")
     def _run():
-        from core.vlm_inference import get_backend
+        from core.vlm_inference import make_backend
         from core.run_record import RunRecorder
         from core.paths import tmp_dir
         out_dir = tmp_dir("vlm")
+        # NOTE: api_key is intentionally excluded from the run record inputs.
         with RunRecorder(run_type="vlm_batch", output_dir=out_dir,
-                         inputs={"task": req.task, "prompt": req.prompt,
-                                 "candidates": req.candidates,
+                         inputs={"backend": backend_name, "task": req.task,
+                                 "prompt": req.prompt, "candidates": req.candidates,
+                                 "model_id": req.model_id,
+                                 "endpoint_url": req.endpoint_url,
                                  "img_dir": img_dir, "max_images": len(imgs)},
-                         model_path=model_path) as rec:
+                         model_path=model_path if backend_name == "clip" else None) as rec:
             vlm_state["trace_id"] = rec.trace_id
-            backend = get_backend(model_path, text_encoder=text_encoder)
+            backend = make_backend(spec)
             task = (req.task or "caption").lower()
             cands = [c for c in (req.candidates or "").split(",") if c.strip()]
             results = []
@@ -383,9 +462,13 @@ async def vlm_batch(req: VLMBatchRequest):
                 t0 = _time.perf_counter()
                 try:
                     if task == "vqa":
-                        text = backend.vqa(frame, req.prompt or "", candidates=cands or None)
+                        text = backend.answer(frame, req.prompt or "", candidates=cands or None,
+                                              max_new_tokens=req.max_new_tokens,
+                                              temperature=req.temperature)
                     else:
-                        text = backend.caption(frame, hint=req.prompt or None)
+                        text = backend.describe(frame, req.prompt or "",
+                                                max_new_tokens=req.max_new_tokens,
+                                                temperature=req.temperature)
                 except Exception as e:
                     text = f"(error: {e})"
                 ms = round((_time.perf_counter() - t0) * 1000, 1)
@@ -397,6 +480,23 @@ async def vlm_batch(req: VLMBatchRequest):
 
     executor.submit(_run)
     return {"ok": True, "total": len(imgs)}
+
+
+@router.get("/api/vlm/backends")
+async def vlm_backends():
+    """List available VLM backends so the UI can grey out missing deps.
+
+    `cuda` reports whether the transformers backend can run on GPU; guarded
+    because torch is an optional dependency.
+    """
+    from core.vlm_inference import list_backends
+    cuda = False
+    try:
+        import torch
+        cuda = bool(torch.cuda.is_available())
+    except Exception:
+        cuda = False
+    return {"backends": list_backends(), "cuda": cuda}
 
 
 @router.get("/api/vlm/status")

@@ -49,6 +49,8 @@ class ProfileResult:
     estimated_int8_speedup: float = 1.0
     input_info: list[dict] = field(default_factory=list)
     output_info: list[dict] = field(default_factory=list)
+    provider: str = "CPUExecutionProvider"
+    flops_approximate: bool = False
 
 
 # ── Helpers ─────────────────────────────────────────────
@@ -90,12 +92,14 @@ def _build_dummy_feed(sess) -> dict:
     return feed
 
 
-def _get_layer_profiles(path: str, input_feed: dict) -> list[LayerProfile]:
+def _get_layer_profiles(path: str, input_feed: dict, providers=None) -> list[LayerProfile]:
     try:
         opts = ort.SessionOptions()
         opts.enable_profiling = True
         opts.profile_file_prefix = os.path.join(tempfile.gettempdir(), "ssook_prof")
-        sess = ort.InferenceSession(path, sess_options=opts, providers=["CPUExecutionProvider"])
+        sess = ort.InferenceSession(
+            path, sess_options=opts,
+            providers=providers or ["CPUExecutionProvider"])
         sess.run(None, input_feed)
         prof_file = sess.end_profiling()
         import json
@@ -135,7 +139,7 @@ def _analyze_graph(path: str, layer_profiles: list[LayerProfile]):
         from onnx import numpy_helper, TensorProto
         model = onnx.load(path, load_external_data=False)
     except Exception:
-        return {}, [], 0, 0.0, 0.0, 0, [], [], [], 0.0, [], 1.0
+        return {}, [], 0, 0.0, 0.0, 0, [], [], [], 0.0, [], 1.0, False
 
     graph = model.graph
 
@@ -191,6 +195,9 @@ def _analyze_graph(path: str, layer_profiles: list[LayerProfile]):
     total_op_count = 0
     diagnosis = []
     suggestions = set()
+    # True when any FLOP estimate fell back to an assumed output size (shape
+    # inference could not resolve it) — the total is then a rough estimate.
+    flops_approximate = False
 
     for node in graph.node:
         op = node.op_type
@@ -218,45 +225,58 @@ def _analyze_graph(path: str, layer_profiles: list[LayerProfile]):
                         "Softmax", "Dropout", "Identity", "Shape", "Cast", "ConstantOfShape", "Constant"}:
             non_quant_ops.add(op)
 
-        # FLOPs estimation
-        node_flops = 0
+        # FLOPs estimation. We compute MACs (multiply-accumulates) first and
+        # derive FLOPs = 2 * MACs. When the output spatial size has to be
+        # guessed (shape inference failed), the count is approximate.
+        node_macs = 0
         if op == "Conv" and len(node.input) >= 2 and node.input[1] in shape_map:
             w = shape_map[node.input[1]]
             if len(w) == 4:
-                out_shape = vi_shapes.get(node.output[0], [1, w[0], 56, 56])
-                h_out = out_shape[2] if len(out_shape) > 2 else 56
-                w_out = out_shape[3] if len(out_shape) > 3 else 56
-                # groups
+                out_shape = vi_shapes.get(node.output[0])
+                if out_shape is None or len(out_shape) < 4:
+                    out_shape = [1, w[0], 56, 56]
+                    flops_approximate = True
+                h_out = out_shape[2]
+                w_out = out_shape[3]
+                # group affects MACs; dilation/stride affect the output size
+                # (already captured by inferred out_shape) not the per-output cost.
                 groups = 1
                 for attr in node.attribute:
-                    if attr.name == "group": groups = attr.i
+                    if attr.name == "group":
+                        groups = attr.i
                 cin_per_g = w[1]
-                node_flops = 2 * w[0] * cin_per_g * w[2] * w[3] * h_out * w_out
-                # Bias
-                if len(node.input) >= 3 and node.input[2]:
-                    node_flops += w[0] * h_out * w_out
+                node_macs = (w[0] * cin_per_g * w[2] * w[3] * h_out * w_out) // max(groups, 1)
         elif op == "ConvTranspose" and len(node.input) >= 2 and node.input[1] in shape_map:
             w = shape_map[node.input[1]]
             if len(w) == 4:
-                out_shape = vi_shapes.get(node.output[0], [1, w[1], 112, 112])
-                h_out = out_shape[2] if len(out_shape) > 2 else 112
-                w_out = out_shape[3] if len(out_shape) > 3 else 112
-                node_flops = 2 * w[0] * w[1] * w[2] * w[3] * h_out * w_out
+                out_shape = vi_shapes.get(node.output[0])
+                if out_shape is None or len(out_shape) < 4:
+                    out_shape = [1, w[1], 112, 112]
+                    flops_approximate = True
+                h_out = out_shape[2]
+                w_out = out_shape[3]
+                node_macs = w[0] * w[1] * w[2] * w[3] * h_out * w_out
         elif op in ("MatMul", "Gemm") and len(node.input) >= 2 and node.input[1] in shape_map:
             w = shape_map[node.input[1]]
-            if len(w) == 2:
-                # For MatMul: (M,K)x(K,N) -> 2*M*K*N; use batch=1 if no info
-                inp_shape = vi_shapes.get(node.input[0], [1, w[0]])
-                m = inp_shape[-2] if len(inp_shape) >= 2 else 1
-                node_flops = 2 * m * w[0] * w[1]
+            if len(w) >= 2:
+                # (…, M, K) x (K, N) -> M*K*N MACs. M from the activation shape;
+                # if it is dynamic/unknown we assume 1 and flag approximate.
+                inp_shape = vi_shapes.get(node.input[0])
+                if inp_shape and len(inp_shape) >= 2:
+                    m = inp_shape[-2]
+                else:
+                    m = 1
+                    flops_approximate = True
+                k, n = w[-2], w[-1]
+                node_macs = m * k * n
         elif op == "BatchNormalization":
-            out_shape = vi_shapes.get(node.output[0], [])
+            out_shape = vi_shapes.get(node.output[0])
             if out_shape:
                 elems = 1
                 for d in out_shape: elems *= d
-                node_flops = 4 * elems  # mean, var, normalize, scale+shift
+                node_macs = 2 * elems  # ~2 MACs/elem (normalize, scale+shift)
 
-        node_macs = node_flops // 2
+        node_flops = 2 * node_macs
         total_flops += node_flops
         total_macs += node_macs
 
@@ -355,14 +375,38 @@ def _analyze_graph(path: str, layer_profiles: list[LayerProfile]):
         op_summary, flops_per_layer, depth,
         weight_bytes / 1024 / 1024, peak_act_bytes / 1024 / 1024,
         total_flops, total_macs, diagnosis, sorted(suggestions),
-        q_ratio, sorted(non_quant_ops), est_speedup,
+        q_ratio, sorted(non_quant_ops), est_speedup, flops_approximate,
     )
 
 
 # ── Main profiler ───────────────────────────────────────
 
-def profile_model(path: str, num_runs: int = 20, warmup: int = 3) -> ProfileResult:
-    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+def _resolve_providers(provider):
+    """Map a provider request to an ORT providers list.
+
+    None / "auto" → the app's auto-EP (GPU-first, matching deployment).
+    A provider name string → [that EP, CPU fallback]. A list → used as-is.
+    """
+    if provider is None or provider == "auto":
+        try:
+            from core.model_loader import _build_providers
+            return _build_providers()
+        except Exception:
+            return ["CPUExecutionProvider"]
+    if isinstance(provider, str):
+        if provider == "CPUExecutionProvider":
+            return ["CPUExecutionProvider"]
+        return [provider, "CPUExecutionProvider"]
+    return list(provider)
+
+
+def profile_model(path: str, num_runs: int = 50, warmup: int = 10,
+                  provider=None) -> ProfileResult:
+    # Profiling CPU-only gives meaningless numbers for GPU deployments; default
+    # to the app auto-EP so latency reflects how the model actually runs.
+    providers = _resolve_providers(provider)
+    sess = ort.InferenceSession(path, providers=providers)
+    chosen_provider = sess.get_providers()[0] if sess.get_providers() else "CPUExecutionProvider"
     input_feed = _build_dummy_feed(sess)
 
     # Input/output info
@@ -383,8 +427,8 @@ def profile_model(path: str, num_runs: int = 20, warmup: int = 3) -> ProfileResu
         latencies.append((time.perf_counter() - t0) * 1000.0)
     latencies = np.array(latencies)
 
-    # Layer profiling
-    layers = _get_layer_profiles(path, input_feed)
+    # Layer profiling — same providers so per-layer timings match the run above.
+    layers = _get_layer_profiles(path, input_feed, providers=providers)
     layers.sort(key=lambda x: x.duration_us, reverse=True)
 
     # Count params
@@ -402,7 +446,7 @@ def profile_model(path: str, num_runs: int = 20, warmup: int = 3) -> ProfileResu
     # Extended analysis
     (op_summary, flops_per_layer, depth,
      weight_mb, peak_act_mb, total_flops, total_macs,
-     diagnosis, suggestions, q_ratio, non_q_ops, est_speedup,
+     diagnosis, suggestions, q_ratio, non_q_ops, est_speedup, flops_approximate,
     ) = _analyze_graph(path, layers)
 
     return ProfileResult(
@@ -434,6 +478,8 @@ def profile_model(path: str, num_runs: int = 20, warmup: int = 3) -> ProfileResu
         estimated_int8_speedup=round(est_speedup, 1),
         input_info=input_info,
         output_info=output_info,
+        provider=chosen_provider,
+        flops_approximate=flops_approximate,
     )
 
 
@@ -449,6 +495,8 @@ def profile_to_dict(result: ProfileResult) -> dict:
         "num_runs": result.num_runs,
         "num_parameters": result.num_parameters,
         "estimated_flops": result.estimated_flops,
+        "flops_approximate": result.flops_approximate,
+        "provider": result.provider,
         "peak_memory_mb": result.peak_memory_mb,
         "top_bottlenecks": [
             {"name": l.name, "op_type": l.op_type, "duration_us": round(l.duration_us, 1)}

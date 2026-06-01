@@ -15,12 +15,28 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from core import paths
 
 log = logging.getLogger("ssook.model_cache")
+
+# Per-key locks so two concurrent inspects of the same model compute once
+# instead of both missing the cache, both running the expensive EP probe, and
+# racing each other's JSON write. The guard protects the lock registry itself.
+_key_locks: dict[str, threading.Lock] = {}
+_key_locks_guard = threading.Lock()
+
+
+def _lock_for(key: str) -> threading.Lock:
+    with _key_locks_guard:
+        lk = _key_locks.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _key_locks[key] = lk
+        return lk
 
 
 def _fingerprint(path: str) -> Optional[tuple[int, int]]:
@@ -48,19 +64,50 @@ def get_or_compute(path: str, compute: Callable[[str], dict]) -> dict:
     if not path or not os.path.isfile(path):
         return compute(path)  # let downstream raise the right error
     cp = _cache_path(path)
-    if cp.exists():
+
+    def _read() -> Optional[dict]:
+        if not cp.exists():
+            return None
         try:
             with cp.open("r", encoding="utf-8") as f:
                 return json.load(f)
         except (OSError, json.JSONDecodeError) as e:
             log.debug("cache read failed for %s: %s — recomputing", path, e)
-    data = compute(path)
+            return None
+
+    # Fast path: a complete, valid cache file (no lock needed for hits).
+    cached = _read()
+    if cached is not None:
+        return cached
+
+    # Miss — serialise per key so identical concurrent inspects compute once.
+    with _lock_for(cp.name):
+        cached = _read()  # another thread may have filled it while we waited
+        if cached is not None:
+            return cached
+        data = compute(path)
+        _atomic_write(cp, data)
+        return data
+
+
+def _atomic_write(cp: Path, data: dict) -> None:
+    """Write JSON to a temp file in the same dir then os.replace (atomic).
+
+    A reader never sees a half-written file: os.replace is atomic on the same
+    filesystem, so concurrent readers get either the old file or the new one.
+    """
+    tmp = cp.with_name(f"{cp.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        with cp.open("w", encoding="utf-8") as f:
+        with tmp.open("w", encoding="utf-8") as f:
             json.dump(_json_safe(data), f, ensure_ascii=False, indent=2)
+        os.replace(tmp, cp)
     except (OSError, TypeError) as e:
-        log.debug("cache write failed for %s: %s", path, e)
-    return data
+        log.debug("cache write failed for %s: %s", cp, e)
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def _json_safe(obj: Any) -> Any:

@@ -8,11 +8,21 @@ from pydantic import BaseModel
 from typing import Optional
 
 from server.errors import route_errors
-from server.path_safety import safe_image_dir
+from server.path_safety import safe_image_dir, safe_label_dir, safe_image_file
 from server.state import anomaly_state, quality_state, dup_state, leaky_state, sim_state, executor
 from server.utils import imread, glob_images
 
 router = APIRouter()
+
+
+# ── Result caps ─────────────────────────────────────────
+# Workers store at most CAP rows to keep status payloads (polled every
+# second) small; the UI surfaces a "showing first N" note when the true
+# count exceeds the cap so users never mistake a truncated view for the
+# whole dataset (QUAL-09).
+ANOMALY_CAP = 1000
+QUALITY_CAP = 1000
+DUP_CAP = 500
 
 
 # ── Shared Pydantic shapes ──────────────────────────────
@@ -22,6 +32,15 @@ class QualityDirRequest(BaseModel):
     recursive: bool = False
     threshold: Optional[int] = None
     metrics: Optional[list[str]] = None
+    # Image-quality knobs (QUAL-12). Defaults reproduce the previous
+    # hardcoded behaviour exactly; `threshold` doubles as the blur cutoff
+    # so the existing UI field finally does something.
+    blur_threshold: Optional[float] = None
+    dark_threshold: float = 40.0
+    bright_threshold: float = 220.0
+    entropy_threshold: float = 3.0
+    aspect_min: float = 0.25
+    aspect_max: float = 4.0
 
 
 class LeakyRequest(BaseModel):
@@ -47,7 +66,10 @@ async def quality_anomaly(req: QualityDirRequest):
     if anomaly_state["running"]:
         return {"error": "Already running"}
     img_dir = safe_image_dir(req.img_dir)
-    label_dir = req.label_dir
+    # Validate label_dir at the boundary too — it feeds open() below, so a
+    # raw path would let a crafted request read arbitrary <stem>.txt files
+    # outside the path-safety surface (QUAL-07).
+    label_dir = safe_label_dir(req.label_dir) if req.label_dir else ""
     recursive = req.recursive
     anomaly_state.update(running=True, progress=0, total=0, msg="Scanning...", results=[])
 
@@ -85,8 +107,15 @@ async def quality_anomaly(req: QualityDirRequest):
                                             "details": f"L{ln+1}: cls={parts[0]} cx={cx:.3f} cy={cy:.3f} w={bw:.3f} h={bh:.3f}",
                                             "severity": "High" if "Out-of-bounds" in issues else "Medium"})
             anomaly_state["progress"] = i + 1
-        anomaly_state["results"] = results[:1000]
-        anomaly_state.update(running=False, msg=f"Complete — {len(results)} issues found")
+        total_found = len(results)
+        truncated = total_found > ANOMALY_CAP
+        anomaly_state["results"] = results[:ANOMALY_CAP]
+        anomaly_state["truncated"] = truncated
+        anomaly_state["total_found"] = total_found
+        msg = f"Complete — {total_found} issues found"
+        if truncated:
+            msg += f" (showing first {ANOMALY_CAP})"
+        anomaly_state.update(running=False, msg=msg)
 
     executor.submit(_run)
     return {"ok": True}
@@ -104,6 +133,14 @@ async def quality_check(req: QualityDirRequest):
         return {"error": "Already running"}
     img_dir = safe_image_dir(req.img_dir)
     recursive = req.recursive
+    # `threshold` is the legacy UI field; treat it as the blur cutoff so it
+    # finally has an effect, falling back to the original default (QUAL-12).
+    blur_threshold = float(req.blur_threshold if req.blur_threshold is not None
+                           else (req.threshold if req.threshold is not None else 50.0))
+    dark_threshold = req.dark_threshold
+    bright_threshold = req.bright_threshold
+    entropy_threshold = req.entropy_threshold
+    aspect_min, aspect_max = req.aspect_min, req.aspect_max
     quality_state.update(running=True, progress=0, total=0, msg="Checking...", results=[])
 
     @route_errors(state=quality_state, scope="quality")
@@ -111,34 +148,53 @@ async def quality_check(req: QualityDirRequest):
         imgs = glob_images(img_dir, recursive=recursive)
         quality_state["total"] = len(imgs)
         results = []
+        skipped = 0
         for i, fp in enumerate(imgs):
             if not quality_state.get("running", True):
                 quality_state.update(msg="Stopped by user")
                 break
             frame = imread(fp)
             if frame is None:
+                skipped += 1
                 quality_state["progress"] = i + 1
                 continue
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             blur = round(cv2.Laplacian(gray, cv2.CV_64F).var(), 2)
             brightness = round(float(gray.mean()), 2)
-            entropy = round(float(-np.sum(np.histogram(gray, 256, [0,256])[0]/gray.size * np.log2(np.histogram(gray, 256, [0,256])[0]/gray.size + 1e-12))), 2)
+            # Single histogram pass — the previous code computed it twice
+            # (QUAL-11). p is the per-bin probability; 1e-12 guards log2(0).
+            hist = np.histogram(gray, 256, [0, 256])[0] / gray.size
+            entropy = round(float(-np.sum(hist * np.log2(hist + 1e-12))), 2)
             h, w = frame.shape[:2]
             aspect = round(w / h, 2)
             issues = []
-            if blur < 50:
+            if blur < blur_threshold:
                 issues.append("Blurry")
-            if brightness < 40:
+            if brightness < dark_threshold:
                 issues.append("Dark")
-            elif brightness > 220:
+            elif brightness > bright_threshold:
                 issues.append("Overexposed")
-            if aspect > 4 or aspect < 0.25:
+            # Low entropy ⇒ flat/featureless frame (was computed but unused).
+            # Machine code drives the i18n key quality.low_detail.
+            if entropy < entropy_threshold:
+                issues.append("low_detail")
+            if aspect > aspect_max or aspect < aspect_min:
                 issues.append("Odd aspect")
             results.append({"file": os.path.basename(fp), "blur": blur, "brightness": brightness,
                             "entropy": entropy, "aspect": aspect, "issues": ", ".join(issues) or "OK"})
             quality_state["progress"] = i + 1
-        quality_state["results"] = results[:1000]
-        quality_state.update(running=False, msg=f"Complete — {len(results)} images checked")
+        total_found = len(results)
+        truncated = total_found > QUALITY_CAP
+        quality_state["results"] = results[:QUALITY_CAP]
+        quality_state["truncated"] = truncated
+        quality_state["total_found"] = total_found
+        quality_state["skipped"] = skipped
+        msg = f"Complete — {total_found} images checked"
+        if skipped:
+            msg += f", {skipped} unreadable skipped"
+        if truncated:
+            msg += f" (showing first {QUALITY_CAP})"
+        quality_state.update(running=False, msg=msg)
 
     executor.submit(_run)
     return {"ok": True}
@@ -151,7 +207,12 @@ async def quality_status():
 # ── Quality: Near-Duplicate Detector API ───────────────
 # Use the canonical hash from core.hashing so merger and duplicate detector
 # agree on what "duplicate" means.
-from core.hashing import compute_dhash as _core_dhash, hamming as _core_hamming
+from core.hashing import (
+    compute_dhash as _core_dhash,
+    hamming as _core_hamming,
+    find_near_duplicates as _find_near_duplicates,
+    cluster_near_duplicates as _cluster_near_duplicates,
+)
 
 
 def _dhash(img, size=8):
@@ -170,30 +231,40 @@ async def quality_duplicate(req: QualityDirRequest):
     def _run():
         imgs = glob_images(img_dir, recursive=recursive)
         dup_state["total"] = len(imgs)
-        hashes = []
+        names: list[str] = []
+        hashes: list[int] = []
+        skipped = 0
         for i, fp in enumerate(imgs):
             if not dup_state.get("running", True):
                 dup_state.update(msg="Stopped by user")
                 break
             frame = imread(fp)
-            if frame is not None:
-                hashes.append((os.path.basename(fp), _dhash(frame)))
+            if frame is None:
+                skipped += 1
+            else:
+                names.append(os.path.basename(fp))
+                hashes.append(_dhash(frame))
             dup_state["progress"] = i + 1
         dup_state["msg"] = "Comparing..."
-        results = []
-        group = 1
-        for i in range(len(hashes)):
-            for j in range(i+1, len(hashes)):
-                dist = _core_hamming(hashes[i][1], hashes[j][1])
-                if dist <= threshold:
-                    results.append({"group": group, "image_a": hashes[i][0], "image_b": hashes[j][0], "distance": dist})
-                    group += 1
-                if len(results) >= 500:
-                    break
-            if len(results) >= 500:
-                break
+        # Group ids over connected components so A~B~C cluster under ONE id
+        # instead of a per-pair counter that never expressed clusters (QUAL-05).
+        groups = _cluster_near_duplicates(hashes, threshold)
+        pairs = _find_near_duplicates(hashes, threshold)
+        results = [{"group": groups[i], "image_a": names[i], "image_b": names[j],
+                    "distance": _core_hamming(hashes[i], hashes[j])}
+                   for i, j in pairs[:DUP_CAP]]
+        total_found = len(pairs)
+        truncated = total_found > DUP_CAP
         dup_state["results"] = results
-        dup_state.update(running=False, msg=f"Complete — {len(results)} pairs found")
+        dup_state["truncated"] = truncated
+        dup_state["total_found"] = total_found
+        dup_state["skipped"] = skipped
+        msg = f"Complete — {total_found} pairs found"
+        if skipped:
+            msg += f", {skipped} unreadable skipped"
+        if truncated:
+            msg += f" (showing first {DUP_CAP})"
+        dup_state.update(running=False, msg=msg)
 
     executor.submit(_run)
     return {"ok": True}
@@ -219,13 +290,31 @@ async def quality_leaky(req: LeakyRequest):
 
     @route_errors(state=leaky_state, scope="leaky")
     def _run():
-        split_hashes = {}
-        for name, d in dirs.items():
-            if not d:
-                continue
-            imgs = glob_images(d)
-            split_hashes[name] = {os.path.basename(fp): _dhash(imread(fp)) for fp in imgs if imread(fp) is not None}
-        leaky_state["total"] = sum(len(v) for v in split_hashes.values())
+        # Glob every split up front so the progress bar has a real `total`
+        # before hashing starts (was set only afterwards → bar stuck at 0%).
+        split_files = {name: glob_images(d) for name, d in dirs.items() if d}
+        leaky_state["total"] = sum(len(v) for v in split_files.values())
+        done = 0
+        skipped = 0
+        split_hashes: dict[str, dict[str, int]] = {}
+        for name, imgs in split_files.items():
+            hashes: dict[str, int] = {}
+            for fp in imgs:
+                if not leaky_state.get("running", True):
+                    leaky_state.update(msg="Stopped by user")
+                    break
+                # Decode once — the old comprehension called imread twice
+                # (filter + hash), doubling disk I/O and decode cost (QUAL-03).
+                frame = imread(fp)
+                if frame is None:
+                    skipped += 1
+                else:
+                    hashes[os.path.basename(fp)] = _dhash(frame)
+                done += 1
+                leaky_state["progress"] = done
+            split_hashes[name] = hashes
+            if not leaky_state.get("running", True):
+                break
         results = []
         names = list(split_hashes.keys())
         for i in range(len(names)):
@@ -234,8 +323,6 @@ async def quality_leaky(req: LeakyRequest):
                 files = []
                 for fa, ha in split_hashes[names[i]].items():
                     for fb, hb in split_hashes[names[j]].items():
-                        if ha is None or hb is None:
-                            continue
                         dist = _core_hamming(ha, hb)
                         if dist <= threshold:
                             dupes += 1
@@ -243,7 +330,11 @@ async def quality_leaky(req: LeakyRequest):
                                 files.append(f"{fa} ↔ {fb}")
                 results.append({"pair": f"{names[i]} ↔ {names[j]}", "duplicates": dupes, "files": "; ".join(files)})
         leaky_state["results"] = results
-        leaky_state.update(running=False, msg="Complete")
+        leaky_state["skipped"] = skipped
+        msg = "Complete"
+        if skipped:
+            msg += f" — {skipped} unreadable skipped"
+        leaky_state.update(running=False, msg=msg)
 
     executor.submit(_run)
     return {"ok": True}
@@ -255,36 +346,68 @@ async def leaky_status():
 
 # ── Quality: Similarity Search API ─────────────────────
 
+# Similarity hashes at the project-wide 64-bit width (QUAL-02). The previous
+# 256-bit (size=16) put it in a different threshold space from every other tool.
+_SIM_HASH_SIZE = 8
+
+
 @router.post("/api/quality/similarity")
 async def quality_similarity(req: SimRequest):
     if sim_state["running"]:
         return {"error": "Already running"}
     img_dir = safe_image_dir(req.img_dir)
-    query = req.query_path or ""
+    # Validate the query at the boundary — must_exist + image extension —
+    # now that the frontend actually sends query_path (QUAL-01/QUAL-08).
+    query = safe_image_file(req.query_path) if req.query_path else ""
     top_k = int(req.top_k)
+    recursive = req.recursive
     sim_state.update(running=True, progress=0, total=0, msg="Building index...", results=[])
 
     @route_errors(state=sim_state, scope="similarity")
     def _run():
-        imgs = glob_images(img_dir, recursive=req.recursive)
-        sim_state["total"] = len(imgs)
-        hashes = []
-        for i, fp in enumerate(imgs):
-            if not sim_state.get("running", True):
-                sim_state.update(msg="Stopped by user")
-                break
-            frame = imread(fp)
-            if frame is not None:
-                hashes.append((os.path.basename(fp), _dhash(frame, 16)))
-            sim_state["progress"] = i + 1
-        if query and os.path.isfile(query):
+        # Reuse the cached hash list when the corpus (dir, recursion, width)
+        # is unchanged so repeat queries against the same folder skip the
+        # full re-glob + re-decode (QUAL-04). Invalidated when the key differs.
+        cache_key = (img_dir, recursive, _SIM_HASH_SIZE)
+        cached = sim_state.get("index")
+        if cached and cached.get("key") == cache_key:
+            hashes = cached["hashes"]
+            skipped = cached.get("skipped", 0)
+            sim_state["total"] = len(hashes)
+            sim_state["progress"] = len(hashes)
+        else:
+            imgs = glob_images(img_dir, recursive=recursive)
+            sim_state["total"] = len(imgs)
+            hashes = []
+            skipped = 0
+            for i, fp in enumerate(imgs):
+                if not sim_state.get("running", True):
+                    sim_state.update(msg="Stopped by user")
+                    return
+                frame = imread(fp)
+                if frame is None:
+                    skipped += 1
+                else:
+                    hashes.append((os.path.basename(fp), _dhash(frame, _SIM_HASH_SIZE)))
+                sim_state["progress"] = i + 1
+            sim_state["index"] = {"key": cache_key, "hashes": hashes, "skipped": skipped}
+
+        if query:
             q_frame = imread(query)
-            q_hash = _dhash(q_frame, 16) if q_frame is not None else 0
+            if q_frame is None:
+                # No silent q_hash=0 fallback — that ranked every image by
+                # distance-to-zero and looked like a real result (QUAL-10).
+                sim_state.update(running=False, msg="Error: query image could not be decoded")
+                return
+            q_hash = _dhash(q_frame, _SIM_HASH_SIZE)
             ranked = sorted(hashes, key=lambda x: _core_hamming(x[1], q_hash))
             sim_state["results"] = [{"rank": i+1, "image": name, "distance": _core_hamming(h, q_hash)} for i, (name, h) in enumerate(ranked[:top_k])]
         else:
             sim_state["results"] = [{"rank": i+1, "image": name, "distance": 0} for i, (name, _) in enumerate(hashes[:top_k])]
-        sim_state.update(running=False, msg="Complete")
+        msg = "Complete"
+        if skipped:
+            msg += f" — {skipped} unreadable skipped"
+        sim_state.update(running=False, msg=msg)
 
     executor.submit(_run)
     return {"ok": True}

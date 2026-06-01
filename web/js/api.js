@@ -83,6 +83,11 @@ const API = {
   findPartner:     (path) => API.post('/api/model/find-partner', { path }),
   vlmBatch:        (params) => API.post('/api/vlm/batch', params),
   vlmStatus:       () => API.get('/api/vlm/status'),
+  vlmBackends:     () => API.get('/api/vlm/backends'),
+
+  // Cooperative cancel for long-running tasks. Data/analysis Stop buttons call this
+  // with the task id (e.g. 'compare', 'merger') matching the backend TaskState key.
+  forceStop:       (task) => API.post('/api/force-stop/' + encodeURIComponent(task), {}),
 
   // Class catalog
   classCatalogs:   () => API.get('/api/classes/catalog'),

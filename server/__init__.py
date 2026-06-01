@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="ssook", version="1.5.3", lifespan=lifespan)
+app = FastAPI(title="ssook", version="1.6.0", lifespan=lifespan)
 
 # Install global exception handlers (envelope + trace_id).
 from server.errors import install as _install_error_handlers

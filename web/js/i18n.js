@@ -11,6 +11,7 @@ const I18n = {
     'sec.batch':       { en: 'Batch',       ko: '일괄처리' },
     'sec.tasks':       { en: 'Tasks',       ko: '태스크' },
     'sec.tools':       { en: 'Tools',       ko: '도구' },
+    'sec.specialized': { en: 'Specialized', ko: '특화 기능' },
     // Nav items
     'nav.viewer':           { en: 'Viewer',            ko: '뷰어' },
     'nav.settings':         { en: 'Settings',          ko: '설정' },
@@ -79,6 +80,8 @@ const I18n = {
     'viewer.infer_stats':   { en: 'Inference', ko: '추론' },
     'viewer.csv_rec':       { en: 'CSV Record', ko: 'CSV 기록' },
     'viewer.csv_export':    { en: 'CSV Export', ko: 'CSV 저장' },
+    'viewer.vlm_unsupported': { en: 'VLM models are not supported in the viewer. Use the VLM tab.', ko: 'VLM 모델은 뷰어에서 지원되지 않습니다. VLM 탭을 사용하세요.' },
+    'viewer.stream_error':  { en: 'Stream error', ko: '스트림 오류' },
     // Settings
     'settings.model':       { en: 'Model',              ko: '모델' },
     'settings.display':     { en: 'Display',            ko: '표시' },
@@ -287,6 +290,9 @@ const I18n = {
     'stopped':              { en: 'Stopped',             ko: '중지됨' },
     // Evaluation extra
     'eval.gt_classmap':     { en: 'GT Class Mapping (id: name, one per line)', ko: 'GT 클래스 매핑 (id: name, 한 줄에 하나)' },
+    'eval.classmap':        { en: 'GT Class Map', ko: 'GT 클래스 매핑' },
+    'eval.classmap_help':   { en: 'Map GT class ids to names (id: name, one per line). Used to label per-class metrics.', ko: 'GT 클래스 id를 이름에 매핑합니다 (id: name, 한 줄에 하나). 클래스별 지표 표시에 사용됩니다.' },
+    'eval.cm_iou':          { en: 'Confusion Matrix IoU', ko: '혼동행렬 IoU' },
     'eval.csv_export':      { en: 'CSV Export',          ko: 'CSV 내보내기' },
     'eval.history':         { en: 'History',             ko: '이력' },
     'eval.add_one_model':   { en: 'Add at least one model', ko: '최소 하나의 모델을 추가하세요' },
@@ -314,6 +320,7 @@ const I18n = {
     'cmp.complete':         { en: 'Compare complete',    ko: '비교 완료' },
     'cmp.loading':          { en: 'Loading...',          ko: '로딩 중...' },
     'cmp.not_available':    { en: 'Image not available', ko: '이미지를 사용할 수 없음' },
+    'cmp.conf':             { en: 'Confidence Threshold', ko: '신뢰도 임계값' },
     // Error Analyzer
     'ea.title':             { en: 'FP/FN Analysis',      ko: 'FP/FN 분석' },
     'ea.iou_threshold':     { en: 'IoU Threshold',       ko: 'IoU 임계값' },
@@ -420,6 +427,7 @@ const I18n = {
     'aug.augmented':        { en: 'Augmented',           ko: '증강됨' },
     'aug.generating':       { en: 'Generating preview...', ko: '미리보기 생성 중...' },
     'aug.ready':            { en: 'Preview ready',       ko: '미리보기 준비 완료' },
+    'aug.preview_only':     { en: 'Preview only — augmentations are not written to disk.', ko: '미리보기 전용 — 증강 결과는 디스크에 저장되지 않습니다.' },
     // Notify
     'notify.title':         { en: 'Notifications',       ko: '알림' },
     'notify.none':          { en: 'No notifications',    ko: '알림이 없습니다' },
@@ -516,6 +524,8 @@ const I18n = {
     // Profiler
     'profiler.title':       { en: 'Model Profiler',      ko: '모델 프로파일러' },
     'profiler.num_runs':    { en: 'Number of Runs',      ko: '실행 횟수' },
+    'profiler.provider':    { en: 'Execution Provider',  ko: '실행 프로바이더' },
+    'profiler.warmup':      { en: 'Warmup Runs',         ko: '워밍업 횟수' },
     'profiler.run':         { en: 'Run Profiling',       ko: '프로파일링 실행' },
     'profiler.hint':        { en: 'Select an ONNX model to profile latency, FLOPs, and bottleneck layers', ko: 'ONNX 모델을 선택하여 지연시간, FLOPs, 병목 레이어를 프로파일링하세요' },
     'profiler.running':     { en: 'Profiling model...',  ko: '모델 프로파일링 중...' },
@@ -558,6 +568,16 @@ const I18n = {
     'vlm.err_model':        { en: 'Select a model (image encoder)', ko: '모델(이미지 인코더)을 선택하세요' },
     'vlm.err_text_encoder': { en: 'Select a CLIP text encoder', ko: 'CLIP 텍스트 인코더를 선택하세요' },
     'vlm.err_imgdir':       { en: 'Select an image directory', ko: '이미지 디렉터리를 선택하세요' },
+    'vlm.backend':          { en: 'Backend',               ko: '백엔드' },
+    'vlm.model_id':         { en: 'Model ID',              ko: '모델 ID' },
+    'vlm.endpoint':         { en: 'Endpoint URL',          ko: '엔드포인트 URL' },
+    'vlm.api_key':          { en: 'API Key',               ko: 'API 키' },
+    'vlm.max_new_tokens':   { en: 'Max New Tokens',        ko: '최대 생성 토큰' },
+    'vlm.temperature':      { en: 'Temperature',           ko: '온도' },
+    'vlm.max_images':       { en: 'Max Images',            ko: '최대 이미지 수' },
+    // Shared / misc
+    'results_truncated':    { en: 'Results truncated to {n} rows', ko: '결과가 {n}행으로 잘렸습니다' },
+    'quality.low_detail':   { en: 'Low detail',            ko: '낮은 디테일' },
   },
 
   t(key, params) {

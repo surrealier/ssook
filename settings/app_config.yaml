@@ -2,15 +2,24 @@ batch_size: 1
 box_thickness: 2
 class_styles:
   0:
-    color: null
+    color:
+    - 255
+    - 30
+    - 0
     enabled: true
     thickness: null
   1:
-    color: null
+    color:
+    - 0
+    - 0
+    - 255
     enabled: true
     thickness: null
   2:
-    color: null
+    color:
+    - 0
+    - 247
+    - 255
     enabled: true
     thickness: null
   3:
@@ -324,7 +333,7 @@ class_styles:
     color: null
     enabled: true
     thickness: null
-conf_threshold: 0.25
+conf_threshold: 0.1
 custom_model_types:
   custom_1:
     attr_roles:
@@ -342,7 +351,24 @@ custom_model_types:
     - conf_class7
     - conf_class8
     conf_threshold: 0.26
-    coord_format: xyxy
+    dim_roles:
+    - batch
+    - num_detections
+    - attributes
+    has_objectness: false
+    nms: true
+    output_index: 0
+  seq_rfdetr:
+    attr_roles:
+    - x_center
+    - y_center
+    - width
+    - height
+    class_names:
+      0: smoke
+      1: fire
+      2: falldown
+    conf_threshold: 0.25
     dim_roles:
     - batch
     - num_detections
@@ -366,7 +392,6 @@ custom_model_types:
     - conf_class7
     - conf_class8
     conf_threshold: 0.25
-    coord_format: xyxy
     dim_roles:
     - batch
     - num_detections
@@ -376,9 +401,10 @@ custom_model_types:
     output_index: 0
 default_model_path: ''
 label_size: 0.55
-model_type: seg_yolo
+model_type: seq_dinov3
 models_dir: Models
 show_confidence: true
 show_label_bg: true
 show_labels: true
+stream_jpeg_quality: 75
 videos_dir: Videos

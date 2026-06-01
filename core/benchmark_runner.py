@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 
@@ -66,6 +67,74 @@ def _smi_query() -> "dict | None":
         return None
 
 
+class _TelemetrySampler:
+    """CPU/GPU 텔레메트리를 추론 루프와 분리해 고정 wall-clock cadence로 폴링.
+
+    nvidia-smi spawn(수십~수백ms)을 측정 루프에서 빼내, 측정값 노이즈와
+    측정 중 GPU 교란을 줄인다. mean/peak를 집계한다.
+    """
+
+    def __init__(self, proc: psutil.Process, interval_s: float = 0.25):
+        self._proc = proc
+        self._interval_s = interval_s
+        self._stop_event = threading.Event()
+        self._thread: "threading.Thread | None" = None
+        self._cpu_samples: list = []
+        self._gpu_util_samples: list = []
+        self._gpu_mem_used_samples: list = []
+        self._gpu_mem_total: "int | None" = None
+
+    def __enter__(self) -> "_TelemetrySampler":
+        # cpu_percent(interval=None)은 직전 호출 이후 사용률을 반환하므로
+        # 첫 폴링이 의미 있는 구간을 갖도록 여기서 baseline을 찍는다.
+        self._proc.cpu_percent(interval=None)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._cpu_samples.append(self._proc.cpu_percent(interval=None))
+            gpu = _smi_query()
+            if gpu:
+                self._gpu_util_samples.append(gpu["util"])
+                self._gpu_mem_used_samples.append(gpu["mem_used"])
+                self._gpu_mem_total = gpu["mem_total"]
+            # wall-clock cadence: stop_event 대기로 즉시 종료 가능.
+            self._stop_event.wait(self._interval_s)
+
+    @property
+    def cpu_pct(self) -> float:
+        return float(np.mean(self._cpu_samples)) if self._cpu_samples else 0.0
+
+    @property
+    def gpu_pct(self) -> "int | None":
+        if not self._gpu_util_samples:
+            return None
+        return int(np.mean(self._gpu_util_samples))
+
+    @property
+    def gpu_pct_peak(self) -> "int | None":
+        if not self._gpu_util_samples:
+            return None
+        return int(np.max(self._gpu_util_samples))
+
+    @property
+    def gpu_mem_used(self) -> "int | None":
+        if not self._gpu_mem_used_samples:
+            return None
+        return int(np.max(self._gpu_mem_used_samples))
+
+    @property
+    def gpu_mem_total(self) -> "int | None":
+        return self._gpu_mem_total
+
+
 @dataclass
 class BenchmarkConfig:
     model_path: str
@@ -104,8 +173,9 @@ class BenchmarkResult:
     fps: float               # 이미지/초 = batch_size × 1000 / mean_total_ms
     cpu_pct: float
     ram_mb: float
-    gpu_pct: "int | None"
-    gpu_mem_used: "int | None"
+    gpu_pct: "int | None"        # 측정 구간 평균 GPU 사용률
+    gpu_pct_peak: "int | None"   # 측정 구간 피크 GPU 사용률
+    gpu_mem_used: "int | None"   # 측정 구간 피크 GPU 메모리 사용량
     gpu_mem_total: "int | None"
 
 
@@ -122,7 +192,6 @@ def run_benchmark_core(
     on_error(msg), is_stopped() -> bool
     """
     proc = psutil.Process(os.getpid())
-    proc.cpu_percent(interval=None)
 
     total_steps = sum(cfg.warmup + cfg.iterations for cfg in configs)
     done = 0
@@ -229,37 +298,32 @@ def run_benchmark_core(
         if is_stopped():
             break
 
-        # Benchmark
+        # Benchmark — 텔레메트리는 전용 샘플러 스레드가 추론 cadence와 분리해 폴링.
         pre_times: list = []
         infer_times: list = []
         post_times: list = []
-        cpu_samples: list = []
-        gpu_util_samples: list = []
 
-        for i in range(cfg.iterations):
-            if is_stopped():
-                break
+        with _TelemetrySampler(proc) as sampler:
+            for i in range(cfg.iterations):
+                if is_stopped():
+                    break
 
-            t0 = time.perf_counter()
-            tensor, ratio_b, pad_b = _preprocess()
-            pre_times.append((time.perf_counter() - t0) * 1000.0)
+                t0 = time.perf_counter()
+                tensor, ratio_b, pad_b = _preprocess()
+                pre_times.append((time.perf_counter() - t0) * 1000.0)
 
-            t0 = time.perf_counter()
-            model_out = model_info.session.run(None, {input_name: tensor})
-            infer_times.append((time.perf_counter() - t0) * 1000.0)
+                t0 = time.perf_counter()
+                model_out = model_info.session.run(None, {input_name: tensor})
+                infer_times.append((time.perf_counter() - t0) * 1000.0)
 
-            t0 = time.perf_counter()
-            _postprocess(model_out[0], ratio_b, pad_b)
-            post_times.append((time.perf_counter() - t0) * 1000.0)
+                t0 = time.perf_counter()
+                _postprocess(model_out[0], ratio_b, pad_b)
+                post_times.append((time.perf_counter() - t0) * 1000.0)
 
-            done += 1
-            if i % 20 == 0:
-                cpu_samples.append(proc.cpu_percent(interval=None))
-                gpu = _smi_query()
-                if gpu:
-                    gpu_util_samples.append(gpu["util"])
-                on_progress(done, total_steps,
-                            f"[{model_name}]  측정  {i + 1} / {cfg.iterations}")
+                done += 1
+                if i % 20 == 0:
+                    on_progress(done, total_steps,
+                                f"[{model_name}]  측정  {i + 1} / {cfg.iterations}")
 
         if not infer_times:
             continue
@@ -269,7 +333,6 @@ def run_benchmark_core(
         post_arr  = np.array(post_times)
         total_arr = pre_arr + infer_arr + post_arr
         mean_total = float(np.mean(total_arr))
-        gpu_final = _smi_query()
 
         result = BenchmarkResult(
             model_name=model_name,
@@ -292,14 +355,12 @@ def run_benchmark_core(
             p95_ms=float(np.percentile(total_arr, 95)),
             p99_ms=float(np.percentile(total_arr, 99)),
             fps=batch * 1000.0 / mean_total if mean_total > 0 else 0.0,
-            cpu_pct=float(np.mean(cpu_samples)) if cpu_samples else 0.0,
+            cpu_pct=sampler.cpu_pct,
             ram_mb=proc.memory_info().rss / 1024 / 1024,
-            gpu_pct=(
-                int(np.mean(gpu_util_samples)) if gpu_util_samples
-                else (gpu_final["util"] if gpu_final else None)
-            ),
-            gpu_mem_used=gpu_final["mem_used"] if gpu_final else None,
-            gpu_mem_total=gpu_final["mem_total"] if gpu_final else None,
+            gpu_pct=sampler.gpu_pct,
+            gpu_pct_peak=sampler.gpu_pct_peak,
+            gpu_mem_used=sampler.gpu_mem_used,
+            gpu_mem_total=sampler.gpu_mem_total,
         )
         on_result(result)
 

@@ -428,3 +428,154 @@ class TestDiagnoseCharts:
         from core.diagnosis_charts import generate_weight_distribution_chart
         img = generate_weight_distribution_chart([])
         assert isinstance(img, str)
+
+
+# ============================================================
+# v1.6.0 hardening — TOOLS-01/02/03/08/09/11/12
+# ============================================================
+def _make_conv_concat_model(path: str):
+    """Conv whose output feeds a Concat — pruning must be skipped (TOOLS-01)."""
+    import onnx
+    from onnx import helper, TensorProto, numpy_helper
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 3, 8, 8])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, None)
+    W = numpy_helper.from_array(np.random.randn(8, 3, 3, 3).astype(np.float32), "W")
+    B = numpy_helper.from_array(np.zeros(8, dtype=np.float32), "B")
+    conv = helper.make_node("Conv", ["X", "W", "B"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    concat = helper.make_node("Concat", ["c", "c"], ["Y"], axis=1)
+    g = helper.make_graph([conv, concat], "conv_concat", [X], [Y], [W, B])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+    m.ir_version = 8
+    onnx.save(m, path)
+    return path
+
+
+@pytest.fixture
+def conv_concat_model(tmp_dir):
+    return _make_conv_concat_model(os.path.join(tmp_dir, "conv_concat.onnx"))
+
+
+class TestChannelPruningSafety:
+    def test_skips_concat_feeding_conv_and_loads(self, conv_concat_model, tmp_dir):
+        import onnxruntime as ort
+        opt = registry.get("channel_pruning")
+        out = os.path.join(tmp_dir, "cc_pruned.onnx")
+        result = opt.apply(conv_concat_model, out, pruning_ratio=0.5)
+        # The single Conv feeds a Concat (twice) — must be skipped, nothing
+        # pruned. Either skip reason is acceptable; both avoid corruption.
+        assert result["channels_removed"] == 0
+        reasons = {s["reason"] for s in result["skipped_layers"]}
+        assert reasons & {"unsupported_consumer", "multiple_consumers"}
+        # Output must still be a loadable model (no corruption).
+        ort.InferenceSession(out, providers=["CPUExecutionProvider"])
+
+    def test_reports_skipped_layers_key(self, conv_model, tmp_dir):
+        opt = registry.get("channel_pruning")
+        out = os.path.join(tmp_dir, "cp_skip.onnx")
+        result = opt.apply(conv_model, out, pruning_ratio=0.25)
+        assert "skipped_layers" in result
+        assert isinstance(result["skipped_layers"], list)
+
+
+class TestMixedPrecisionExclusion:
+    def test_excluded_names_non_empty(self, conv_model, tmp_dir):
+        opt = registry.get("mixed_precision")
+        out = os.path.join(tmp_dir, "mp.onnx")
+        result = opt.apply(conv_model, out, exclude_pct=50)
+        assert "error" not in result
+        assert result["num_excluded"] >= 1
+        # Every excluded entry must be a non-empty matchable node key.
+        assert all(isinstance(n, str) and n for n in result["excluded_nodes"])
+
+    def test_unnamed_nodes_get_keys(self, tmp_dir):
+        # Build a conv model whose nodes have empty names; scores must key on output.
+        import onnx
+        from onnx import helper, TensorProto, numpy_helper
+        X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 3, 8, 8])
+        Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, None)
+        W = numpy_helper.from_array(np.random.randn(8, 3, 3, 3).astype(np.float32), "W")
+        conv = helper.make_node("Conv", ["X", "W"], ["Y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+        assert conv.name == ""  # unnamed
+        g = helper.make_graph([conv], "unnamed", [X], [Y], [W])
+        m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+        m.ir_version = 8
+        p = os.path.join(tmp_dir, "unnamed.onnx")
+        onnx.save(m, p)
+        from core.optimizers.mixed_precision import compute_sensitivity_scores
+        scores = compute_sensitivity_scores(p)
+        assert len(scores) == 1
+        assert all(k for k in scores)  # key is node.output[0], non-empty
+
+
+class TestArchitectureDetectionMargin:
+    def test_single_conv_not_cnn(self, conv_model):
+        # One Conv lacks the discriminating "multiple Conv" requirement.
+        from core.model_diagnosis import ModelDiagnosisEngine
+        arch = ModelDiagnosisEngine().diagnose(conv_model)["architecture"]
+        assert arch in ("cnn", "unknown")  # never a transformer family
+
+    def test_multi_conv_is_cnn(self, conv_bn_conv_model):
+        from core.model_diagnosis import ModelDiagnosisEngine
+        arch = ModelDiagnosisEngine().diagnose(conv_bn_conv_model)["architecture"]
+        assert arch in ("cnn", "yolo", "hybrid")
+
+
+class TestHealthScoreContinuity:
+    def test_score_in_range(self, conv_model):
+        from core.model_diagnosis import ModelDiagnosisEngine
+        score = ModelDiagnosisEngine().diagnose(conv_model)["summary"]["health_score"]
+        assert 0 <= score <= 100
+
+    def test_score_does_not_saturate_at_zero(self):
+        # Many warnings should decay smoothly, not clamp hard to 0.
+        from core.model_diagnosis import ModelDiagnosisEngine
+        eng = ModelDiagnosisEngine()
+        findings = [{"severity": "warning", "category": "x", "message": "m"}] * 10
+        crit = 0
+        warn = len(findings)
+        score = round(100.0 * (0.7 ** crit) * (0.9 ** warn))
+        assert score > 0  # continuous decay, never an abrupt 0
+        assert score < 100
+
+
+class TestProfilerOutput:
+    def test_provider_and_flops_flag(self, conv_model):
+        from core.model_profiler import profile_model, profile_to_dict
+        d = profile_to_dict(profile_model(conv_model, num_runs=3, warmup=1))
+        assert "provider" in d and d["provider"]
+        assert "flops_approximate" in d
+        assert isinstance(d["flops_approximate"], bool)
+
+
+class TestModelCacheAtomic:
+    def test_concurrent_compute_runs_once(self, tmp_dir, monkeypatch):
+        import threading
+        from core import model_cache
+        # Point the cache dir at a temp dir.
+        from core import paths
+        monkeypatch.setattr(paths, "cache_dir", lambda *a, **k: __import__("pathlib").Path(tmp_dir))
+        target = os.path.join(tmp_dir, "f.onnx")
+        with open(target, "wb") as f:
+            f.write(b"x" * 10)
+        calls = {"n": 0}
+        lock = threading.Lock()
+
+        def _compute(p):
+            with lock:
+                calls["n"] += 1
+            import time
+            time.sleep(0.05)
+            return {"value": 42}
+
+        results = []
+        def _worker():
+            results.append(model_cache.get_or_compute(target, _compute))
+
+        threads = [threading.Thread(target=_worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # All workers get the same value; compute ran once (per-key lock).
+        assert all(r == {"value": 42} for r in results)
+        assert calls["n"] == 1

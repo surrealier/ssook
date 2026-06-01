@@ -29,7 +29,6 @@ class CustomModelType:
     # 예: ["batch", "detections", "attrs"]
     attr_roles: Optional[list] = None               # attrs 차원 내 각 슬롯의 역할
     # 예: ["x_center", "y_center", "width", "height", "conf_class0", ...]
-    coord_format: str = "xyxy"                      # "xyxy" | "xywh" | "cxcywh"
     has_objectness: bool = False
     nms: bool = True
     conf_threshold: float = 0.25
@@ -68,6 +67,8 @@ class AppConfig:
             self.model_type: str = cfg.get("model_type", "yolo")
             self.batch_size: int = cfg.get("batch_size", 1)
             self.default_model_path: str = cfg.get("default_model_path", "")
+            # MJPEG 뷰어 스트림 JPEG 인코딩 품질 (viewer가 읽음).
+            self.stream_jpeg_quality: int = cfg.get("stream_jpeg_quality", 75)
 
             raw = cfg.get("class_styles", {})
             self.class_styles: dict[int, ClassStyle] = {}
@@ -89,7 +90,6 @@ class AppConfig:
                     output_index=d.get("output_index", 0),
                     dim_roles=d.get("dim_roles"),
                     attr_roles=d.get("attr_roles"),
-                    coord_format=d.get("coord_format", "xyxy"),
                     has_objectness=d.get("has_objectness", False),
                     nms=d.get("nms", True),
                     conf_threshold=d.get("conf_threshold", 0.25),
@@ -113,7 +113,6 @@ class AppConfig:
                     "output_index": cmt.output_index,
                     "dim_roles": cmt.dim_roles,
                     "attr_roles": cmt.attr_roles,
-                    "coord_format": cmt.coord_format,
                     "has_objectness": cmt.has_objectness,
                     "nms": cmt.nms,
                     "conf_threshold": cmt.conf_threshold,
@@ -133,6 +132,7 @@ class AppConfig:
                 "model_type": self.model_type,
                 "batch_size": self.batch_size,
                 "default_model_path": self.default_model_path,
+                "stream_jpeg_quality": self.stream_jpeg_quality,
                 "class_styles": cs_save,
                 "custom_model_types": cmt_save,
             }

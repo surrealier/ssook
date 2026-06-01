@@ -1,6 +1,7 @@
 """ONNX Model Quantizer — Dynamic / Static INT8 / FP16 conversion."""
 import glob
 import os
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -41,9 +42,17 @@ def _resolve_shape(shape, default_hw=640):
 
 
 class _AutoCalibrationReader(_CalibBase):
-    """CalibrationDataReader that auto-preprocesses images to match model input."""
+    """CalibrationDataReader that auto-preprocesses images to match model input.
 
-    def __init__(self, model_path: str, image_dir: str, max_images: int = 100):
+    Calibration must mirror deployment preprocessing or the INT8 ranges are
+    calibrated on a different input distribution and accuracy silently drops.
+    Detection models use letterbox (aspect-preserving padded resize), so we
+    default to letterbox for square inputs. Classifier/embedder pipelines that
+    plain-resize can opt out via `use_letterbox=False`.
+    """
+
+    def __init__(self, model_path: str, image_dir: str, max_images: int = 100,
+                 use_letterbox: Optional[bool] = None):
         self.meta = _get_input_meta(model_path)
         exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
         self.images = []
@@ -56,6 +65,12 @@ class _AutoCalibrationReader(_CalibBase):
         self.input_name = inp["name"]
         self.shape = _resolve_shape(inp["shape"])
         self.is_float16 = "float16" in (inp["type"] or "")
+        # Default: letterbox for square detection inputs (H == W), plain resize
+        # otherwise. An explicit flag overrides the heuristic.
+        if use_letterbox is None:
+            h, w = self.shape[2], self.shape[3]
+            use_letterbox = (h == w)
+        self.use_letterbox = use_letterbox
 
     def get_next(self):
         if self.index >= len(self.images):
@@ -65,7 +80,11 @@ class _AutoCalibrationReader(_CalibBase):
             self.index += 1
             return self.get_next()
         h, w = self.shape[2], self.shape[3]
-        img = cv2.resize(img, (w, h))
+        if self.use_letterbox:
+            from core.inference import letterbox
+            img, _ratio, _pad = letterbox(img, (h, w))
+        else:
+            img = cv2.resize(img, (w, h))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         tensor = img.transpose(2, 0, 1).astype(np.float32) / 255.0
         tensor = np.expand_dims(tensor, axis=0)
@@ -107,13 +126,15 @@ def quantize_static(model_path: str, output_path: str,
                     weight_type: str = "int8",
                     activation_type: str = "uint8",
                     quant_format: str = "QDQ",
+                    use_letterbox: Optional[bool] = None,
                     on_progress=None) -> dict:
     """Static quantization with calibration data."""
     from onnxruntime.quantization import (
         quantize_static as _qs, QuantType, QuantFormat,
     )
 
-    reader = _AutoCalibrationReader(model_path, calibration_dir, max_images)
+    reader = _AutoCalibrationReader(model_path, calibration_dir, max_images,
+                                    use_letterbox=use_letterbox)
     total = len(reader.images)
     if total == 0:
         raise ValueError("No calibration images found in the directory")

@@ -4,15 +4,26 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Optional
 
-from server.state import all_states, executor
+from server.path_safety import safe_model_file, safe_path, UnsafePathError
+from server.state import TaskState, all_states, executor
 
 router = APIRouter()
 
 # ── State ───────────────────────────────────────────────
-opt_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": {}}
-diag_state = {"running": False, "progress": 0, "total": 0, "msg": "", "results": {}}
+# TaskState (RLock-guarded) instead of plain dicts so status polling can
+# snapshot atomically and try_start() makes the "already running" guard atomic.
+# results is a dict here (TaskState defaults it to a list), so set it explicitly.
+opt_state = TaskState()
+opt_state["results"] = {}
+diag_state = TaskState()
+diag_state["results"] = {}
 all_states["optimize"] = opt_state
 all_states["diagnose"] = diag_state
+
+
+def _safe_output(out: str) -> str:
+    """Validate a user-supplied .onnx output path (may not yet exist)."""
+    return safe_path(out, allowed_exts={".onnx"}, must_be_file=False)
 
 
 # ── Optimization endpoints ──────────────────────────────
@@ -41,18 +52,22 @@ async def list_methods():
 
 @router.post("/api/optimize/run")
 async def run_optimize(req: OptimizeRequest):
-    if opt_state["running"]:
+    # Job-submission route returns {error} with 200 (not the 400 envelope) so
+    # the polling frontend handles bad input the same as other job errors.
+    try:
+        model_path = safe_model_file(req.model_path)
+        out = req.output_path
+        if not out:
+            base, ext = os.path.splitext(model_path)
+            suffix = req.method or "optimized"
+            out = f"{base}_{suffix}{ext}"
+        out = _safe_output(out)
+    except UnsafePathError as e:
+        return {"error": str(e), "code": f"PATH_{e.code}"}
+
+    # Atomic guard: try_start flips running=True under the lock or returns False.
+    if not opt_state.try_start(progress=0, total=0, msg="Starting...", results={}):
         return {"error": "Optimization already running"}
-    if not req.model_path or not os.path.isfile(req.model_path):
-        return {"error": "Model file not found"}
-
-    out = req.output_path
-    if not out:
-        base, ext = os.path.splitext(req.model_path)
-        suffix = req.method or "optimized"
-        out = f"{base}_{suffix}{ext}"
-
-    opt_state.update(running=True, progress=0, total=0, msg="Starting...", results={})
 
     def _run():
         try:
@@ -71,7 +86,7 @@ async def run_optimize(req: OptimizeRequest):
                     opt_state.update(progress=step_idx, total=total,
                                      msg=f"Step {step_idx}/{total}: {name}")
 
-                result = pipe.run(req.model_path, out, on_progress=_prog)
+                result = pipe.run(model_path, out, on_progress=_prog)
             elif req.method:
                 # Single method mode
                 opt = registry.get(req.method)
@@ -79,7 +94,7 @@ async def run_optimize(req: OptimizeRequest):
                     opt_state.update(running=False, msg=f"Error: unknown method '{req.method}'")
                     return
                 opt_state.update(total=1, msg=f"Running {req.method}...")
-                result = opt.apply(req.model_path, out, **req.params)
+                result = opt.apply(model_path, out, **req.params)
                 opt_state["progress"] = 1
             else:
                 opt_state.update(running=False, msg="Error: specify method or pipeline")
@@ -95,7 +110,7 @@ async def run_optimize(req: OptimizeRequest):
 
 @router.get("/api/optimize/status")
 async def optimize_status():
-    return dict(opt_state)
+    return opt_state.snapshot()
 
 
 # ── Diagnose endpoints ──────────────────────────────────
@@ -107,12 +122,13 @@ class DiagnoseRequest(BaseModel):
 
 @router.post("/api/diagnose/run")
 async def run_diagnose(req: DiagnoseRequest):
-    if diag_state["running"]:
-        return {"error": "Diagnosis already running"}
-    if not req.model_path or not os.path.isfile(req.model_path):
-        return {"error": "Model file not found"}
+    try:
+        model_path = safe_model_file(req.model_path)
+    except UnsafePathError as e:
+        return {"error": str(e), "code": f"PATH_{e.code}"}
 
-    diag_state.update(running=True, progress=0, total=4, msg="Starting diagnosis...", results={})
+    if not diag_state.try_start(progress=0, total=4, msg="Starting diagnosis...", results={}):
+        return {"error": "Diagnosis already running"}
 
     def _run():
         try:
@@ -121,7 +137,7 @@ async def run_diagnose(req: DiagnoseRequest):
             diag_state["msg"] = "Analyzing model structure..."
             diag_state["progress"] = 1
             engine = ModelDiagnosisEngine()
-            diagnosis = engine.diagnose(req.model_path)
+            diagnosis = engine.diagnose(model_path)
 
             diag_state["msg"] = "Generating recommendations..."
             diag_state["progress"] = 2
@@ -160,19 +176,19 @@ async def run_diagnose(req: DiagnoseRequest):
 
 @router.get("/api/diagnose/status")
 async def diagnose_status():
-    return dict(diag_state)
+    return diag_state.snapshot()
 
 
 @router.post("/api/diagnose/apply-recommendation")
 async def apply_recommendation(req: dict):
     """Apply a recommended optimization pipeline."""
-    model_path = req.get("model_path", "")
+    try:
+        model_path = safe_model_file(req.get("model_path", ""))
+    except UnsafePathError as e:
+        return {"error": str(e), "code": f"PATH_{e.code}"}
     output_path = req.get("output_path", "")
     pipeline_config = req.get("pipeline_config")
     recommendation_index = req.get("recommendation_index")
-
-    if not model_path or not os.path.isfile(model_path):
-        return {"error": "Model file not found"}
 
     # Build pipeline from recommendation or direct config
     if pipeline_config:

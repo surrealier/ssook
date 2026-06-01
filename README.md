@@ -10,7 +10,7 @@
 [![FastAPI](https://img.shields.io/badge/backend-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![ONNX Runtime](https://img.shields.io/badge/runtime-ONNX-005CED?logo=onnx&logoColor=white)](https://onnxruntime.ai)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.5.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-1.6.0-blue)](#)
 
 <br>
 
@@ -34,6 +34,7 @@
 | ⚡ | **Benchmark?** | Measure FPS, latency (P50/P95/P99), CPU/GPU usage with system info export |
 | 🖼️ | **Segmentation Evaluation?** | mIoU, mDice, per-class IoU/Dice against GT masks |
 | 🔤 | **CLIP Zero-Shot?** | Load image + text encoders, evaluate zero-shot classification |
+| 🧠 | **Vision-Language (VLM)?** | Caption & VQA via CLIP, local Qwen-VL (transformers), or OpenAI-compatible API |
 | 🧲 | **Embedder Evaluation?** | Retrieval@1/@K, cosine similarity, multi-image comparison |
 | 📁 | **Dataset Explorer?** | Gallery with multi-class filter, box filter, class/size/aspect distribution charts |
 | ✂️ | **Dataset Splitter?** | Random or stratified train/val/test split with progress tracking |
@@ -59,10 +60,31 @@
 | **Detection** | YOLO v5/v8/v9/v11, CenterNet (Darknet), Custom ONNX | mAP@50, mAP@50:95, P/R/F1 |
 | **Classification** | ONNX (2D output) | Accuracy, per-class P/R/F1 |
 | **Segmentation** | ONNX (C×H×W output) | mIoU, mDice, per-class IoU/Dice |
-| **VLM / CLIP** | Image Encoder + Text Encoder ONNX | Zero-shot Classification |
+| **VLM / CLIP** | CLIP ONNX, local transformers (Qwen-VL), or OpenAI-compatible API | Zero-shot Classification, Captioning, VQA |
 | **Embedder** | ONNX (feature extractor) | Retrieval@1/@K, Cosine Similarity |
 
 > Fixed-batch models (e.g., batch=4) are automatically detected and handled.
+
+---
+
+## 🧠 VLM Backends
+
+The VLM tab supports three pluggable backends. Pick one in the **Backend** dropdown:
+
+| Backend | What it runs | Tasks | Setup |
+|---------|-------------|-------|-------|
+| **clip** *(default)* | CLIP image + text encoder ONNX | Zero-shot classification, template-based caption / VQA | None — works out of the box, no extra deps |
+| **transformers** | Local generative VLM (e.g. **Qwen2.5-VL**) via 🤗 transformers | Captioning, VQA | `pip install -r requirements-vlm.txt` (CUDA build of torch for GPU) |
+| **openai** | Any **OpenAI-compatible** chat endpoint — **Ollama**, **vLLM**, **LM Studio**, etc. | Captioning, VQA | `pip install httpx` (or `requirements-vlm.txt`); set endpoint URL + optional API key |
+
+- **clip** is fully self-contained: just supply the image and text encoder ONNX files.
+- **transformers** downloads / loads a HuggingFace image-text-to-text model by ID or local path and runs it locally (GPU auto-detected via CUDA).
+- **openai** sends frames as base64 JPEG to `{endpoint_url}/chat/completions`. Point it at a local server (`http://localhost:11434/v1` for Ollama, `http://localhost:8000/v1` for vLLM) or a remote one with a Bearer API key.
+
+```bash
+# Enable the transformers + OpenAI-compatible backends (CLIP needs nothing):
+pip install -r requirements-vlm.txt
+```
 
 ---
 
@@ -91,6 +113,7 @@ pip install matplotlib scikit-learn openpyxl   # charts & Excel export
 pip install umap-learn                          # UMAP embedding
 pip install pywebview                           # native desktop window
 pip install onnxruntime-gpu                     # CUDA acceleration
+pip install -r requirements-vlm.txt            # transformers / OpenAI VLM backends
 
 # EP venv 격리 설치 (GPU/DirectML/OpenVINO/CoreML 동시 공존)
 python scripts/setup_ep.py                      # 플랫폼 전체 EP 설치
@@ -175,6 +198,8 @@ show_confidence: true
 | openpyxl | Excel report export |
 | umap-learn | UMAP embedding visualization |
 | onnxruntime-gpu | CUDA/TensorRT acceleration |
+| transformers / torch / accelerate | Local generative VLM backend (Qwen-VL) — see `requirements-vlm.txt` |
+| httpx | OpenAI-compatible VLM backend (Ollama / vLLM / LM Studio) |
 
 ---
 
@@ -187,6 +212,12 @@ python -m pytest tests/ -v
 ---
 
 ## 📋 Changelog
+
+### v1.6.0
+- **QC release**: P0 crash fixes across viewer, evaluation, data, and analysis flows
+- **Security hardening**: path-safety validation on all user-supplied paths (traversal prevention)
+- **7 specialized tabs now reachable**: CLIP Zero-Shot, Embedder, Segmentation, Tracking, VLM, and more are registered in the sidebar
+- **Pluggable VLM backends**: choose **clip** (dependency-free), **transformers** (local Qwen-VL), or **openai** (OpenAI-compatible — Ollama / vLLM / LM Studio) — see [VLM Backends](#-vlm-backends)
 
 ### v1.4.0
 - **EP venv Isolation**: onnxruntime 변종별 독립 venv 격리 (`ep_venvs/`) — GPU/DirectML/OpenVINO/CoreML/CPU 동시 공존

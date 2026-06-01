@@ -46,6 +46,24 @@ class TaskState(dict):
         with self._lock:
             return dict(self)
 
+    def try_start(self, **init) -> bool:
+        """Atomic check-and-set start guard.
+
+        Routes used to do `if state['running']: return error` then a
+        separate `state.update(running=True)` — two distinct ops, so two
+        concurrent POSTs (double-click / parallel tabs) could both pass
+        the guard and race on the same results/tmp. This collapses the
+        read+write into one locked critical section: returns False if a
+        run is already in flight, otherwise marks running and applies the
+        caller's initial state.
+        """
+        with self._lock:
+            if self.get("running"):
+                return False
+            super().__setitem__("running", True)
+            super().update(init)
+            return True
+
 
 # ── 스레드 풀 ──
 executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ssook-bg")
