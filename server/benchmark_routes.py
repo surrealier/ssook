@@ -110,16 +110,13 @@ async def run_benchmark(req: BenchmarkRequest):
                 else:
                     encoded_bufs[codec] = None
 
-        result_idx = [0]
-
         def on_progress(done, total, msg):
             bench_state["progress"] = done
             bench_state["msg"] = msg
 
-        def on_result(r):
-            ci = result_idx[0]
-            codec = codec_map.get(ci, "none")
-            result_idx[0] += 1
+        def on_result(cfg_idx, r):
+            # codec은 config 인덱스로 매핑 — 일부 모델이 건너뛰어져도 라벨이 밀리지 않는다.
+            codec = codec_map.get(cfg_idx, "none")
 
             # Measure decode time for this codec
             decode_ms = 0.0
@@ -175,8 +172,18 @@ async def run_benchmark(req: BenchmarkRequest):
                 "gpu_mem_total": r.gpu_mem_total,
             })
 
-        def on_error(msg):
-            bench_state["results"].append({"error": msg})
+        def on_error(cfg_idx, msg):
+            # 건너뛴(로드 실패/OOM) 모델도 어느 모델/codec이었는지 결과에 남긴다.
+            codec = codec_map.get(cfg_idx, "none")
+            try:
+                name = os.path.basename(configs[cfg_idx].model_path)
+            except (IndexError, AttributeError):
+                name = "—"
+            bench_state["results"].append({
+                "name": name,
+                "codec": codec.upper() if codec != "none" else "Raw",
+                "error": msg,
+            })
 
         try:
             run_benchmark_core(configs, on_progress, on_result, on_error, lambda: not bench_state["running"])

@@ -189,8 +189,13 @@ def run_benchmark_core(
 ) -> None:
     """
     벤치마크 핵심 로직. QThread 내 직접 실행 및 ep_worker 서브프로세스 양쪽에서 사용.
-    on_progress(done, total, msg), on_result(BenchmarkResult),
-    on_error(msg), is_stopped() -> bool
+    on_progress(done, total, msg), on_result(cfg_idx, BenchmarkResult),
+    on_error(cfg_idx, msg), is_stopped() -> bool
+
+    on_result/on_error는 config 인덱스를 함께 받는다 — 호출자가 codec 등 config별
+    메타데이터를 인덱스로 정확히 매핑하고, 건너뛴(로드 실패/OOM) config도 어느
+    모델/codec이었는지 기록할 수 있게 하기 위함. (누적 카운터로 매핑하면 한 모델만
+    건너뛰어도 이후 모든 결과의 codec 라벨이 밀린다.)
     """
     proc = psutil.Process(os.getpid())
 
@@ -198,6 +203,14 @@ def run_benchmark_core(
     done = 0
     # 직전 모델 — 다음 모델을 로드하기 전에 세션을 해제해 메모리 peak를 억제한다.
     prev_info = None
+
+    # OOM을 무한 hang이 아니라 예외로 만들기 위한 CUDA EP 옵션. CUDA EP가 없으면
+    # _build_providers가 무시하므로 CPU 환경에서도 안전하다.
+    cuda_opts = {"cudnn_conv_algo_search": "HEURISTIC"}
+    _gpu_info = _smi_query()
+    if _gpu_info and _gpu_info.get("mem_total"):
+        # 가용 VRAM의 90%를 상한으로 — 초과 할당 시 ORT가 즉시 OOM 예외를 던진다.
+        cuda_opts["gpu_mem_limit"] = str(int(_gpu_info["mem_total"] * 1024 * 1024 * 0.9))
 
     def _release(info) -> None:
         """ORT 세션과 캐시 버퍼 참조를 끊고 GC를 유도한다.
@@ -213,7 +226,7 @@ def run_benchmark_core(
             info._frame_buffer = []
         gc.collect()
 
-    for cfg in configs:
+    for cfg_idx, cfg in enumerate(configs):
         # 다음 모델 로드 전에 직전 세션을 해제 — 두 세션이 동시에 상주(peak 2배)하지 않게.
         if prev_info is not None:
             _release(prev_info)
@@ -225,9 +238,9 @@ def run_benchmark_core(
         model_name = os.path.basename(cfg.model_path)
 
         try:
-            model_info = load_model(cfg.model_path, cfg.model_type)
+            model_info = load_model(cfg.model_path, cfg.model_type, cuda_options=cuda_opts)
         except Exception as e:
-            on_error(f"[{model_name}] 로드 실패: {e}")
+            on_error(cfg_idx, f"[{model_name}] 로드 실패: {e}")
             done += cfg.warmup + cfg.iterations
             on_progress(done, total_steps, f"[{model_name}] 로드 실패 — 건너뜀")
             continue
@@ -237,7 +250,7 @@ def run_benchmark_core(
         prev_info = model_info
 
         if model_info.session is None:
-            on_error(f"[{model_name}] 세션 없음 — 건너뜀")
+            on_error(cfg_idx, f"[{model_name}] 세션 없음 — 건너뜀")
             done += cfg.warmup + cfg.iterations
             on_progress(done, total_steps, f"[{model_name}] 세션 없음 — 건너뜀")
             continue
@@ -310,17 +323,29 @@ def run_benchmark_core(
                     postprocess_v5(single, _CONF, ratio, pad, dummy_frame.shape)
 
         # Warmup
+        infer_failed = False
         for i in range(cfg.warmup):
             if is_stopped():
                 break
-            t_b, r_w, p_w = _preprocess()
-            out_w = model_info.session.run(None, {input_name: t_b})
-            _postprocess(out_w[0], r_w, p_w)
+            try:
+                t_b, r_w, p_w = _preprocess()
+                out_w = model_info.session.run(None, {input_name: t_b})
+                _postprocess(out_w[0], r_w, p_w)
+            except Exception as e:
+                # OOM 등 추론 실패 — 이 모델만 건너뛰고 다음 모델로. 남은 스텝은
+                # 진행도에 반영해 progress bar가 멈추지 않게 한다.
+                on_error(cfg_idx, f"[{model_name}] 추론 실패 (워밍업 {i + 1}): {e}")
+                done += cfg.warmup - i + cfg.iterations
+                on_progress(done, total_steps, f"[{model_name}] 추론 실패 — 건너뜀")
+                infer_failed = True
+                break
             done += 1
             if i % 10 == 0 or i == cfg.warmup - 1:
                 on_progress(done, total_steps,
                             f"[{model_name}]  워밍업  {i + 1} / {cfg.warmup}")
 
+        if infer_failed:
+            continue
         if is_stopped():
             break
 
@@ -334,24 +359,31 @@ def run_benchmark_core(
                 if is_stopped():
                     break
 
-                t0 = time.perf_counter()
-                tensor, ratio_b, pad_b = _preprocess()
-                pre_times.append((time.perf_counter() - t0) * 1000.0)
+                try:
+                    t0 = time.perf_counter()
+                    tensor, ratio_b, pad_b = _preprocess()
+                    pre_times.append((time.perf_counter() - t0) * 1000.0)
 
-                t0 = time.perf_counter()
-                model_out = model_info.session.run(None, {input_name: tensor})
-                infer_times.append((time.perf_counter() - t0) * 1000.0)
+                    t0 = time.perf_counter()
+                    model_out = model_info.session.run(None, {input_name: tensor})
+                    infer_times.append((time.perf_counter() - t0) * 1000.0)
 
-                t0 = time.perf_counter()
-                _postprocess(model_out[0], ratio_b, pad_b)
-                post_times.append((time.perf_counter() - t0) * 1000.0)
+                    t0 = time.perf_counter()
+                    _postprocess(model_out[0], ratio_b, pad_b)
+                    post_times.append((time.perf_counter() - t0) * 1000.0)
+                except Exception as e:
+                    # 측정 도중 OOM 등 실패 — 부분 결과는 버리고 이 모델을 건너뛴다.
+                    on_error(cfg_idx, f"[{model_name}] 추론 실패 (측정 {i + 1}): {e}")
+                    done += cfg.iterations - i
+                    infer_failed = True
+                    break
 
                 done += 1
                 if i % 20 == 0:
                     on_progress(done, total_steps,
                                 f"[{model_name}]  측정  {i + 1} / {cfg.iterations}")
 
-        if not infer_times:
+        if infer_failed or not infer_times:
             continue
 
         pre_arr   = np.array(pre_times)
@@ -388,7 +420,7 @@ def run_benchmark_core(
             gpu_mem_used=sampler.gpu_mem_used,
             gpu_mem_total=sampler.gpu_mem_total,
         )
-        on_result(result)
+        on_result(cfg_idx, result)
 
     # 마지막으로 처리한 모델의 세션도 해제 (루프 내 정리는 '다음 로드 직전'이므로).
     if prev_info is not None:
@@ -493,8 +525,9 @@ if _HAS_QT:
                     run_benchmark_core(
                         ep_configs,
                         on_progress=_prog,
-                        on_result=self.result_ready.emit,
-                        on_error=self.error.emit,
+                        # core가 (cfg_idx, payload)로 호출 — Qt Signal은 payload만 받으므로 인덱스는 버린다.
+                        on_result=lambda idx, r: self.result_ready.emit(r),
+                        on_error=lambda idx, m: self.error.emit(m),
                         is_stopped=lambda: self._stopped,
                     )
                     global_done += sum(c.warmup + c.iterations for c in ep_configs)

@@ -87,8 +87,13 @@ MODEL_TYPES = {
 }
 
 
-def _build_providers() -> list:
-    """사용 가능한 ONNX Runtime provider 선택 (GPU 우선)"""
+def _build_providers(cuda_options: "dict | None" = None) -> list:
+    """사용 가능한 ONNX Runtime provider 선택 (GPU 우선).
+
+    cuda_options: CUDAExecutionProvider에 전달할 provider 옵션(예: gpu_mem_limit,
+    cudnn_conv_algo_search). 지정 시 CUDA EP를 (이름, 옵션) 튜플로 구성한다.
+    벤치마크가 OOM을 무한 hang이 아니라 예외로 받도록 메모리 상한을 주는 용도.
+    """
     available = ort.get_available_providers()
     for prov in [
         "CUDAExecutionProvider",
@@ -107,12 +112,14 @@ def _build_providers() -> list:
                     ("OpenVINOExecutionProvider", {"device_type": "CPU"}),
                     "CPUExecutionProvider",
                 ]
+            if prov == "CUDAExecutionProvider" and cuda_options:
+                return [("CUDAExecutionProvider", cuda_options), "CPUExecutionProvider"]
             return [prov, "CPUExecutionProvider"]
     return ["CPUExecutionProvider"]
 
 
-def _create_session(path: str, session_options=None) -> ort.InferenceSession:
-    providers = _build_providers()
+def _create_session(path: str, session_options=None, cuda_options=None) -> ort.InferenceSession:
+    providers = _build_providers(cuda_options)
     if session_options is None:
         import os
         session_options = ort.SessionOptions()
@@ -232,16 +239,17 @@ def _get_input_size(session: ort.InferenceSession) -> tuple:
 
 
 def load_model(path: str, model_type: str = "yolo", pt_convert_callback=None,
-               session_options=None) -> ModelInfo:
+               session_options=None, cuda_options=None) -> ModelInfo:
     """
     path: .onnx 또는 .pt 파일 경로
     pt_convert_callback: PT 파일 시 ONNX 변환 여부 묻는 콜백 함수.
                          콜백이 ONNX 경로를 반환하면 그것으로 로드.
+    cuda_options: CUDAExecutionProvider provider 옵션 (벤치마크의 OOM 상한 등).
     """
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".onnx":
-        return _load_onnx(path, model_type, session_options)
+        return _load_onnx(path, model_type, session_options, cuda_options)
 
     elif ext == ".pt":
         names = _get_names_from_pt(path)
@@ -251,7 +259,7 @@ def load_model(path: str, model_type: str = "yolo", pt_convert_callback=None,
             onnx_path = pt_convert_callback(path, names)
 
         if onnx_path and os.path.isfile(onnx_path):
-            info = _load_onnx(onnx_path, model_type, session_options)
+            info = _load_onnx(onnx_path, model_type, session_options, cuda_options)
             # PT에서 추출한 names가 더 정확할 수 있으므로 병합
             if names:
                 info.names = names
@@ -273,8 +281,8 @@ def load_model(path: str, model_type: str = "yolo", pt_convert_callback=None,
         raise ValueError(f"지원하지 않는 모델 형식: {ext}")
 
 
-def _load_onnx(path: str, model_type: str = "yolo", session_options=None) -> ModelInfo:
-    session = _create_session(path, session_options)
+def _load_onnx(path: str, model_type: str = "yolo", session_options=None, cuda_options=None) -> ModelInfo:
+    session = _create_session(path, session_options, cuda_options)
     names = _get_names_from_onnx(session)
     if model_type == "darknet" and all(v.startswith("class_") for v in names.values()):
         names = _DARKNET_DEFAULT_NAMES

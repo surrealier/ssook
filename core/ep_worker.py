@@ -38,8 +38,8 @@ def _run_benchmark(task: dict) -> None:
     run_benchmark_core(
         configs,
         on_progress=lambda d, t, m: _emit({"type": "progress", "done": d, "total": t, "msg": m}),
-        on_result=lambda r: _emit({"type": "result", "data": dataclasses.asdict(r)}),
-        on_error=lambda m: _emit({"type": "error", "msg": m}),
+        on_result=lambda idx, r: _emit({"type": "result", "idx": idx, "data": dataclasses.asdict(r)}),
+        on_error=lambda idx, m: _emit({"type": "error", "idx": idx, "msg": m}),
         is_stopped=lambda: stopped[0],
     )
 
