@@ -618,9 +618,9 @@ const I18n = {
     for (const key of Object.keys(Tabs)) {
       if (Tabs[key] && Tabs[key]._cachedHTML) Tabs[key]._cachedHTML = null;
     }
-    // Re-render current view
+    // Re-render current view (forceRender: bypass the stale old-language cache)
     App.renderSidebar();
-    App.switchTab(App.currentTab);
+    App.switchTab(App.currentTab, true);
   },
 
   getLang() { return this._lang; }

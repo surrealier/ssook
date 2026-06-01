@@ -102,7 +102,10 @@ const App = {
 
   _tabCache: {},
 
-  switchTab(name) {
+  // forceRender: skip the DOM cache entirely and re-render from tab.render().
+  // Used by language switch — the cached HTML is in the old language, so both
+  // saving it and restoring it would re-introduce stale (untranslated) markup.
+  switchTab(name, forceRender = false) {
     const tab = Tabs[name];
     if (!tab) return;
 
@@ -110,9 +113,9 @@ const App = {
     const prev = Tabs[this.currentTab];
     if (prev && prev.destroy) prev.destroy();
 
-    // 현재 탭 DOM 캐시 저장
+    // 현재 탭 DOM 캐시 저장 (강제 재렌더 시엔 stale 상태이므로 저장하지 않음)
     const body = document.getElementById('page-body');
-    if (this.currentTab && body.children.length) {
+    if (this.currentTab && body.children.length && !forceRender) {
       this._tabCache[this.currentTab] = body.innerHTML;
     }
 
@@ -130,10 +133,10 @@ const App = {
     document.getElementById('page-actions').innerHTML = `<button class="btn btn-ghost btn-sm" onclick="showHelp('${name}')" style="color:var(--text-02);font-size:12px;">Help</button>`;
 
     // 캐시된 HTML이 있으면 복원, 없으면 새로 렌더
-    if (tab._cachedHTML) {
+    if (!forceRender && tab._cachedHTML) {
       body.innerHTML = tab._cachedHTML;
       if (tab.init) tab.init();
-    } else if (this._tabCache[name]) {
+    } else if (!forceRender && this._tabCache[name]) {
       body.innerHTML = this._tabCache[name];
       if (tab.init) tab.init();
     } else {
