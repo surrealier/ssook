@@ -1,0 +1,27 @@
+# Optional Training + Deployment dependencies.
+#
+# The core app stays ONNX-runtime-only (see requirements-web.txt). The Training
+# and Deployment (export) tabs need a training/export framework, all treated as
+# OPTIONAL and lazy-imported — a missing backend simply greys the relevant
+# trainer/target out in the UI with an explanation, it never breaks startup.
+#
+#   pip install -r requirements-train.txt
+#
+# For a CUDA build of torch, install from the PyTorch index first, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+# Training (YOLO detect/segment/pose/classify) + .pt->onnx/engine/openvino/coreml export
+ultralytics>=8.3
+torch>=2.2
+torchvision>=0.17
+
+# Image-classification backbones beyond YOLO (timm; falls back to torchvision)
+timm>=1.0
+
+# Deployment export backends (install the ones for your target runtime):
+onnx>=1.15            # graph load / opset handling
+onnxsim>=0.4          # optional: --simplify
+# onnxconverter-common>=1.14   # FP16 conversion from an existing .onnx
+# tensorrt>=10                 # build .engine (NVIDIA GPU; usually from NVIDIA index)
+# openvino>=2024.0             # OpenVINO IR (.xml/.bin)
+# coremltools>=8.0             # CoreML .mlpackage (macOS)

@@ -35,6 +35,14 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 _VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 _MODEL_EXTS = {".onnx"}
 _LABEL_EXTS = {".txt", ".json", ".xml"}
+# Inference loads only .onnx, but Training/Deployment also ingest PyTorch
+# checkpoints, so the *source* model for those flows accepts weight formats.
+_WEIGHT_EXTS = {".onnx", ".pt", ".pth", ".torchscript"}
+# Deployment emits runtime-specific artifacts; the output ext allowlist is
+# wider than _MODEL_EXTS. (OpenVINO IR also writes a sibling .bin; CoreML
+# .mlpackage / OpenVINO IR dir are validated via safe_output_dir instead.)
+_EXPORT_EXTS = {".onnx", ".engine", ".trt", ".plan", ".xml", ".bin",
+                ".mlmodel", ".mlpackage", ".pt", ".torchscript"}
 
 
 def safe_path(
@@ -124,3 +132,20 @@ def safe_image_dir(p: str) -> str:
 
 def safe_label_dir(p: str) -> str:
     return safe_path(p, must_exist=True, must_be_dir=True)
+
+
+def safe_weights_file(p: str) -> str:
+    """Source model for Training/Deployment — .onnx or a PyTorch checkpoint."""
+    return safe_path(p, must_exist=True, must_be_file=True, allowed_exts=_WEIGHT_EXTS)
+
+
+def safe_export_output(p: str) -> str:
+    """Validate a not-yet-existing deployment artifact path (file)."""
+    return safe_path(p, allowed_exts=_EXPORT_EXTS, must_be_file=False)
+
+
+def safe_output_dir(p: str) -> str:
+    """Validate a not-yet-existing output directory (training run dir,
+    OpenVINO IR dir, CoreML .mlpackage). Normalizes + blocks traversal; the
+    directory itself need not exist yet (the worker creates it)."""
+    return safe_path(p, must_be_dir=True)

@@ -4,7 +4,7 @@
 
 # ssook
 
-**All-in-one desktop toolkit for AI model inference, evaluation, analysis & data management**
+**All-in-one desktop toolkit for AI model inference, evaluation, analysis, data management, training & deployment**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/backend-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
@@ -48,8 +48,14 @@
 | 🔍 | **Leaky Split Detector?** | Cross-split (train/val/test) duplicate detection |
 | 🔎 | **Similarity Search?** | Query any image → top-K most similar results |
 | 🎨 | **Augmentation Preview?** | Mosaic, flip, rotate, Albumentations — preview before applying |
+| 🏋️ | **Train a Model?** | YOLO detect/segment/pose/classify + timm/torchvision classifiers, live per-epoch metrics ([docs](docs/training.md)) |
+| 🚀 | **Export / Deploy?** | `.pt`/`.onnx` → onnxruntime (CPU/CUDA/DirectML) / TensorRT / OpenVINO / CoreML / TorchScript with configurable opset/batch/input/precision ([docs](docs/deployment.md)) |
 
 **All in one window. No code required.**
+
+> Training & export frameworks (torch / ultralytics / openvino / …) are **optional**
+> — install with `pip install -r requirements-train.txt`. Unavailable trainers/targets
+> are greyed-out with an explanation; the ONNX-runtime-only core never breaks.
 
 ---
 

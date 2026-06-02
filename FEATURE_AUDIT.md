@@ -15,6 +15,8 @@
 6. [Quality](#6-quality) — anomaly, quality, duplicate, leaky, similarity
 7. [Specialized / 사이드바 미노출](#7-specialized--사이드바-미노출) — segmentation, clip, embedder, pose, instance-seg, tracking, vlm
 8. [공통 / 횡단 이슈](#8-공통--횡단-이슈)
+9. [Training](#9-training) — training
+10. [Deployment](#10-deployment) — deployment
 
 ---
 
@@ -998,6 +1000,81 @@ dHash 16×16(256bit) 쿼리 → Top-K(1-100). 출력: rank/image/distance.
 | **P2** | **dHash 크기 일관성** — `duplicate`(8×8) vs `similarity`(16×16) 불일치. 통일 또는 사용자 선택. | `core/hashing.py` | M |
 | **P2** | **차트/시각화 표준화** — error-analyzer/conf-optimizer/quality/anomaly 모두 수치만, 차트 없거나 SVG 직접 그리기. matplotlib PNG 백엔드 + 일관 컴포넌트. | `core/diagnosis_charts.py` 재사용 | M |
 | **P2** | **i18n 완성도** — findings/recommendations/일부 에러 메시지 영어 only. | i18n 전반 | M |
+
+---
+
+## 9. Training
+
+### `training` — 모델 학습
+
+**[1] 기능 / 최종 목표**
+
+데이터셋으로 비전 모델을 학습/파인튜닝하고 결과 체크포인트를 Deployment로 인계. YOLO 검출/분할/포즈/분류(ultralytics) + 분류 백본(timm/torchvision) 지원. 에폭별 진행·메트릭 실시간 표시, 협조적 중지.
+
+**[2] 현재 구현 구성**
+
+- `core/training/registry.py` — `BaseTrainer` ABC + `TrainerRegistry` + 싱글톤 (optimizer_registry 미러).
+- `core/training/trainers.py` — `UltralyticsTrainer`(detect/segment/pose/classify, `on_fit_epoch_end` 콜백으로 진행·메트릭, `trainer.stop`으로 협조적 중지) + `TimmClassifierTrainer`(ImageFolder).
+- `core/training/dataset.py` — `prepare_yolo_dataset`: 라벨에서 클래스 자동 발견, names 해석(인자→catalog→`class_{i}`), train/val split(deterministic), hardlink + `data.yaml` 생성. 기존 data.yaml 패스스루.
+- `core/training/runner.py` — `run_training` 순수 함수(콜백 주도).
+- `server/training_routes.py` — `/api/training/{trainers,run,status,stop}`, `training_state` TaskState + `try_start` + `executor.submit`, `task_locks["gpu_infer"]` 직렬화, 경로 검증.
+- `web/js/tabs-mlops.js` `Tabs.training` — 트레이너/하이퍼파라미터 폼, 진행바, 에폭 메트릭 테이블, "이 모델 배포" 핸드오프.
+
+**[3] 1과 2의 괴리 / 리스크**
+
+- (a) torch/ultralytics/timm은 optional — 미설치 시 트레이너 비활성(사유 표시). 검증 env: `torch271`.
+- (b) 분류(classify)는 사전 분할된 `train/`·`val/` ImageFolder 필요 — 자동 split 미지원(검출과 비대칭).
+- (c) 협조적 중지는 에폭 경계에서만 동작(에폭 중간 선점 불가) — 긴 에폭은 중지 지연.
+- (d) 학습은 단일 `executor`(max_workers=4) + `gpu_infer` 락을 장시간 점유 → 동시 추론/벤치 starvation 가능.
+- (e) keep/multilabel/dominant는 `data.yaml` 패스스루만 — stock ultralytics는 무시, anydetection fork에서만 동작.
+- (f) CenterNet(metro) 학습 경로 미구현(task.md 10절) — 별도 trainer 필요.
+
+**[4] 개선 작업 항목**
+
+| 우선순위 | 작업 | 파일/함수 | 작업량 |
+|---|---|---|---|
+| P1 | classify 데이터셋 자동 split(ImageFolder → train/val) | `core/training/dataset.py` | M |
+| P1 | 학습 전용 executor 또는 작업 중 추론 락 양보 정책 | `server/state.py`, `training_routes` | M |
+| P2 | 에폭 내 step 단위 진행/중지(batch 콜백) | `trainers.py` | M |
+| P2 | CenterNet keep/gaussian-heatmap trainer 추가 | `core/training/` 신규 | L |
+| P2 | 학습 출력(runs/) 관리 UI(목록/삭제/배포 연결) | `tabs-mlops.js` | S |
+
+---
+
+## 10. Deployment
+
+### `deployment` — 모델 내보내기 / 배포
+
+**[1] 기능 / 최종 목표**
+
+학습된 모델(.pt) 또는 기존 .onnx를 타깃 런타임/EP용 산출물로 export. onnxruntime(CPU/CUDA/DirectML), TensorRT(.engine), OpenVINO(IR), CoreML, TorchScript. opset/batch/input/precision(fp32·fp16·int8) 설정 + `deploy.json` 매니페스트.
+
+**[2] 현재 구현 구성**
+
+- `core/deployment/registry.py` — `BaseExportTarget` ABC + `ExportTargetRegistry` + 싱글톤.
+- `core/deployment/targets.py` — onnxruntime_cpu/cuda/directml(동일 ONNX, provider만 상이) + tensorrt + openvino + coreml + torchscript. `is_available()`로 백엔드 가용성 보고.
+- `core/deployment/exporters.py` — `.pt`는 ultralytics 익스포터(opset/imgsz/batch/dynamic/half), `.onnx`는 quantizer(fp16/int8)·TensorRT API(.engine)·`openvino.convert_model`(IR).
+- `core/deployment/manifest.py` — provider/provider_options(DirectML `enable_mem_pattern=False`)·input/batch/opset·클래스명·env 스냅샷 기록.
+- `core/deployment/runner.py` — `run_export`: 타깃 해석·가용성·export·아티팩트 load-verify(ONNX는 CPU 세션)·매니페스트.
+- `server/deployment_routes.py` — `/api/deploy/{targets,run,status,stop}`, `deploy_state` + `try_start` + `executor.submit` + `gpu_infer` 락, `safe_weights_file`/`safe_export_output`.
+- `web/js/tabs-mlops.js` `Tabs.deployment` — 소스/타깃/정밀도/opset/batch/input 폼, 결과 카드(산출물·크기·provider·검증·매니페스트), "벤치마크" 핸드오프.
+
+**[3] 1과 2의 괴리 / 리스크**
+
+- (a) ONNX 변종은 한 프로세스 공존 불가 — 현재 **인프로세스** export라 openvino/coreml은 해당 백엔드가 설치된 env에서 실행해야 함(미설치 시 타깃 비활성). `ep_manager.launch_worker` 서브프로세스 라우팅 미연결.
+- (b) 기존 .onnx의 opset/batch 재지정은 best-effort(`onnx.version_converter`) — 깨끗한 변경은 .pt에서 재export 권장.
+- (c) CoreML/TorchScript는 .pt 소스 + 해당 백엔드 필요(.onnx 소스 미지원).
+- (d) fp16 onnx(.onnx 소스)는 `onnxconverter_common` 필요(torch271 미설치) — .pt 소스는 ultralytics `half=True`로 의존성 없이 처리.
+- (e) TensorRT/CUDA 빌드는 `gpu_infer` 락 장시간 점유.
+
+**[4] 개선 작업 항목**
+
+| 우선순위 | 작업 | 파일/함수 | 작업량 |
+|---|---|---|---|
+| P1 | EP-격리 서브프로세스 export(`ep_worker`에 `export` task 추가, openvino/coreml를 전용 venv로 라우팅) | `core/ep_worker.py`, `ep_manager`, `runner` | L |
+| P2 | export 후 타깃 EP에서 실제 load-verify(TensorRT/OpenVINO 세션) | `core/deployment/runner.py` | M |
+| P2 | int8 calibration `data.yaml` 자동 생성(이미지 dir → ultralytics int8) | `exporters.py` | S |
+| P2 | 매니페스트 기반 "원클릭 추론/벤치" 통합 | `tabs-mlops.js` | S |
 
 ---
 
