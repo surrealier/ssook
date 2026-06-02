@@ -265,6 +265,167 @@ def test_concurrent_custom_model_type_saves_all_persist(monkeypatch, tmp_path):
         assert f"type{i}" in reloaded.custom_model_types
 
 
+# ── SETTINGS P1: batch class-style endpoint ─────────────────────────────
+def _fresh_cfg(monkeypatch, tmp_path):
+    cfg_path = tmp_path / "app_config.yaml"
+    monkeypatch.setattr("core.app_config._CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(AppConfig, "_instance", None)
+    return cfg_path
+
+
+def test_batch_class_styles_round_trips_all(monkeypatch, tmp_path):
+    """A batch of styles persists every entry through a single save()."""
+    cfg_path = _fresh_cfg(monkeypatch, tmp_path)
+    items = [
+        {"class_id": i, "enabled": (i % 2 == 0), "color": [i, i, i], "thickness": i + 1}
+        for i in range(8)
+    ]
+    req = config_routes.ClassStyleBatchUpdate(styles=items)
+    out = asyncio.run(config_routes.save_class_styles(req))
+    assert out == {"ok": True, "updated": 8}
+
+    monkeypatch.setattr(AppConfig, "_instance", None)
+    reloaded = AppConfig()
+    for i in range(8):
+        style = reloaded.class_styles[i]
+        assert style.enabled == (i % 2 == 0)
+        assert style.color == (i, i, i)
+        assert style.thickness == i + 1
+
+
+def test_batch_class_styles_returns_updated_count(monkeypatch, tmp_path):
+    _fresh_cfg(monkeypatch, tmp_path)
+    req = config_routes.ClassStyleBatchUpdate(
+        styles=[{"class_id": 1, "enabled": False}, {"class_id": 2, "enabled": True}]
+    )
+    out = asyncio.run(config_routes.save_class_styles(req))
+    assert out["updated"] == 2
+
+
+def test_batch_class_styles_falsy_color_clears_to_none(monkeypatch, tmp_path):
+    """Mirror single-style semantics: [] color → None (auto palette)."""
+    _fresh_cfg(monkeypatch, tmp_path)
+    cfg = AppConfig()
+    cfg.class_styles[3] = ClassStyle(color=(1, 2, 3), thickness=4)
+    req = config_routes.ClassStyleBatchUpdate(
+        styles=[{"class_id": 3, "color": [], "thickness": 0}]
+    )
+    out = asyncio.run(config_routes.save_class_styles(req))
+    assert out["ok"] is True
+    assert cfg.class_styles[3].color is None
+    # thickness ≤ 0 → None (global default), as in the single-style route.
+    assert cfg.class_styles[3].thickness is None
+
+
+def test_batch_class_styles_creates_missing_class(monkeypatch, tmp_path):
+    _fresh_cfg(monkeypatch, tmp_path)
+    cfg = AppConfig()
+    assert 99 not in cfg.class_styles
+    req = config_routes.ClassStyleBatchUpdate(
+        styles=[{"class_id": 99, "enabled": False}]
+    )
+    asyncio.run(config_routes.save_class_styles(req))
+    assert cfg.class_styles[99].enabled is False
+
+
+def test_batch_class_styles_rejects_bad_color(monkeypatch, tmp_path):
+    _fresh_cfg(monkeypatch, tmp_path)
+    req = config_routes.ClassStyleBatchUpdate(
+        styles=[{"class_id": 1, "color": [10, 20]}]  # only two components
+    )
+    out = asyncio.run(config_routes.save_class_styles(req))
+    assert out["error"] == "BAD_COLOR"
+
+
+def test_batch_class_styles_rejects_out_of_range_color(monkeypatch, tmp_path):
+    _fresh_cfg(monkeypatch, tmp_path)
+    req = config_routes.ClassStyleBatchUpdate(
+        styles=[{"class_id": 1, "color": [0, 0, 300]}]
+    )
+    out = asyncio.run(config_routes.save_class_styles(req))
+    assert out["error"] == "BAD_COLOR"
+
+
+def test_batch_class_styles_rejects_bad_thickness(monkeypatch, tmp_path):
+    _fresh_cfg(monkeypatch, tmp_path)
+    req = config_routes.ClassStyleBatchUpdate(
+        styles=[{"class_id": 1, "thickness": 9999}]
+    )
+    out = asyncio.run(config_routes.save_class_styles(req))
+    assert out["error"] == "BAD_THICKNESS"
+
+
+def test_batch_class_styles_is_all_or_nothing(monkeypatch, tmp_path):
+    """A bad item rejects the whole batch — no partial mutation persists."""
+    _fresh_cfg(monkeypatch, tmp_path)
+    cfg = AppConfig()
+    req = config_routes.ClassStyleBatchUpdate(
+        styles=[
+            {"class_id": 1, "enabled": False},          # valid
+            {"class_id": 2, "color": [0, 0, 300]},      # invalid → rejects all
+        ]
+    )
+    out = asyncio.run(config_routes.save_class_styles(req))
+    assert out["error"] == "BAD_COLOR"
+    # The valid item must NOT have been applied (validation precedes mutation).
+    assert 1 not in cfg.class_styles
+
+
+def test_batch_class_styles_single_save(monkeypatch, tmp_path):
+    """A batch of N styles writes the YAML exactly once, not once per item."""
+    _fresh_cfg(monkeypatch, tmp_path)
+    cfg = AppConfig()
+    saves = {"n": 0}
+    orig_save = cfg.save
+
+    def _counting_save():
+        saves["n"] += 1
+        orig_save()
+
+    monkeypatch.setattr(cfg, "save", _counting_save)
+    items = [{"class_id": i, "enabled": True} for i in range(10)]
+    req = config_routes.ClassStyleBatchUpdate(styles=items)
+    asyncio.run(config_routes.save_class_styles(req))
+    assert saves["n"] == 1
+
+
+def test_batch_class_styles_does_not_deadlock(monkeypatch, tmp_path):
+    """Regression: the handler must not re-acquire the non-reentrant _rw_lock.
+
+    If it called set_class_style() while already holding _rw_lock it would
+    deadlock; this completes within a generous timeout on a worker thread.
+    """
+    _fresh_cfg(monkeypatch, tmp_path)
+    AppConfig()  # build singleton up front so the worker shares its lock
+    done = threading.Event()
+
+    def _run():
+        req = config_routes.ClassStyleBatchUpdate(
+            styles=[{"class_id": i, "enabled": True} for i in range(5)]
+        )
+        asyncio.run(config_routes.save_class_styles(req))
+        done.set()
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    worker.join(timeout=10)
+    assert done.is_set(), "save_class_styles deadlocked on _rw_lock"
+
+
+def test_single_class_style_still_works(monkeypatch, tmp_path):
+    """The original single-style endpoint must keep working (additive route)."""
+    _fresh_cfg(monkeypatch, tmp_path)
+    cfg = AppConfig()
+    req = config_routes.ClassStyleUpdate(
+        class_id=7, enabled=False, color=[10, 20, 30], thickness=3
+    )
+    out = asyncio.run(config_routes.save_class_style(req))
+    assert out == {"ok": True}
+    assert cfg.class_styles[7].enabled is False
+    assert cfg.class_styles[7].color == (10, 20, 30)
+    assert cfg.class_styles[7].thickness == 3
+
+
 def test_save_config_takes_lock(monkeypatch, tmp_path):
     """save_config mutates under _rw_lock; field round-trips to disk."""
     cfg_path = tmp_path / "app_config.yaml"

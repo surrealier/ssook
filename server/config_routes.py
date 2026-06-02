@@ -148,6 +148,87 @@ async def save_class_style(req: ClassStyleUpdate):
         return {"error": str(e)}
 
 
+class ClassStyleBatchItem(BaseModel):
+    class_id: int
+    enabled: Optional[bool] = None
+    color: Optional[list] = None
+    thickness: Optional[int] = None
+
+
+class ClassStyleBatchUpdate(BaseModel):
+    styles: list[ClassStyleBatchItem]
+
+
+def _validate_color(color: Optional[list]) -> None:
+    """Reject malformed BGR triples before they reach the YAML write.
+
+    A non-3-tuple or out-of-range component would persist a style that the
+    renderer can't interpret; fail fast at the boundary instead. An empty
+    list is allowed: it mirrors the single-style route where a falsy color
+    clears the override back to the auto palette (color → None).
+    """
+    if not color:  # None or [] → "use auto palette", not a malformed triple
+        return
+    if len(color) != 3 or not all(isinstance(c, int) and 0 <= c <= 255 for c in color):
+        raise UnsafePathError(
+            "BAD_COLOR",
+            "color must be a list of three integers in 0..255 (BGR), or empty to clear",
+        )
+
+
+def _validate_thickness(thickness: Optional[int]) -> None:
+    """Bound box thickness so a runaway value can't be serialized."""
+    if thickness is None:
+        return
+    if not isinstance(thickness, int) or thickness < 0 or thickness > 50:
+        raise UnsafePathError(
+            "BAD_THICKNESS",
+            "thickness must be an integer in 0..50",
+        )
+
+
+@router.post("/api/config/class-styles")
+async def save_class_styles(req: ClassStyleBatchUpdate):
+    """Apply a LIST of class styles under one lock + one YAML write.
+
+    "Select All" on the settings table previously fired one POST per class
+    (N × ~100ms). This batches every change into a single AppConfig lock
+    acquisition and a single atomic save(), so toggling many classes costs
+    one round trip and one disk write. Mirrors the single-style semantics:
+    falsy color → None (auto palette), thickness ≤ 0 → None (global default).
+    """
+    try:
+        # Validate the whole batch first so a single bad item rejects the
+        # request before any in-memory mutation (all-or-nothing).
+        for item in req.styles:
+            _validate_color(item.color)
+            _validate_thickness(item.thickness)
+
+        cfg = AppConfig()
+        # Mutate every style directly under the SAME lock save()/_load() use.
+        # _rw_lock is a plain (non-reentrant) Lock, so we must NOT call
+        # set_class_style() here (it re-acquires the lock → deadlock); update
+        # the dict in place instead, then save() once after releasing.
+        with cfg._rw_lock:
+            for item in req.styles:
+                style = cfg.class_styles.get(item.class_id)
+                if style is None:
+                    style = ClassStyle()
+                    cfg.class_styles[item.class_id] = style
+                if item.enabled is not None:
+                    style.enabled = item.enabled
+                if item.color is not None:
+                    style.color = tuple(item.color) if item.color else None
+                if item.thickness is not None:
+                    style.thickness = item.thickness if item.thickness > 0 else None
+        cfg.save()
+        return {"ok": True, "updated": len(req.styles)}
+    except UnsafePathError as e:
+        return {"error": e.code}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 class CustomModelTypeRequest(BaseModel):
     name: str
     model_path: str

@@ -7,6 +7,7 @@ import pytest
 from core.inference import (
     PoseResult, InstanceSegResult, SegmentationResult,
     DetectionResult, postprocess_pose_v8, run_pose, run_instance_seg,
+    run_pose_batch, run_instance_seg_batch,
     UnsupportedModelError,
 )
 
@@ -21,15 +22,35 @@ class _FakeSession:
         return self._outputs
 
 
+class _BatchEchoSession:
+    """ORT-session stand-in for batch tests: emits per-sample outputs sized to
+    the fed batch dim, so run_*_batch can slice output[*][i] for each frame.
+
+    `builder(batch_n)` returns a list of output arrays whose leading dim == batch_n.
+    """
+
+    def __init__(self, builder):
+        self._builder = builder
+
+    def run(self, _output_names, feed):
+        # The single image tensor is the only NCHW (rank-4) value in the feed.
+        tensor = next(v for v in feed.values() if hasattr(v, "ndim") and v.ndim == 4)
+        return self._builder(tensor.shape[0])
+
+
 class _FakeModelInfo:
     """Just enough of ModelInfo for run_pose / run_instance_seg."""
 
-    def __init__(self, model_type, outputs=None, input_size=(640, 640)):
+    def __init__(self, model_type, outputs=None, input_size=(640, 640),
+                 session=None, batch_size=1):
         self.model_type = model_type
-        self.session = _FakeSession(outputs) if outputs is not None else None
+        if session is not None:
+            self.session = session
+        else:
+            self.session = _FakeSession(outputs) if outputs is not None else None
         self.input_name = "images"
         self.input_size = input_size
-        self.batch_size = 1
+        self.batch_size = batch_size
         self.names = {}
 
 
@@ -291,3 +312,162 @@ class TestTrackingClassGating:
         assert sort.class_gating is True
         # Default stays off.
         assert create_tracker("bytetrack").class_gating is False
+
+
+# ── Batch / directory inference (DEFERRED — imports cv2 via core.inference) ──
+# These verify run_pose_batch / run_instance_seg_batch return one result per
+# frame and respect fixed-batch padding/chunking. Run centrally (not by the
+# memory-safe agent) because importing core.inference pulls in cv2.
+
+def _pose_output_builder(channels=56, anchors=100, conf_idx=4):
+    """Return a builder(batch_n) -> [(1*? , channels, anchors)] with one strong
+    detection per sample, so each decoded PoseResult has exactly one box."""
+    def _build(batch_n):
+        out = np.zeros((batch_n, channels, anchors), dtype=np.float32)
+        # one detection per sample with a valid box + high conf
+        out[:, 0, 0] = 320.0  # cx
+        out[:, 1, 0] = 320.0  # cy
+        out[:, 2, 0] = 100.0  # w
+        out[:, 3, 0] = 200.0  # h
+        out[:, conf_idx, 0] = 0.9
+        return [out]
+    return _build
+
+
+class TestRunPoseBatch:
+    """run_pose_batch: per-frame results, type guard, fixed-batch handling."""
+
+    def test_empty_frames_returns_empty_list(self):
+        mi = _FakeModelInfo("pose_yolo", session=_BatchEchoSession(_pose_output_builder()))
+        assert run_pose_batch(mi, [], conf=0.25) == []
+
+    def test_one_result_per_frame(self):
+        mi = _FakeModelInfo("pose_yolo", session=_BatchEchoSession(_pose_output_builder()))
+        frames = [np.zeros((480, 640, 3), dtype=np.uint8) for _ in range(3)]
+        results = run_pose_batch(mi, frames, conf=0.25)
+        assert len(results) == 3
+        for r in results:
+            assert isinstance(r, PoseResult)
+            assert len(r.boxes) == 1
+
+    def test_rejects_non_yolo_pose_type(self):
+        mi = _FakeModelInfo("pose_hrnet", session=_BatchEchoSession(_pose_output_builder()))
+        frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
+        with pytest.raises(UnsupportedModelError):
+            run_pose_batch(mi, frames, conf=0.25)
+
+    def test_fixed_batch_pad_up_trims_to_n(self):
+        # Model fixed batch=4 but only 2 frames → pad up to 4, trim back to 2.
+        mi = _FakeModelInfo("pose_yolo", batch_size=4,
+                            session=_BatchEchoSession(_pose_output_builder()))
+        frames = [np.zeros((480, 640, 3), dtype=np.uint8) for _ in range(2)]
+        results = run_pose_batch(mi, frames, conf=0.25)
+        assert len(results) == 2
+
+    def test_fixed_batch_chunks_when_more_frames_than_bs(self):
+        # Model fixed batch=2 but 5 frames → chunk into 2+2+1, 5 results total.
+        mi = _FakeModelInfo("pose_yolo", batch_size=2,
+                            session=_BatchEchoSession(_pose_output_builder()))
+        frames = [np.zeros((480, 640, 3), dtype=np.uint8) for _ in range(5)]
+        results = run_pose_batch(mi, frames, conf=0.25)
+        assert len(results) == 5
+
+
+def _seg_output_builder(nc=80, nm=32, anchors=8400, mh=160, mw=160):
+    """Builder(batch_n) -> [det (batch_n, 4+nc+nm, anchors), proto (batch_n, nm, mh, mw)]
+    with one above-conf detection per sample."""
+    def _build(batch_n):
+        det = np.zeros((batch_n, 4 + nc + nm, anchors), dtype=np.float32)
+        det[:, 0, 0] = 320.0
+        det[:, 1, 0] = 320.0
+        det[:, 2, 0] = 100.0
+        det[:, 3, 0] = 200.0
+        det[:, 4, 0] = 0.9  # class-0 score
+        proto = np.zeros((batch_n, nm, mh, mw), dtype=np.float32)
+        return [det, proto]
+    return _build
+
+
+class TestRunInstanceSegBatch:
+    """run_instance_seg_batch: per-frame results, type/layout guards, fixed batch."""
+
+    def test_empty_frames_returns_empty_list(self):
+        mi = _FakeModelInfo("instseg_yolo", session=_BatchEchoSession(_seg_output_builder()))
+        assert run_instance_seg_batch(mi, [], conf=0.25) == []
+
+    def test_one_result_per_frame(self):
+        mi = _FakeModelInfo("instseg_yolo", session=_BatchEchoSession(_seg_output_builder()))
+        frames = [np.zeros((480, 640, 3), dtype=np.uint8) for _ in range(3)]
+        results = run_instance_seg_batch(mi, frames, conf=0.25)
+        assert len(results) == 3
+        for r in results:
+            assert isinstance(r, InstanceSegResult)
+            assert len(r.boxes) == 1
+            assert len(r.masks) == 1
+
+    def test_rejects_non_yolo_type(self):
+        mi = _FakeModelInfo("instseg_maskrcnn",
+                            session=_BatchEchoSession(_seg_output_builder()))
+        frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
+        with pytest.raises(UnsupportedModelError):
+            run_instance_seg_batch(mi, frames, conf=0.25)
+
+    def test_fixed_batch_chunks(self):
+        mi = _FakeModelInfo("instseg_yolo", batch_size=2,
+                            session=_BatchEchoSession(_seg_output_builder()))
+        frames = [np.zeros((480, 640, 3), dtype=np.uint8) for _ in range(5)]
+        results = run_instance_seg_batch(mi, frames, conf=0.25)
+        assert len(results) == 5
+
+
+class TestClipBatchEncoder:
+    """CLIPModel.encode_images / zero_shot_classify_batch — DEFERRED (imports
+    onnxruntime via core.clip_inference). Verifies batched rows are L2-normalized
+    and match the per-image path within tolerance."""
+
+    def _make_clip(self):
+        # Lazy import so collection doesn't fail in a cv2/onnxruntime-less env.
+        from core.clip_inference import CLIPModel
+
+        class _ImgSession:
+            def get_inputs(self):
+                class _I:
+                    name = "pixel_values"
+                    shape = [None, 3, 224, 224]  # dynamic batch
+                    type = "tensor(float)"
+                return [_I()]
+
+            def run(self, _names, feed):
+                t = feed["pixel_values"]
+                # Deterministic per-row "embedding": row mean over spatial dims.
+                n = t.shape[0]
+                emb = t.reshape(n, -1).mean(axis=1, keepdims=True) * np.arange(1, 5)
+                return [emb.astype(np.float32)]
+
+        model = CLIPModel.__new__(CLIPModel)
+        model.img_session = _ImgSession()
+        model.txt_session = None
+        model._img_input = _ImgSession().get_inputs()[0]
+        model._img_size = (224, 224)
+        model._img_bs = 1
+        return model
+
+    def test_encode_images_rows_are_unit_norm(self):
+        model = self._make_clip()
+        frames = [np.full((50, 50, 3), v, dtype=np.uint8) for v in (10, 50, 200)]
+        embs = model.encode_images(frames)
+        assert embs.shape[0] == 3
+        norms = np.linalg.norm(embs, axis=1)
+        assert np.allclose(norms, 1.0, atol=1e-4)
+
+    def test_zero_shot_batch_matches_shapes(self):
+        model = self._make_clip()
+        frames = [np.full((50, 50, 3), v, dtype=np.uint8) for v in (10, 200)]
+        text_embs = [np.array([1, 0, 0, 0], dtype=np.float32),
+                     np.array([0, 1, 0, 0], dtype=np.float32)]
+        ranked = model.zero_shot_classify_batch(frames, text_embs, ["a", "b"])
+        assert len(ranked) == 2
+        for row in ranked:
+            assert len(row) == 2
+            # ranked descending by prob
+            assert row[0][1] >= row[1][1]

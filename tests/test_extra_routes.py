@@ -58,6 +58,11 @@ class _FakeCLIPModel:
         ranked += [(l, 0.1) for l in labels if l != labels[idx]]
         return ranked
 
+    def zero_shot_classify_batch(self, frames, text_embs, labels):
+        # Wave-4 batched CLIP path: one ranked list per frame (delegates to the
+        # single-image ranking so the per-frame prediction stays identical).
+        return [self.zero_shot_classify(f, text_embs, labels) for f in frames]
+
 
 @pytest.fixture
 def clip_dataset(tmp_path, monkeypatch):

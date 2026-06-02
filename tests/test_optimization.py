@@ -430,6 +430,53 @@ class TestDiagnoseCharts:
         assert isinstance(img, str)
 
 
+class TestGenerateAllCharts:
+    """generate_all_charts parallelizes the 5 builders; dict shape must match
+    the keys the diagnose route previously built serially."""
+
+    _EXPECTED_KEYS = {
+        "weight_distribution", "op_distribution", "quantization_sensitivity",
+        "channel_importance", "model_overview",
+    }
+
+    def test_keys_match_serial_contract(self, conv_bn_conv_model):
+        from core.diagnosis_charts import generate_all_charts
+        diag = ModelDiagnosisEngine().diagnose(conv_bn_conv_model)
+        charts = generate_all_charts(diag)
+        # Exact same key set as the legacy serial dict — no more, no fewer.
+        assert set(charts.keys()) == self._EXPECTED_KEYS
+
+    def test_each_chart_is_str(self, conv_bn_conv_model):
+        from core.diagnosis_charts import generate_all_charts
+        diag = ModelDiagnosisEngine().diagnose(conv_bn_conv_model)
+        charts = generate_all_charts(diag)
+        for key, img in charts.items():
+            assert isinstance(img, str), key
+            # When matplotlib is present each value is a base64 PNG; "" is the
+            # graceful fallback when matplotlib is absent.
+            if img:
+                assert img.startswith("data:image/png;base64,"), key
+
+    def test_matches_serial_builders(self, conv_bn_conv_model):
+        # The parallel orchestrator must feed each builder the same diagnosis
+        # slice the route fed serially, so non-empty charts come back non-empty.
+        from core.diagnosis_charts import generate_all_charts
+        diag = ModelDiagnosisEngine().diagnose(conv_bn_conv_model)
+        charts = generate_all_charts(diag)
+        # model_overview is built from the whole diagnosis and always renders.
+        assert charts["model_overview"].startswith("data:image/png;base64,")
+
+    def test_single_builder_failure_isolated(self, conv_bn_conv_model):
+        # A broken slice for one chart must not sink the rest of the batch.
+        from core.diagnosis_charts import generate_all_charts
+        diag = ModelDiagnosisEngine().diagnose(conv_bn_conv_model)
+        diag["weight_analysis"] = [{"name": "bad", "mean": "not-a-number"}]
+        charts = generate_all_charts(diag)
+        assert set(charts.keys()) == self._EXPECTED_KEYS
+        # The healthy charts still render despite the poisoned weight slice.
+        assert charts["model_overview"].startswith("data:image/png;base64,")
+
+
 # ============================================================
 # v1.6.0 hardening — TOOLS-01/02/03/08/09/11/12
 # ============================================================

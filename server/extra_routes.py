@@ -82,35 +82,48 @@ async def run_clip(req: CLIPRequest):
         label_total = {l: 0 for l in labels}
         skipped = 0
         detail_log = []
-        for idx, fp in enumerate(imgs):
+        # Batched encode: a 10k-image run was 10k sequential ORT calls. Process
+        # in chunks of CHUNK images, stacking each chunk into one image-encoder
+        # forward and scoring against the cached text-embedding matrix. Cancel is
+        # re-checked per chunk so force-stop stays responsive.
+        _CHUNK = 32
+        processed = 0
+        for start in range(0, len(imgs), _CHUNK):
             if not clip_state.get("running", True):
                 clip_state.update(msg="Stopped by user")
                 return
-            frame = imread(fp)
-            if frame is None:
-                skipped += 1
-                clip_state["skipped"] = skipped
-                clip_state["progress"] = idx + 1
-                continue
-            ranked = model.zero_shot_classify(frame, text_embs, labels)
-            parent = os.path.basename(os.path.dirname(fp)).lower()
-            top_label = ranked[0][0].lower() if ranked else ""
-            correct = False
-            for l in labels:
-                if parent == l.lower():
-                    label_total[l] += 1
-                    if top_label == l.lower():
-                        label_correct[l] += 1
-                        correct = True
-            detail_log.append({
-                "file": os.path.basename(fp),
-                "gt": parent,
-                "pred": ranked[0][0] if ranked else "—",
-                "score": round(ranked[0][1], 4) if ranked else 0,
-                "correct": correct,
-                "top3": [(r[0], round(r[1], 4)) for r in ranked[:3]],
-            })
-            clip_state["progress"] = idx + 1
+            chunk_fps = imgs[start:start + _CHUNK]
+            frames = []
+            kept_fps = []
+            for fp in chunk_fps:
+                frame = imread(fp)
+                if frame is None:
+                    skipped += 1
+                    continue
+                frames.append(frame)
+                kept_fps.append(fp)
+            processed += len(chunk_fps)
+            if frames:
+                ranked_batch = model.zero_shot_classify_batch(frames, text_embs, labels)
+                for fp, ranked in zip(kept_fps, ranked_batch):
+                    parent = os.path.basename(os.path.dirname(fp)).lower()
+                    top_label = ranked[0][0].lower() if ranked else ""
+                    correct = False
+                    for l in labels:
+                        if parent == l.lower():
+                            label_total[l] += 1
+                            if top_label == l.lower():
+                                label_correct[l] += 1
+                                correct = True
+                    detail_log.append({
+                        "file": os.path.basename(fp),
+                        "gt": parent,
+                        "pred": ranked[0][0] if ranked else "—",
+                        "score": round(ranked[0][1], 4) if ranked else 0,
+                        "correct": correct,
+                        "top3": [(r[0], round(r[1], 4)) for r in ranked[:3]],
+                    })
+            clip_state.update(progress=processed, skipped=skipped)
         results = []
         total_correct = 0
         total_count = 0
@@ -196,26 +209,45 @@ async def run_embedder(req: EmbedderRequest):
             emb_list: list = []
             class_to_gis: dict[str, list[int]] = {}  # class -> global indices
             skipped = 0
-            for idx, (cls, fp) in enumerate(all_files):
-                frame = imread(fp)
-                if frame is None:
-                    skipped += 1
-                    embedder_state["skipped"] = skipped
-                    embedder_state["progress"] = idx + 1
-                    continue
-                padded, ratio, pad = letterbox(frame, mi.input_size)
-                tensor = _padded_to_tensor(padded, mi.input_size)
-                if mi.batch_size > 1:
-                    tensor = np.repeat(tensor, mi.batch_size, axis=0)
-                out = mi.session.run(None, {mi.input_name: tensor})
-                emb = out[0][0].flatten().astype(np.float32)
-                emb = emb / (np.linalg.norm(emb) + 1e-9)
-                gi = len(emb_list)
-                emb_list.append(emb)
-                emb_labels.append(cls)
-                emb_fnames.append(os.path.basename(fp))
-                class_to_gis.setdefault(cls, []).append(gi)
-                embedder_state["progress"] = idx + 1
+            # Batched extraction: stack CHUNK preprocessed frames into one forward
+            # instead of one ORT call per image. Fixed-batch models (mi.batch_size>1)
+            # set the chunk to the model batch and the last short chunk is padded
+            # then trimmed. The stable global index (gi) is preserved so the
+            # diagonal-masked self-similarity below stays correct.
+            _CHUNK = mi.batch_size if mi.batch_size > 1 else 32
+            for start in range(0, len(all_files), _CHUNK):
+                if not embedder_state.get("running", True):
+                    embedder_state.update(msg="Stopped by user")
+                    return
+                chunk = all_files[start:start + _CHUNK]
+                tensors = []
+                kept = []  # (cls, fname)
+                for cls, fp in chunk:
+                    frame = imread(fp)
+                    if frame is None:
+                        skipped += 1
+                        continue
+                    padded, ratio, pad = letterbox(frame, mi.input_size)
+                    tensors.append(_padded_to_tensor(padded, mi.input_size).copy())
+                    kept.append((cls, os.path.basename(fp)))
+                if tensors:
+                    batch = np.concatenate(tensors, axis=0)
+                    real = batch.shape[0]
+                    if mi.batch_size > 1 and real < mi.batch_size:
+                        batch = np.concatenate(
+                            [batch, np.repeat(batch[-1:], mi.batch_size - real, axis=0)], axis=0)
+                    out = mi.session.run(None, {mi.input_name: batch})[0]
+                    out = out.reshape(out.shape[0], -1)[:real].astype(np.float32)
+                    norms = np.linalg.norm(out, axis=1, keepdims=True)
+                    out = out / (norms + 1e-9)
+                    for (cls, fname), emb in zip(kept, out):
+                        gi = len(emb_list)
+                        emb_list.append(emb)
+                        emb_labels.append(cls)
+                        emb_fnames.append(fname)
+                        class_to_gis.setdefault(cls, []).append(gi)
+                embedder_state.update(progress=min(start + _CHUNK, len(all_files)),
+                                      skipped=skipped)
 
             # Compute retrieval metrics. Vectorize the full N×N similarity once
             # (all_embs @ all_embs.T) and mask the diagonal (self-match) to -inf
@@ -340,49 +372,103 @@ async def embedder_compare(req: EmbedderCompareRequest):
 class BatchAugmentRequest(BaseModel):
     img_dir: str
     aug_type: str = "Flip"
-    # Preview-only augmentation. Labels are NOT transformed, so this endpoint
-    # only renders a visual preview (the UI shows an aug.preview_only note).
     angle: float = 15.0       # Rotate degrees
     alpha: float = 1.3        # Brightness contrast scale
     beta: float = 30.0        # Brightness additive shift
+    # Optional YOLO label dir. When set and the op supports label co-transform
+    # (Flip/Rotate/Brightness), the boxes are transformed alongside the image
+    # and returned, and preview_only flips to false.
+    label_dir: str = ""
+
+
+def _find_yolo_label(label_dir: str, img_dir: str, fp: str):
+    """Locate a YOLO .txt label for image `fp`: prefer label_dir, else next to image."""
+    stem = os.path.splitext(os.path.basename(fp))[0]
+    candidates = []
+    if label_dir:
+        candidates.append(os.path.join(label_dir, stem + ".txt"))
+    candidates.append(os.path.join(os.path.dirname(fp), stem + ".txt"))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
 
 
 # ── Batch: Augmentation Preview API ────────────────────
 @router.post("/api/batch/augmentation")
 async def batch_augmentation(req: BatchAugmentRequest):
     img_dir = safe_image_dir(req.img_dir)
+    label_dir = safe_image_dir(req.label_dir) if req.label_dir else ""
     imgs = glob_images(img_dir)
     if not imgs:
         return {"error": "No images found"}
     import random
+    from core import augmentation as aug_mod
     # imgs is non-empty here, so random.choice is safe.
     fp = random.choice(imgs)
     frame = imread(fp)
     if frame is None:
         return {"error": "Cannot read image"}
-    original = encode_jpeg(frame)
     aug_type = req.aug_type
-    if aug_type == "Flip":
-        aug = cv2.flip(frame, 1)
-    elif aug_type == "Rotate":
-        M = cv2.getRotationMatrix2D((frame.shape[1]//2, frame.shape[0]//2), req.angle, 1.0)
-        aug = cv2.warpAffine(frame, M, (frame.shape[1], frame.shape[0]))
-    elif aug_type == "Brightness":
-        aug = cv2.convertScaleAbs(frame, alpha=req.alpha, beta=req.beta)
-    elif "Mosaic" in aug_type:
+
+    # Locate a YOLO label and parse boxes (None when no label / unsupported op).
+    label_path = _find_yolo_label(label_dir, img_dir, fp)
+    has_labels = (label_path is not None
+                  and aug_type in aug_mod.LABEL_TRANSFORM_OPS)
+    class_ids = np.zeros(0, dtype=np.int32)
+    boxes = np.zeros((0, 4), dtype=np.float32)
+    if has_labels:
+        with open(label_path, "r", encoding="utf-8", errors="replace") as f:
+            class_ids, boxes = aug_mod.parse_yolo_label(f.read())
+
+    if aug_type == "Mosaic" or "Mosaic" in aug_type:
+        # Mosaic composites 4 images — a single label set has no meaning, so it
+        # stays an image-only preview. Resample distinct readable tiles (avoid
+        # black quadrants); fall back to the base frame when the dir is tiny.
         h, w = frame.shape[:2]
-        half_h, half_w = h//2, w//2
-        samples = [imread(random.choice(imgs)) for _ in range(4)]
-        samples = [cv2.resize(s, (half_w, half_h)) if s is not None else np.zeros((half_h, half_w, 3), dtype=np.uint8) for s in samples]
+        half_h, half_w = h // 2, w // 2
+        readable = [frame]
+        attempts = 0
+        while len(readable) < 4 and attempts < 24:
+            cand = imread(random.choice(imgs))
+            if cand is not None:
+                readable.append(cand)
+            attempts += 1
+        while len(readable) < 4:
+            readable.append(frame)
+        samples = [cv2.resize(s, (half_w, half_h)) for s in readable[:4]]
         top = np.hstack([samples[0], samples[1]])
         bot = np.hstack([samples[2], samples[3]])
         aug = np.vstack([top, bot])
-    else:
-        aug = frame.copy()
-    augmented = encode_jpeg(aug)
-    # preview_only signals the UI that labels were not transformed.
-    return {"original": original, "augmented": augmented,
-            "file": os.path.basename(fp), "preview_only": True}
+        original = encode_jpeg(frame)
+        return {"original": original, "augmented": encode_jpeg(aug),
+                "file": os.path.basename(fp), "preview_only": True}
+
+    # Single-image op: co-transform image + boxes together.
+    aug_img, aug_boxes, aug_cids = aug_mod.augment_image_and_boxes(
+        frame, boxes, class_ids, aug_type,
+        angle=req.angle, alpha=req.alpha, beta=req.beta)
+
+    # Draw boxes on both previews when labels were transformed.
+    orig_vis = aug_mod.draw_boxes_on_image(frame, boxes) if has_labels else frame
+    aug_vis = aug_mod.draw_boxes_on_image(aug_img, aug_boxes) if has_labels else aug_img
+
+    resp = {
+        "original": encode_jpeg(orig_vis),
+        "augmented": encode_jpeg(aug_vis),
+        "file": os.path.basename(fp),
+        # preview_only=false only when labels were actually co-transformed.
+        "preview_only": not has_labels,
+    }
+    if has_labels:
+        # Transformed YOLO labels for the frontend to render/save.
+        resp["labels"] = [
+            {"class_id": int(c), "box": [round(float(v), 6) for v in b]}
+            for c, b in zip(aug_cids, aug_boxes)
+        ]
+        resp["label_text"] = aug_mod.format_yolo_label(aug_cids, aug_boxes)
+        resp["num_boxes"] = len(aug_boxes)
+    return resp
 
 
 # ── Calibration / Quantization API ─────────────────────
@@ -466,10 +552,18 @@ class ProfileModelRequest(BaseModel):
 
 class InferImageRequest(BaseModel):
     model_path: str
-    image_path: str
+    # Single-image mode: set image_path. Directory/batch mode: set image_dir
+    # (image_path may be left empty). Both kept so existing single-image callers
+    # are unchanged; image_dir is the additive batch entry point.
+    image_path: str = ""
+    image_dir: str = ""
     conf: float = 0.25
     model_type: Optional[str] = None
     kpt_conf: float = 0.5   # pose keypoint visibility threshold
+    # Bound the directory scan so a huge folder can't exhaust memory in one
+    # response (per-image overlays are heavy). 0 / negative → no extra cap
+    # beyond max_images below.
+    max_images: int = 200
 
 
 # ── Phase 1: Model Inspector API ───────────────────────
@@ -505,91 +599,177 @@ async def api_profile_model(req: ProfileModelRequest):
 
 
 # ── Phase 1: Pose Estimation API ───────────────────────
+def _draw_pose(frame, result, kpt_conf):
+    """Draw boxes + keypoints + skeleton onto a copy of the frame."""
+    from core.inference import COCO_SKELETON
+    vis = frame.copy()
+    for i in range(len(result.boxes)):
+        x1, y1, x2, y2 = result.boxes[i].astype(int)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        kpts = result.keypoints[i]
+        for kx, ky, kc in kpts:
+            if kc > kpt_conf:
+                cv2.circle(vis, (int(kx), int(ky)), 3, (0, 0, 255), -1)
+        for a, b in COCO_SKELETON:
+            if kpts[a][2] > kpt_conf and kpts[b][2] > kpt_conf:
+                cv2.line(vis, (int(kpts[a][0]), int(kpts[a][1])),
+                         (int(kpts[b][0]), int(kpts[b][1])), (255, 255, 0), 2)
+    return vis
+
+
+def _pose_result_dict(frame, result, kpt_conf):
+    vis = _draw_pose(frame, result, kpt_conf)
+    return {
+        "image": encode_jpeg(vis),
+        "num_persons": len(result.boxes),
+        "infer_ms": round(result.infer_ms, 2),
+        "detections": [
+            {"box": result.boxes[i].tolist(),
+             "score": round(float(result.scores[i]), 3),
+             "keypoints": result.keypoints[i].tolist()}
+            for i in range(len(result.boxes))
+        ],
+    }
+
+
 @router.post("/api/infer/pose")
 async def api_infer_pose(req: InferImageRequest):
     model_path = safe_model_file(req.model_path)
-    image_path = safe_image_file(req.image_path)
     model_type = req.model_type or "pose_yolo"
+    # Directory/batch mode when image_dir is set; otherwise single-image mode.
+    image_dir = safe_image_dir(req.image_dir) if req.image_dir else ""
+    image_path = safe_image_file(req.image_path) if req.image_path else ""
+    if not image_dir and not image_path:
+        return {"error": "image_path or image_dir required"}
 
-    def _work():
+    def _work_single():
         frame = imread(image_path)
         if frame is None:
             return {"error": "Cannot read image"}
         mi = _load_model(model_path, model_type=model_type)
-        from core.inference import run_pose, COCO_SKELETON, COCO_KPT_NAMES
+        from core.inference import run_pose
         result = run_pose(mi, frame, req.conf)
-        vis = frame.copy()
-        for i in range(len(result.boxes)):
-            x1, y1, x2, y2 = result.boxes[i].astype(int)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            kpts = result.keypoints[i]
-            kpt_conf = req.kpt_conf
-            for j, (kx, ky, kc) in enumerate(kpts):
-                if kc > kpt_conf:
-                    cv2.circle(vis, (int(kx), int(ky)), 3, (0, 0, 255), -1)
-            for a, b in COCO_SKELETON:
-                if kpts[a][2] > kpt_conf and kpts[b][2] > kpt_conf:
-                    cv2.line(vis, (int(kpts[a][0]), int(kpts[a][1])),
-                             (int(kpts[b][0]), int(kpts[b][1])), (255, 255, 0), 2)
-        return {
-            "image": encode_jpeg(vis),
-            "num_persons": len(result.boxes),
-            "infer_ms": round(result.infer_ms, 2),
-            "detections": [
-                {"box": result.boxes[i].tolist(),
-                 "score": round(float(result.scores[i]), 3),
-                 "keypoints": result.keypoints[i].tolist()}
-                for i in range(len(result.boxes))
-            ],
-        }
+        return _pose_result_dict(frame, result, req.kpt_conf)
 
-    # Model load + ORT run + per-keypoint cv2 drawing are blocking; running
-    # them on the event loop would freeze every other request (status pollers,
-    # MJPEG stream) for the full inference duration. Offload to the shared pool.
-    return await asyncio.get_event_loop().run_in_executor(executor, _work)
+    def _work_batch():
+        from core.inference import run_pose_batch
+        files = glob_images(image_dir)
+        if req.max_images and req.max_images > 0:
+            files = files[:req.max_images]
+        if not files:
+            return {"error": "No images found"}
+        mi = _load_model(model_path, model_type=model_type)
+        frames, kept = [], []
+        skipped = 0
+        for fp in files:
+            f = imread(fp)
+            if f is None:
+                skipped += 1
+                continue
+            frames.append(f)
+            kept.append(fp)
+        if not frames:
+            return {"error": "No readable images"}
+        results = run_pose_batch(mi, frames, req.conf)
+        per_image = []
+        for fp, frame, result in zip(kept, frames, results):
+            item = _pose_result_dict(frame, result, req.kpt_conf)
+            item["file"] = os.path.basename(fp)
+            per_image.append(item)
+        total_persons = sum(p["num_persons"] for p in per_image)
+        return {"results": per_image, "count": len(per_image),
+                "skipped": skipped, "total_persons": total_persons}
+
+    # Model load + ORT run + cv2 drawing are blocking; offload off the event
+    # loop so concurrent requests (status pollers, MJPEG stream) aren't frozen.
+    work = _work_batch if image_dir else _work_single
+    return await asyncio.get_event_loop().run_in_executor(executor, work)
 
 
 # ── Phase 1: Instance Segmentation API ─────────────────
+def _draw_instance_seg(frame, result):
+    """Draw per-instance mask overlay + boxes + labels onto a copy of the frame."""
+    vis = frame.copy()
+    colors = generate_palette(max(len(result.masks), 1))
+    for i in range(len(result.masks)):
+        mask = result.masks[i]
+        color = colors[i % len(colors)]
+        overlay = vis.copy()
+        overlay[mask > 0] = color
+        cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
+        x1, y1, x2, y2 = result.boxes[i].astype(int)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+        label = f"cls{result.class_ids[i]} {result.scores[i]:.2f}"
+        cv2.putText(vis, label, (x1, max(y1-4, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+    return vis
+
+
+def _instance_seg_result_dict(frame, result):
+    vis = _draw_instance_seg(frame, result)
+    return {
+        "image": encode_jpeg(vis),
+        "num_instances": len(result.boxes),
+        "infer_ms": round(result.infer_ms, 2),
+        "detections": [
+            {"box": result.boxes[i].tolist(),
+             "score": round(float(result.scores[i]), 3),
+             "class_id": int(result.class_ids[i])}
+            for i in range(len(result.boxes))
+        ],
+    }
+
+
 @router.post("/api/infer/instance-seg")
 async def api_infer_instance_seg(req: InferImageRequest):
     model_path = safe_model_file(req.model_path)
-    image_path = safe_image_file(req.image_path)
     model_type = req.model_type or "instseg_yolo"
+    image_dir = safe_image_dir(req.image_dir) if req.image_dir else ""
+    image_path = safe_image_file(req.image_path) if req.image_path else ""
+    if not image_dir and not image_path:
+        return {"error": "image_path or image_dir required"}
 
-    def _work():
+    def _work_single():
         frame = imread(image_path)
         if frame is None:
             return {"error": "Cannot read image"}
         mi = _load_model(model_path, model_type=model_type)
         from core.inference import run_instance_seg
         result = run_instance_seg(mi, frame, req.conf)
-        vis = frame.copy()
-        colors = generate_palette(max(len(result.masks), 1))
-        for i in range(len(result.masks)):
-            mask = result.masks[i]
-            color = colors[i % len(colors)]
-            overlay = vis.copy()
-            overlay[mask > 0] = color
-            cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
-            x1, y1, x2, y2 = result.boxes[i].astype(int)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-            label = f"cls{result.class_ids[i]} {result.scores[i]:.2f}"
-            cv2.putText(vis, label, (x1, max(y1-4, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        return {
-            "image": encode_jpeg(vis),
-            "num_instances": len(result.boxes),
-            "infer_ms": round(result.infer_ms, 2),
-            "detections": [
-                {"box": result.boxes[i].tolist(),
-                 "score": round(float(result.scores[i]), 3),
-                 "class_id": int(result.class_ids[i])}
-                for i in range(len(result.boxes))
-            ],
-        }
+        return _instance_seg_result_dict(frame, result)
+
+    def _work_batch():
+        from core.inference import run_instance_seg_batch
+        files = glob_images(image_dir)
+        if req.max_images and req.max_images > 0:
+            files = files[:req.max_images]
+        if not files:
+            return {"error": "No images found"}
+        mi = _load_model(model_path, model_type=model_type)
+        frames, kept = [], []
+        skipped = 0
+        for fp in files:
+            f = imread(fp)
+            if f is None:
+                skipped += 1
+                continue
+            frames.append(f)
+            kept.append(fp)
+        if not frames:
+            return {"error": "No readable images"}
+        results = run_instance_seg_batch(mi, frames, req.conf)
+        per_image = []
+        for fp, frame, result in zip(kept, frames, results):
+            item = _instance_seg_result_dict(frame, result)
+            item["file"] = os.path.basename(fp)
+            per_image.append(item)
+        total_instances = sum(p["num_instances"] for p in per_image)
+        return {"results": per_image, "count": len(per_image),
+                "skipped": skipped, "total_instances": total_instances}
 
     # ORT run + per-instance cv2.resize/overlay loop are blocking; offload off
     # the event loop so concurrent requests aren't frozen (same as pose).
-    return await asyncio.get_event_loop().run_in_executor(executor, _work)
+    work = _work_batch if image_dir else _work_single
+    return await asyncio.get_event_loop().run_in_executor(executor, work)
 
 
 # ── Phase 1: Tracking API ──────────────────────────────

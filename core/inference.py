@@ -1236,6 +1236,71 @@ def run_pose(model_info: ModelInfo, frame: np.ndarray, conf: float) -> PoseResul
     return result
 
 
+def _batch_preprocess_letterbox(frames: list, input_size: tuple) -> "tuple[np.ndarray, list]":
+    """Stack N frames into one NCHW tensor via letterbox. Returns (tensor, [(ratio,pad), ...]).
+
+    Shared by the pose/instance-seg batch helpers. Uses fresh arrays (no thread
+    buffer) because every frame in the batch is distinct, so the buffer reuse
+    that benefits the single-image hot path would just be overwritten here.
+    """
+    metas = []
+    tensors = []
+    for f in frames:
+        padded, ratio, pad = letterbox(f, input_size)
+        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+        tensors.append(np.ascontiguousarray(
+            rgb.transpose(2, 0, 1)[np.newaxis], dtype=np.float32) / 255.0)
+        metas.append((ratio, pad))
+    return np.concatenate(tensors, axis=0), metas
+
+
+def run_pose_batch(model_info: ModelInfo, frames: list, conf: float) -> "list[PoseResult]":
+    """Pose inference over multiple frames, batched through one forward where possible.
+
+    Mirrors run_pose's type guard. Respects fixed-batch models: pads the batch
+    up to model_info.batch_size and divides timing by the real frame count.
+    Falls back to a per-frame loop only when the model batch dim is fixed and
+    smaller than the requested count.
+    """
+    if model_info.session is None or not frames:
+        return [PoseResult.empty() for _ in frames]
+    if model_info.model_type != "pose_yolo":
+        raise UnsupportedModelError(
+            f"Pose estimation for model type '{model_info.model_type}' is not "
+            f"supported yet — only 'pose_yolo' (YOLO-pose) output is decodable."
+        )
+
+    n = len(frames)
+    bs = model_info.batch_size
+    orig_shapes = [f.shape for f in frames]
+
+    # Fixed-batch model whose batch dim can't hold all frames at once: chunk by
+    # bs so we never feed a tensor the model can't accept.
+    if bs > 1 and bs < n:
+        results: list[PoseResult] = []
+        for start in range(0, n, bs):
+            chunk = frames[start:start + bs]
+            results.extend(run_pose_batch(model_info, chunk, conf))
+        return results
+
+    t0 = time.perf_counter()
+    batch_tensor, metas = _batch_preprocess_letterbox(frames, model_info.input_size)
+    if bs > n:
+        # Pad fixed-batch input up to bs by repeating the last frame; trim outputs.
+        pad_tensor = np.repeat(batch_tensor[-1:], bs - n, axis=0)
+        batch_tensor = np.concatenate([batch_tensor, pad_tensor], axis=0)
+    output = model_info.session.run(None, {model_info.input_name: batch_tensor})
+    infer_ms = (time.perf_counter() - t0) * 1000.0
+
+    results = []
+    for i in range(n):
+        ratio, pad = metas[i]
+        r = postprocess_pose_v8(output[0][i:i + 1], conf, ratio, pad, orig_shapes[i])
+        r.infer_ms = infer_ms / n
+        results.append(r)
+    return results
+
+
 # ── Instance Segmentation Inference ─────────────────────
 @dataclass
 class InstanceSegResult:
@@ -1290,10 +1355,23 @@ def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
             "This model cannot be decoded as 'instseg_yolo'."
         )
 
-    det = output[0][0]      # (116, 8400)
-    protos = output[1][0]   # (32, mh, mw)
+    result = _decode_yolo_seg(output[0][0], output[1][0], conf,
+                             ratio, pad, model_info.input_size, (h_orig, w_orig))
+    result.infer_ms = infer_ms
+    return result
+
+
+def _decode_yolo_seg(det: np.ndarray, protos: np.ndarray, conf: float,
+                     ratio: float, pad: tuple, input_size: tuple,
+                     orig_hw: tuple) -> InstanceSegResult:
+    """Decode one image's YOLO-Seg det+proto tensors → InstanceSegResult (infer_ms=0).
+
+    Extracted from run_instance_seg so the batch path can reuse the identical
+    per-image decode without changing single-image behavior.
+    """
     nm = protos.shape[0]
     nc = det.shape[0] - 4 - nm
+    h_orig, w_orig = orig_hw
 
     scores_all = det[4:4+nc, :]
     max_scores = scores_all.max(axis=0)
@@ -1320,7 +1398,7 @@ def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
     raw_masks = (mask_coeffs @ protos.reshape(nm, -1)).reshape(-1, mh, mw)
     raw_masks = 1.0 / (1.0 + np.exp(-raw_masks))
 
-    ih, iw = model_info.input_size
+    ih, iw = input_size
     pad_h_i, pad_w_i = int(round(pad[1])), int(round(pad[0]))
 
     boxes_out, scores_out, cids_out, masks_out = [], [], [], []
@@ -1347,5 +1425,56 @@ def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
         boxes=np.array(boxes_out, dtype=np.float32),
         scores=np.array(scores_out, dtype=np.float32),
         class_ids=np.array(cids_out, dtype=np.int32),
-        masks=masks_out, infer_ms=infer_ms,
+        masks=masks_out, infer_ms=0.0,
     )
+
+
+def run_instance_seg_batch(model_info: ModelInfo, frames: list,
+                           conf: float) -> "list[InstanceSegResult]":
+    """Instance segmentation over multiple frames, batched through one forward.
+
+    Mirrors run_instance_seg's type/layout guards. Respects fixed-batch models:
+    chunks by batch_size when fixed and smaller than the request, pads up when
+    larger, and divides timing by the real frame count.
+    """
+    if model_info.session is None or not frames:
+        return [InstanceSegResult.empty() for _ in frames]
+    if model_info.model_type != "instseg_yolo":
+        raise UnsupportedModelError(
+            f"Instance segmentation for model type '{model_info.model_type}' is not "
+            f"supported yet — only 'instseg_yolo' (YOLO-Seg) output is decodable."
+        )
+
+    n = len(frames)
+    bs = model_info.batch_size
+    if bs > 1 and bs < n:
+        results: list[InstanceSegResult] = []
+        for start in range(0, n, bs):
+            results.extend(run_instance_seg_batch(model_info, frames[start:start + bs], conf))
+        return results
+
+    orig_shapes = [f.shape for f in frames]
+    t0 = time.perf_counter()
+    batch_tensor, metas = _batch_preprocess_letterbox(frames, model_info.input_size)
+    if bs > n:
+        pad_tensor = np.repeat(batch_tensor[-1:], bs - n, axis=0)
+        batch_tensor = np.concatenate([batch_tensor, pad_tensor], axis=0)
+    output = model_info.session.run(None, {model_info.input_name: batch_tensor})
+    infer_ms = (time.perf_counter() - t0) * 1000.0
+
+    if len(output) < 2 or output[0].ndim != 3 or output[1].ndim != 4:
+        raise UnsupportedModelError(
+            "Model output does not match the YOLO-Seg layout "
+            "(expected a 3D detection tensor + 4D prototype tensor). "
+            "This model cannot be decoded as 'instseg_yolo'."
+        )
+
+    results = []
+    for i in range(n):
+        ratio, pad = metas[i]
+        h_orig, w_orig = orig_shapes[i][:2]
+        r = _decode_yolo_seg(output[0][i], output[1][i], conf, ratio, pad,
+                             model_info.input_size, (h_orig, w_orig))
+        r.infer_ms = infer_ms / n
+        results.append(r)
+    return results
