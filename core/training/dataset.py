@@ -13,6 +13,13 @@ Files are hard-linked (copy fallback) so even large datasets prepare quickly
 without duplicating bytes. If the source dir already contains a ``data.yaml``
 it is used as-is. Class ids are discovered from the labels; names come from the
 caller, else a class catalog match, else ``class_{i}``.
+
+``prepare_classification_dataset`` is the ImageFolder analogue: it auto-splits a
+flat ``class_name/img.*`` directory into ``train/`` + ``val/`` (hard-linked,
+same conventions) so classification trainers no longer require a pre-split
+input. A class with too few images to spare a val sample keeps all of them in
+train — never an empty train split — so single-image-per-class folders still
+train (val simply omits that class).
 """
 from __future__ import annotations
 
@@ -207,6 +214,119 @@ def prepare_yolo_dataset(
         "n_val": n_val_written,
         "n_total": len(pairs),
         "n_unlabeled": len(pairs) - len(label_files),
+    }
+
+
+def _class_subdirs(images_dir: str) -> list[str]:
+    """Immediate subdirectory names of ``images_dir`` (candidate classes), sorted."""
+    try:
+        entries = os.listdir(images_dir)
+    except OSError:
+        return []
+    return sorted(
+        name for name in entries if os.path.isdir(os.path.join(images_dir, name))
+    )
+
+
+def prepare_classification_dataset(
+    images_dir: str,
+    val_ratio: float = 0.2,
+    seed: int = 0,
+    out_root: Optional[str] = None,
+) -> dict:
+    """Prepare an ImageFolder classification dataset with a train/val split.
+
+    Two modes:
+
+    * ``images_dir`` already holds a ``train/`` subdir -> it is treated as a
+      pre-split ImageFolder and returned untouched (preserves prior behavior;
+      ``prepared`` is False).
+    * Otherwise ``images_dir`` is a flat ImageFolder (``class_name/img.*``). Each
+      immediate subdir is a class; its images are split deterministically with
+      ``random.Random(seed)`` and hard-linked into ``<out_root>/train/<cls>/``
+      and ``<out_root>/val/<cls>/``.
+
+    Returns ``{"data_dir", "prepared", "classes", "n_train", "n_val"}``.
+    Raises ValueError if no class subdirs / images are found.
+    """
+    train_dir = os.path.join(images_dir, "train")
+    if os.path.isdir(train_dir):
+        # Pre-split passthrough: count without moving anything.
+        classes = _class_subdirs(train_dir)
+        n_train = len(_glob_images(train_dir))
+        val_dir = os.path.join(images_dir, "val")
+        n_val = len(_glob_images(val_dir)) if os.path.isdir(val_dir) else 0
+        log.info("classification dataset: using pre-split %s (%d train / %d val)",
+                 images_dir, n_train, n_val)
+        return {
+            "data_dir": images_dir,
+            "prepared": False,
+            "classes": classes,
+            "n_train": n_train,
+            "n_val": n_val,
+        }
+
+    classes = _class_subdirs(images_dir)
+    if not classes:
+        raise ValueError(
+            f"No class subdirectories found under {images_dir}; expected a flat "
+            f"ImageFolder of class_name/image.* or a pre-split train/ dir."
+        )
+
+    # Gather per-class images first so an entirely empty dir fails clearly
+    # before we create any output.
+    per_class: dict[str, list[str]] = {}
+    for cls in classes:
+        imgs = _glob_images(os.path.join(images_dir, cls))
+        if imgs:
+            per_class[cls] = imgs
+    if not per_class:
+        raise ValueError(f"No images found in any class subdirectory under {images_dir}")
+
+    if out_root is None:
+        from core.paths import tmp_dir
+        safe = "".join(c if c.isalnum() else "_" for c in os.path.basename(os.path.normpath(images_dir)))
+        out_root = str(tmp_dir("training") / f"{safe or 'dataset'}_cls_split")
+
+    # Rebuild cleanly so a re-prep never mixes with a stale split.
+    if os.path.isdir(out_root):
+        shutil.rmtree(out_root, ignore_errors=True)
+
+    rng = random.Random(seed)
+    n_train = n_val = 0
+    final_classes: list[str] = []
+    for cls in sorted(per_class):
+        imgs = per_class[cls][:]
+        rng.shuffle(imgs)
+        # A class with only one image can't spare a val sample -> all to train,
+        # so train is never empty for that class (val just omits the class).
+        n_val_cls = max(1, int(round(len(imgs) * val_ratio))) if len(imgs) > 1 else 0
+        val_imgs = imgs[:n_val_cls]
+        train_imgs = imgs[n_val_cls:] or imgs  # never leave this class' train empty
+
+        cls_train = os.path.join(out_root, "train", cls)
+        os.makedirs(cls_train, exist_ok=True)
+        for img in train_imgs:
+            _link_or_copy(img, os.path.join(cls_train, os.path.basename(img)))
+        n_train += len(train_imgs)
+
+        if val_imgs:
+            cls_val = os.path.join(out_root, "val", cls)
+            os.makedirs(cls_val, exist_ok=True)
+            for img in val_imgs:
+                _link_or_copy(img, os.path.join(cls_val, os.path.basename(img)))
+            n_val += len(val_imgs)
+
+        final_classes.append(cls)
+
+    log.info("classification dataset prepared: %d classes, %d train / %d val -> %s",
+             len(final_classes), n_train, n_val, out_root)
+    return {
+        "data_dir": out_root,
+        "prepared": True,
+        "classes": final_classes,
+        "n_train": n_train,
+        "n_val": n_val,
     }
 
 

@@ -53,6 +53,7 @@ Tabs.training = {
             <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-top:0.5rem;">
               <div class="form-group"><label class="form-label">${t('training.lr')}</label><input type="number" class="form-input input-normal" id="train-lr" placeholder="auto" step="0.0001"></div>
               <div class="form-group"><label class="form-label">${t('training.val_ratio')}</label><input type="number" class="form-input input-normal" id="train-val" value="0.2" min="0" max="0.9" step="0.05"></div>
+              <div class="form-group"><label class="form-label">${t('training.patience')}</label><input type="number" class="form-input input-normal" id="train-patience" placeholder="auto" min="0" step="1"></div>
             </div>
           </details>
 
@@ -69,13 +70,20 @@ Tabs.training = {
         <div class="card" style="padding:1.5rem;">
           <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('training.progress')}</h3>
           <div id="train-summary"></div>
-          <div class="table-container"><table><thead><tr><th>${t('training.epoch')}</th><th>Metrics</th></tr></thead>
+          <div class="table-container"><table><thead><tr><th>${t('training.epoch')}</th><th>${t('training.metrics')}</th></tr></thead>
           <tbody id="train-results"><tr><td colspan="2" class="text-secondary" style="text-align:center;padding:2rem;">${t('training.hint')}</td></tr></tbody></table></div>
+        </div>
+
+        <div class="card" style="padding:1.5rem;">
+          <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('training.runs')}</h3>
+          <div id="train-runs"></div>
         </div>
       </div>`;
   },
 
   async init() {
+    const trainerSel = document.getElementById('train-trainer');
+    if (trainerSel) trainerSel.innerHTML = `<option disabled selected>${t('common.loading')}</option>`;
     try {
       const r = await API.get('/api/training/trainers');
       this._trainers = r.trainers || [];
@@ -101,6 +109,10 @@ Tabs.training = {
         this._poll();
       }
     } catch (e) { /* status optional on init */ }
+    // Wire delegation on the summary container too: on cache-restore the node is
+    // fresh, so a previously-rendered "Deploy this model" button needs rebinding.
+    this._wireActions(document.getElementById('train-summary'));
+    this._loadRuns();
   },
 
   _onTrainerChange() {
@@ -133,6 +145,7 @@ Tabs.training = {
       lr0: parseFloat(document.getElementById('train-lr').value) || null,
       device: document.getElementById('train-device').value || '',
       val_ratio: parseFloat(document.getElementById('train-val').value) || 0.2,
+      patience: +document.getElementById('train-patience').value || null,
     };
     document.getElementById('train-run').disabled = true;
     document.getElementById('train-run').textContent = t('training.running');
@@ -170,6 +183,7 @@ Tabs.training = {
         if (s.msg && s.msg.startsWith('Error')) { App.setStatus(s.msg); return; }
         this._renderSummary(s.results && s.results.summary);
         App.setStatus(t('training.complete'));
+        this._loadRuns();
       }
     } catch (e) {
       console.warn('poll error:', e);
@@ -188,6 +202,13 @@ Tabs.training = {
     if (table) { table.querySelector('thead').innerHTML = head; document.getElementById('train-results').innerHTML = body; }
   },
 
+  // Escape a server string for safe interpolation inside a double-quoted HTML
+  // attribute. escHtml() (textContent→innerHTML) covers &<> but NOT quotes, so
+  // a path/name with a quote could break out of data-path="…". We add &quot;.
+  _attr(value) {
+    return escHtml(value).replace(/"/g, '&quot;');
+  },
+
   _renderSummary(summary) {
     if (!summary) return;
     const best = summary.best_model || '';
@@ -199,9 +220,82 @@ Tabs.training = {
       ${metricHtml}
     </div>`;
     if (best) {
-      html += `<button class="btn btn-secondary" onclick="Tabs.deployment._loadModel('${best.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')">${t('training.deploy_now')}</button>`;
+      // Path carried via data-path (attribute-escaped) instead of inline-onclick
+      // string escaping, which was fragile against quotes/backslashes.
+      html += `<button class="btn btn-secondary" data-action="deploy" data-path="${this._attr(best)}">${t('training.deploy_now')}</button>`;
     }
-    document.getElementById('train-summary').innerHTML = html;
+    const summaryEl = document.getElementById('train-summary');
+    summaryEl.innerHTML = html;
+    this._wireActions(summaryEl);
+  },
+
+  // Delegate clicks for data-action buttons within a container. The container
+  // node survives innerHTML replacement, so a single listener per render is fine;
+  // we tag the node to avoid stacking duplicate listeners across re-renders.
+  _wireActions(container) {
+    if (!container || container._actionsWired) return;
+    container._actionsWired = true;
+    container.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-action]');
+      if (!btn) return;
+      const action = btn.dataset.action;
+      const path = btn.dataset.path || '';
+      const name = btn.dataset.name || '';
+      if (action === 'deploy') Tabs.deployment._loadModel(path);
+      else if (action === 'benchmark') Tabs.deployment._openInBenchmark(path);
+      else if (action === 'delete') this._deleteRun(name);
+    });
+  },
+
+  async _loadRuns() {
+    const host = document.getElementById('train-runs');
+    if (!host) return;
+    let runs = [];
+    try {
+      const r = await API.get('/api/training/runs');
+      runs = (r && r.runs) || [];
+    } catch (e) { console.warn('runs load:', e); }
+    if (!runs.length) {
+      host.innerHTML = `<div class="text-secondary" style="text-align:center;padding:1.5rem;">${t('runs.empty')}</div>`;
+      return;
+    }
+    const rows = runs.map(run => {
+      const name = run.name || '';
+      const best = run.best_model || '';
+      const metrics = run.last_metrics || {};
+      const metricStr = Object.keys(metrics).map(k => `${escHtml(k)}=${escHtml(String(metrics[k]))}`).join(', ') || '—';
+      const size = run.size_mb != null ? run.size_mb + ' MB' : '—';
+      // Deploy/Benchmark need a weights artifact; disable when absent.
+      const canDeploy = run.has_weights && best;
+      const deployDis = canDeploy ? '' : ' disabled';
+      return `<tr>
+        <td style="word-break:break-all;font-size:12px;">${escHtml(name)}</td>
+        <td>${escHtml(run.task || '—')}</td>
+        <td style="font-size:11px;">${metricStr}</td>
+        <td>${size}</td>
+        <td style="white-space:nowrap;">
+          <button class="btn btn-secondary btn-sm" data-action="deploy" data-path="${this._attr(best)}"${deployDis}>${t('training.deploy')}</button>
+          <button class="btn btn-secondary btn-sm" data-action="benchmark" data-path="${this._attr(best)}"${deployDis}>${t('training.benchmark')}</button>
+          <button class="btn btn-danger btn-sm" data-action="delete" data-name="${this._attr(name)}">${t('training.delete')}</button>
+        </td>
+      </tr>`;
+    }).join('');
+    host.innerHTML = `<div class="table-container"><table><thead><tr>
+      <th>${t('training.runs')}</th><th>${t('eval.task')}</th><th>${t('training.metrics')}</th><th>${t('deploy.size')}</th><th></th>
+    </tr></thead><tbody>${rows}</tbody></table></div>`;
+    this._wireActions(host);
+  },
+
+  async _deleteRun(name) {
+    if (!name || !confirm(`${t('training.delete')}: ${name}?`)) return;
+    try {
+      // API client has no DELETE verb; call fetch directly. Backend returns
+      // {ok:true} or {error:"..."} either way (200 envelope), so read the body.
+      const resp = await fetch(API.base + `/api/training/runs/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const r = await resp.json().catch(() => ({}));
+      if (!resp.ok || (r && r.error)) { App.setStatus('Error: ' + ((r && r.error) || resp.statusText)); return; }
+    } catch (e) { App.setStatus(`Error: ${e.message}`, e.stack); return; }
+    this._loadRuns();
   },
 
   _resetButtons() {
@@ -246,6 +340,7 @@ Tabs.deployment = {
             <div class="form-group">
               <label class="form-label">${t('deploy.target')}</label>
               <select class="form-input input-normal" id="deploy-target"></select>
+              <span class="text-secondary" id="deploy-compat-hint" style="display:none;font-size:11px;color:var(--status-warning-05);margin-top:0.25rem;"></span>
             </div>
             <div class="form-group">
               <label class="form-label">${t('deploy.precision')}</label>
@@ -288,18 +383,29 @@ Tabs.deployment = {
   },
 
   async init() {
+    const targetSel = document.getElementById('deploy-target');
+    if (targetSel) targetSel.innerHTML = `<option disabled selected>${t('common.loading')}</option>`;
     try {
       const r = await API.get('/api/deploy/targets');
       this._targets = r.targets || [];
-      const sel = document.getElementById('deploy-target');
-      if (sel) {
-        sel.innerHTML = this._targets.map(tg => {
-          const dis = tg.available ? '' : ' disabled';
-          const note = tg.available ? '' : ` ${t('deploy.unavailable')}`;
-          return `<option value="${tg.name}"${dis}>${escHtml(tg.label)}${note}</option>`;
-        }).join('');
-      }
+      this._renderTargets();
     } catch (e) { console.warn('targets load:', e); }
+    // Re-evaluate target compatibility when the source model or target changes.
+    const modelEl = document.getElementById('deploy-model');
+    if (modelEl && !modelEl._compatWired) {
+      modelEl._compatWired = true;
+      modelEl.addEventListener('change', () => this._renderTargets());
+      modelEl.addEventListener('input', () => this._renderTargets());
+    }
+    const sel = document.getElementById('deploy-target');
+    if (sel && !sel._compatWired) {
+      sel._compatWired = true;
+      sel.addEventListener('change', () => this._onTargetChange());
+    }
+    // Wire result-card delegation on init too: when the tab DOM is restored from
+    // cache the container is a fresh node, so a previously-rendered benchmark
+    // button would otherwise have no click handler.
+    this._wireResultActions(document.getElementById('deploy-result-body'));
     // Resume polling if an export is still running (cached tab DOM on return).
     try {
       const s = await API.get('/api/deploy/status');
@@ -311,6 +417,57 @@ Tabs.deployment = {
         this._poll();
       }
     } catch (e) { /* status optional on init */ }
+  },
+
+  // Escape a server string for a double-quoted HTML attribute (escHtml covers
+  // &<> but not quotes). Mirrors Tabs.training._attr.
+  _attr(value) {
+    return escHtml(value).replace(/"/g, '&quot;');
+  },
+
+  // Map a source model path to a target's `accepts` kind ("pt"/"onnx").
+  // Empty path → null (treat all targets as compatible).
+  _sourceKind(path) {
+    if (!path) return null;
+    if (/\.onnx$/i.test(path)) return 'onnx';
+    if (/\.(pt|pth)$/i.test(path)) return 'pt';
+    return null;  // unknown extension → don't restrict
+  },
+
+  _renderTargets() {
+    const sel = document.getElementById('deploy-target');
+    if (!sel) return;
+    const prev = sel.value;
+    const modelPath = (document.getElementById('deploy-model') || {}).value || G.model || '';
+    const kind = this._sourceKind(modelPath);
+    sel.innerHTML = this._targets.map(tg => {
+      const accepts = Array.isArray(tg.accepts) ? tg.accepts : null;
+      const incompatible = kind && accepts && !accepts.includes(kind);
+      const dis = (!tg.available || incompatible) ? ' disabled' : '';
+      let note = tg.available ? '' : ` ${t('deploy.unavailable')}`;
+      if (tg.available && incompatible) note = ` (${kind} ✗)`;
+      return `<option value="${tg.name}"${dis}>${escHtml(tg.label)}${note}</option>`;
+    }).join('');
+    // Preserve the prior selection if it's still selectable.
+    if (prev) {
+      const opt = sel.querySelector(`option[value="${this._attr(prev)}"]`);
+      if (opt && !opt.disabled) sel.value = prev;
+    }
+    this._onTargetChange();
+  },
+
+  // Show a hint when the selected target can't accept the current source kind.
+  _onTargetChange() {
+    const sel = document.getElementById('deploy-target');
+    const hint = document.getElementById('deploy-compat-hint');
+    if (!sel || !hint) return;
+    const tg = this._targets.find(x => x.name === sel.value);
+    const modelPath = (document.getElementById('deploy-model') || {}).value || G.model || '';
+    const kind = this._sourceKind(modelPath);
+    const accepts = tg && Array.isArray(tg.accepts) ? tg.accepts : null;
+    const incompatible = !!(kind && accepts && !accepts.includes(kind));
+    hint.textContent = incompatible ? t('deploy.incompatible_source') : '';
+    hint.style.display = incompatible ? '' : 'none';
   },
 
   _loadModel(path) {
@@ -411,14 +568,37 @@ Tabs.deployment = {
       html += `<div><span class="text-secondary">${label}</span><br><strong style="${wrap ? 'word-break:break-all;font-size:12px;' : ''}">${escHtml(String(val))}</strong></div>`;
     }
     html += '</div>';
+    // Hard validation failure → danger red (kept as-is below).
     if (res.validation_error) {
       html += `<div style="color:var(--action-danger-05);margin-top:0.75rem;font-size:12px;">${escHtml(res.validation_error)}</div>`;
     }
-    if (out && /\.onnx$/i.test(out)) {
-      html += `<button class="btn btn-secondary" style="margin-top:1rem;" onclick="Tabs.deployment._openInBenchmark('${out.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')">${t('deploy.open_bench')}</button>`;
+    // Soft warnings (export succeeded but with caveats) → amber, not red.
+    const warnings = Array.isArray(res.warnings) ? res.warnings : [];
+    if (warnings.length || res.validation_warning) {
+      const lines = warnings.concat(res.validation_warning ? [res.validation_warning] : []);
+      html += `<div style="color:var(--status-warning-05);margin-top:0.75rem;font-size:12px;">
+        <strong>${t('deploy.warnings')}</strong><br>${lines.map(w => escHtml(String(w))).join('<br>')}</div>`;
     }
-    document.getElementById('deploy-result-body').innerHTML = html;
+    if (out && /\.onnx$/i.test(out)) {
+      // Path via data-path attribute instead of fragile inline-onclick escaping.
+      html += `<button class="btn btn-secondary" style="margin-top:1rem;" data-action="benchmark" data-path="${this._attr(out)}">${t('deploy.open_bench')}</button>`;
+    }
+    const body = document.getElementById('deploy-result-body');
+    body.innerHTML = html;
+    this._wireResultActions(body);
     document.getElementById('deploy-result').style.display = '';
+  },
+
+  // Delegate clicks for the result-card action buttons. Container survives
+  // innerHTML replacement, so one listener per render (guarded) suffices.
+  _wireResultActions(container) {
+    if (!container || container._actionsWired) return;
+    container._actionsWired = true;
+    container.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-action]');
+      if (!btn) return;
+      if (btn.dataset.action === 'benchmark') this._openInBenchmark(btn.dataset.path || '');
+    });
   },
 
   _openInBenchmark(outputPath) {

@@ -72,16 +72,23 @@ def _apply_onnx_precision_from_onnx(
         return r
     # fp32 — copy through (opset re-spec on an existing ONNX is best-effort).
     if opts.get("opset"):
+        requested_opset = int(opts["opset"])
         try:
             import onnx
             from onnx import version_converter
             model = onnx.load(src_onnx)
-            converted = version_converter.convert_version(model, int(opts["opset"]))
+            converted = version_converter.convert_version(model, requested_opset)
             onnx.save(converted, output_path)
-            return {"output_path": output_path, "opset": int(opts["opset"])}
+            return {"output_path": output_path, "opset": requested_opset}
         except Exception:
-            # version_converter is brittle for real graphs; fall back to copy.
-            pass
+            # version_converter is brittle for real graphs; fall back to copy
+            # but tell the caller — never silently claim the re-spec succeeded.
+            if os.path.abspath(src_onnx) != os.path.abspath(output_path):
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+                shutil.copy2(src_onnx, output_path)
+            warning = (f"opset re-spec to {requested_opset} failed (graph unsupported "
+                       f"by version_converter); kept original opset")
+            return {"output_path": output_path, "warnings": [warning]}
     if os.path.abspath(src_onnx) != os.path.abspath(output_path):
         os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
         shutil.copy2(src_onnx, output_path)
@@ -175,6 +182,7 @@ class OnnxCudaTarget(_OnnxRuntimeTarget):
     description = "ONNX tuned for NVIDIA CUDAExecutionProvider; FP16 recommended."
     provider = "CUDAExecutionProvider"
     platforms = ("win32", "linux")
+    uses_gpu = True
     _provider_options = {"device_id": 0}
 
 
@@ -198,6 +206,7 @@ class TensorRTTarget(BaseExportTarget):
     provider = "TensorrtExecutionProvider"
     output_ext = ".engine"
     platforms = ("win32", "linux")
+    uses_gpu = True
 
     def is_available(self) -> tuple[bool, str]:
         ok = super().is_available()
@@ -273,6 +282,7 @@ class CoreMLTarget(BaseExportTarget):
     provider = "CoreMLExecutionProvider"
     output_ext = ".mlpackage"
     platforms = ("darwin",)
+    accepts = ("pt",)  # CoreML export requires a PyTorch checkpoint source
 
     def is_available(self) -> tuple[bool, str]:
         ok = super().is_available()
@@ -308,6 +318,7 @@ class TorchScriptTarget(BaseExportTarget):
     description = "Serialized TorchScript module (.torchscript) for libtorch deployment."
     provider = None
     output_ext = ".torchscript"
+    accepts = ("pt",)  # TorchScript export requires a PyTorch checkpoint source
 
     def is_available(self) -> tuple[bool, str]:
         ok = super().is_available()

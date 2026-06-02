@@ -150,3 +150,21 @@ async def training_stop():
     # keeping `running` set means the start guard can't be re-entered mid-run.
     training_state["cancel_requested"] = True
     return {"ok": True}
+
+
+@router.get("/api/training/runs")
+async def list_runs_route():
+    """List finished training runs (newest first) for the runs browser."""
+    from core.training.runs import list_runs  # lazy: keep router import-light
+    return {"runs": list_runs()}
+
+
+@router.delete("/api/training/runs/{name}")
+async def delete_run_route(name: str):
+    """Delete one run dir; traversal/missing names return {error} with 200."""
+    from core.training.runs import delete_run
+    try:
+        delete_run(name)
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"ok": True}

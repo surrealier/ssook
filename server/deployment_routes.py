@@ -7,6 +7,7 @@ opset / batch / input-size / precision, and writes a deploy manifest.
 
 Long-running-job pattern mirrors server/optimization_routes.py.
 """
+import contextlib
 import logging
 import os
 from typing import Optional, Union
@@ -57,6 +58,16 @@ def _derive_output(model_path: str, target_name: str, ext: str) -> str:
     return f"{base}_{target_name}{ext}"
 
 
+def _source_kind(model_path: str) -> str:
+    """Map a source extension to a target.accepts kind ("pt" | "onnx" | ext)."""
+    ext = os.path.splitext(model_path)[1].lower()
+    if ext in (".pt", ".pth"):
+        return "pt"
+    if ext == ".onnx":
+        return "onnx"
+    return ext.lstrip(".") or "?"
+
+
 @router.post("/api/deploy/run")
 async def run_deploy(req: DeployRequest):
     from core.deployment import registry
@@ -72,6 +83,23 @@ async def run_deploy(req: DeployRequest):
         calibration_dir = safe_image_dir(req.calibration_dir) if req.calibration_dir else ""
     except UnsafePathError as e:
         return {"error": str(e), "code": f"PATH_{e.code}"}
+
+    # Reject incompatible source kinds early so the user gets a clear message
+    # instead of a backend-specific failure mid-export (CoreML/TorchScript need .pt).
+    source_kind = _source_kind(req.model_path)
+    if source_kind not in target.accepts:
+        accepts = "/".join(target.accepts)
+        return {"error": f"Target '{req.target}' requires a {accepts} source "
+                         f"(got {source_kind})"}
+
+    # Validate the configurable levers up front (opset range follows the ONNX
+    # opset versions onnx.version_converter / ultralytics realistically accept).
+    if req.opset is not None and not (9 <= req.opset <= 22):
+        return {"error": f"opset must be between 9 and 22 (got {req.opset})"}
+    if req.batch is not None and req.batch < 1:
+        return {"error": f"batch must be >= 1 (got {req.batch})"}
+    if req.workspace_gb <= 0:
+        return {"error": f"workspace_gb must be > 0 (got {req.workspace_gb})"}
 
     if not deploy_state.try_start(progress=0, total=1, msg="Starting export...",
                                   results={}, cancel_requested=False):
@@ -89,8 +117,12 @@ async def run_deploy(req: DeployRequest):
     }
 
     def _run():
-        # TensorRT/ONNX-GPU builds touch the GPU — serialize with inference.
-        with task_locks["gpu_infer"]:
+        # Only GPU-building targets (TensorRT, ONNX-CUDA) serialize with
+        # inference via the gpu_infer lock. CPU-only exports (CPU ONNX,
+        # OpenVINO, TorchScript, CoreML) must NOT hold it — otherwise a long
+        # CPU export would block the viewer/benchmark from running inference.
+        gpu_guard = task_locks["gpu_infer"] if target.uses_gpu else contextlib.nullcontext()
+        with gpu_guard:
             try:
                 from core.deployment.runner import run_export
 

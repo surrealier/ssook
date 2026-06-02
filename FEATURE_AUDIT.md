@@ -1031,13 +1031,16 @@ dHash 16×16(256bit) 쿼리 → Top-K(1-100). 출력: rank/image/distance.
 
 **[4] 개선 작업 항목**
 
-| 우선순위 | 작업 | 파일/함수 | 작업량 |
-|---|---|---|---|
-| P1 | classify 데이터셋 자동 split(ImageFolder → train/val) | `core/training/dataset.py` | M |
-| P1 | 학습 전용 executor 또는 작업 중 추론 락 양보 정책 | `server/state.py`, `training_routes` | M |
-| P2 | 에폭 내 step 단위 진행/중지(batch 콜백) | `trainers.py` | M |
-| P2 | CenterNet keep/gaussian-heatmap trainer 추가 | `core/training/` 신규 | L |
-| P2 | 학습 출력(runs/) 관리 UI(목록/삭제/배포 연결) | `tabs-mlops.js` | S |
+| 우선순위 | 작업 | 파일/함수 | 작업량 | 상태 |
+|---|---|---|---|---|
+| P1 | classify 데이터셋 자동 split(ImageFolder → train/val) | `core/training/dataset.py` | M | ✅ `prepare_classification_dataset` |
+| P1 | 학습 전용 executor 또는 작업 중 추론 락 양보 정책 | `server/state.py`, `training_routes` | M | — (deployment 측 조건부 락만 적용) |
+| P2 | 에폭 내 step 단위 진행/중지(batch 콜백) | `trainers.py` | M | — |
+| P2 | CenterNet keep/gaussian-heatmap trainer 추가 | `core/training/` 신규 | L | — |
+| P2 | 학습 출력(runs/) 관리 UI(목록/삭제/배포 연결) | `tabs-mlops.js` | S | ✅ `core/training/runs.py` + `/api/training/runs` + Trained runs 카드 |
+| — | timm classify early-stopping(patience) + UI | `trainers.py`, `tabs-mlops.js` | S | ✅ patience 조기 종료 + Advanced 입력 |
+
+> 해결 완료 (`feat/training-deployment`, 2026-06-02): 분류 자동 split(평면 ImageFolder → train/val), timm early-stopping(patience), 학습 run 관리(목록/삭제/배포·벤치 핸드오프, traversal 방어). 테스트 `tests/test_training.py` 확장.
 
 ---
 
@@ -1069,12 +1072,17 @@ dHash 16×16(256bit) 쿼리 → Top-K(1-100). 출력: rank/image/distance.
 
 **[4] 개선 작업 항목**
 
-| 우선순위 | 작업 | 파일/함수 | 작업량 |
-|---|---|---|---|
-| P1 | EP-격리 서브프로세스 export(`ep_worker`에 `export` task 추가, openvino/coreml를 전용 venv로 라우팅) | `core/ep_worker.py`, `ep_manager`, `runner` | L |
-| P2 | export 후 타깃 EP에서 실제 load-verify(TensorRT/OpenVINO 세션) | `core/deployment/runner.py` | M |
-| P2 | int8 calibration `data.yaml` 자동 생성(이미지 dir → ultralytics int8) | `exporters.py` | S |
-| P2 | 매니페스트 기반 "원클릭 추론/벤치" 통합 | `tabs-mlops.js` | S |
+| 우선순위 | 작업 | 파일/함수 | 작업량 | 상태 |
+|---|---|---|---|---|
+| P1 | EP-격리 서브프로세스 export(`ep_worker`에 `export` task 추가, openvino/coreml를 전용 venv로 라우팅) | `core/ep_worker.py`, `ep_manager`, `runner` | L | — (범위 외) |
+| P2 | export 후 타깃 EP에서 실제 load-verify(TensorRT/OpenVINO 세션) | `core/deployment/runner.py` | M | ✅ 타깃 provider 가용 시 그 EP로 검증 + CPU fallback 경고 |
+| P2 | int8 calibration `data.yaml` 자동 생성(이미지 dir → ultralytics int8) | `exporters.py` | S | ✅ `_calibration_data_yaml` |
+| P2 | 매니페스트 기반 "원클릭 추론/벤치" 통합 | `tabs-mlops.js` | S | △ runs/결과 카드 → Benchmark 핸드오프(.onnx) |
+| — | opset 재지정 실패 조용한 보고 → 경고 + manifest 실제 opset 기록 | `targets.py`, `runner.py`, `manifest.py` | S | ✅ |
+| — | 조건부 GPU 락(CPU 전용 export는 추론 미차단) | `deployment_routes.py`, `registry.py` | S | ✅ `uses_gpu` |
+| — | 소스↔타깃 호환성(`accepts`) 사전 차단 + opset/batch/workspace 입력 검증 | `registry.py`, `targets.py`, `deployment_routes.py` | S | ✅ |
+
+> 해결 완료 (`feat/training-deployment`, 2026-06-02): opset 재지정 실패를 경고로 표면화하고 manifest에 산출물 실제 opset 기록, int8 calibration data.yaml 자동 생성, 타깃 EP 기반 load-verify, 조건부 GPU 락(`uses_gpu`), 소스/타깃 호환성·입력 사전 검증. 테스트 `tests/test_deployment.py` 확장.
 
 ---
 

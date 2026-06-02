@@ -15,11 +15,34 @@ from core.deployment.manifest import build_manifest, write_manifest
 log = logging.getLogger("ssook.deployment")
 
 
+def onnx_actual_opset(artifact_path: str) -> Optional[int]:
+    """Read the produced ONNX's default-domain opset, or None if unreadable.
+
+    The manifest must record the opset the artifact ACTUALLY carries (opset
+    re-spec on an existing graph can silently no-op), not the requested value.
+    """
+    try:
+        import onnx
+        model = onnx.load(artifact_path)
+        for imp in model.opset_import:
+            # The default ("") domain is the ai.onnx version most tools mean by "opset".
+            if imp.domain in ("", "ai.onnx"):
+                return int(imp.version)
+        return int(model.opset_import[0].version) if model.opset_import else None
+    except Exception:
+        return None
+
+
 def validate_artifact(artifact_path: str, target) -> dict:
     """Light load-verification so a broken artifact is never reported as success.
 
-    ONNX is opened under the CPU provider (always present). Engines/IR/CoreML
-    only get an existence check — loading them needs their runtime/hardware.
+    ONNX is opened under the TARGET's execution provider when that provider is
+    present in this process (with CPU as fallback), so a CUDA/TensorRT export
+    is actually exercised on its provider. If the target provider isn't
+    available in-process, or the provider-specific session fails to build, we
+    fall back to a CPU-only session and surface a ``warning`` — a CPU-validated
+    artifact is still a valid artifact. Engines/IR/CoreML only get an existence
+    check — loading them needs their runtime/hardware.
     """
     if not artifact_path or not os.path.exists(artifact_path):
         return {"ok": False, "error": "artifact not found after export"}
@@ -27,10 +50,30 @@ def validate_artifact(artifact_path: str, target) -> dict:
     if ext == ".onnx":
         try:
             import onnxruntime as ort
+        except Exception as e:
+            return {"ok": False, "error": f"onnxruntime unavailable: {e}"}
+
+        provider = getattr(target, "provider", None)
+        available = set(ort.get_available_providers())
+        # Skip CPU here — it's the universal fallback handled below; trying it as
+        # the "target provider" would only duplicate the CPU session.
+        if provider and provider != "CPUExecutionProvider" and provider in available:
+            try:
+                ort.InferenceSession(artifact_path,
+                                     providers=[provider, "CPUExecutionProvider"])
+                return {"ok": True}
+            except Exception as e:
+                log.debug("provider %s session failed, falling back to CPU: %s", provider, e)
+                # Fall through to CPU-only below with a warning.
+        try:
             ort.InferenceSession(artifact_path, providers=["CPUExecutionProvider"])
-            return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": f"ONNX failed to load: {e}"}
+        if provider and provider != "CPUExecutionProvider":
+            return {"ok": True,
+                    "warning": f"validated on CPU; target provider {provider} "
+                               f"unavailable in this process"}
+        return {"ok": True}
     return {"ok": True}
 
 
@@ -84,10 +127,18 @@ def run_export(
         result["validated"] = verdict.get("ok")
         if verdict.get("error"):
             result["validation_error"] = verdict["error"]
+        if verdict.get("warning"):
+            result["validation_warning"] = verdict["warning"]
 
     if config.get("write_manifest", True):
         try:
-            manifest = build_manifest(model_path, target, opts, result, config.get("model_meta"))
+            # Record the opset the artifact ACTUALLY carries (best-effort read of
+            # the produced .onnx); falls back to the requested opset otherwise.
+            actual_opset = None
+            if os.path.splitext(final_path)[1].lower() == ".onnx":
+                actual_opset = onnx_actual_opset(final_path)
+            manifest = build_manifest(model_path, target, opts, result,
+                                      config.get("model_meta"), actual_opset=actual_opset)
             result["manifest_path"] = write_manifest(manifest, final_path)
         except Exception as e:  # manifest is a convenience, not the deliverable
             log.debug("manifest write failed: %s", e)

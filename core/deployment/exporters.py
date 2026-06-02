@@ -81,6 +81,47 @@ ULTRALYTICS_FORMAT = {
 }
 
 
+def _calibration_data_yaml(calibration_dir: str) -> str:
+    """Return a data.yaml path for ultralytics int8 calibration over a dir.
+
+    Ultralytics' int8 export wants a dataset YAML (not a bare image folder) so
+    it knows where to pull calibration images from. If the dir already ships a
+    data.yaml/data.yml we hand that back; otherwise we synthesize a minimal one
+    in a tmp dir pointing train/val at the folder itself. This is best-effort:
+    the names map is a single placeholder class because calibration only needs
+    representative inputs, not correct labels.
+
+    Returns the dir unchanged on any failure so the export still proceeds.
+    """
+    try:
+        for name in ("data.yaml", "data.yml"):
+            existing = os.path.join(calibration_dir, name)
+            if os.path.isfile(existing):
+                return existing
+
+        try:
+            from core.paths import tmp_dir
+            out_dir = str(tmp_dir("deploy"))
+        except Exception:
+            import tempfile
+            out_dir = tempfile.mkdtemp(prefix="ssook_deploy_calib_")
+
+        yaml_path = os.path.join(out_dir, "calibration_data.yaml")
+        # Lazy import per the stream contract — dataset.py is owned elsewhere.
+        from core.training.dataset import _write_yaml
+        _write_yaml(yaml_path, {
+            "path": os.path.abspath(calibration_dir),
+            "train": ".",
+            "val": ".",
+            "names": {0: "object"},
+        })
+        return yaml_path
+    except Exception:
+        # Never block the export on calibration-yaml generation — fall back to
+        # passing the dir; ultralytics may still cope or surface its own error.
+        return calibration_dir
+
+
 def ultralytics_export(model_path: str, fmt: str, opts: dict) -> str:
     """Run Ultralytics export and return the produced artifact path.
 
@@ -104,9 +145,9 @@ def ultralytics_export(model_path: str, fmt: str, opts: dict) -> str:
     if opts.get("precision") == "int8":
         kwargs["int8"] = True
         if opts.get("calibration_dir"):
-            # Ultralytics expects a data.yaml for int8 calibration; a plain
-            # image dir is accepted by passing `data` when available.
-            kwargs["data"] = opts["calibration_dir"]
+            # Ultralytics int8 wants a dataset YAML; synthesize one over a bare
+            # image dir (or reuse an existing data.yaml in it). See helper.
+            kwargs["data"] = _calibration_data_yaml(opts["calibration_dir"])
     if opts.get("simplify"):
         kwargs["simplify"] = True
     device = opts.get("device", "")

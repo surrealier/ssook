@@ -41,8 +41,14 @@ def build_manifest(
     opts: dict,
     export_result: dict,
     model_meta: Optional[dict] = None,
+    actual_opset: Optional[int] = None,
 ) -> dict:
-    """Assemble the manifest dict from the export inputs and result."""
+    """Assemble the manifest dict from the export inputs and result.
+
+    ``actual_opset`` (when known, read back from the produced .onnx) overrides
+    the requested opset in ``config.opset`` so the manifest reflects what the
+    artifact really carries — opset re-spec can silently keep the original.
+    """
     try:
         from core.run_record import env_snapshot, model_meta as fingerprint
         env = env_snapshot()
@@ -70,7 +76,7 @@ def build_manifest(
             "size_mb": export_result.get("output_size_mb"),
         },
         "config": {
-            "opset": opts.get("opset"),
+            "opset": actual_opset if actual_opset is not None else opts.get("opset"),
             "batch": opts.get("batch"),
             "input_size": opts.get("input_size"),
             "dynamic": bool(opts.get("dynamic")),

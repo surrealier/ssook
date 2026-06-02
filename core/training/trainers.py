@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from core.training.registry import BaseTrainer, registry
-from core.training.dataset import prepare_yolo_dataset
+from core.training.dataset import prepare_yolo_dataset, prepare_classification_dataset
 
 log = logging.getLogger("ssook.training")
 
@@ -74,9 +74,16 @@ class UltralyticsTrainer(BaseTrainer):
         # ── Dataset resolution ──
         dataset_info: dict = {}
         if self.dataset_kind == "imagefolder":
-            data = config.get("images_dir") or config.get("data", "")
-            if not data:
-                raise ValueError("classification training needs images_dir (an ImageFolder with train/ and val/).")
+            images_dir = config.get("images_dir") or config.get("data", "")
+            if not images_dir:
+                raise ValueError("classification training needs images_dir (an ImageFolder of class subfolders).")
+            # Auto-split a flat ImageFolder into train/val (no-op if already split).
+            dataset_info = prepare_classification_dataset(
+                images_dir,
+                val_ratio=float(config.get("val_ratio", 0.2)),
+                seed=int(config.get("seed", 0)),
+            )
+            data = dataset_info["data_dir"]
         else:
             dataset_info = prepare_yolo_dataset(
                 images_dir=config["images_dir"],
@@ -191,15 +198,25 @@ class TimmClassifierTrainer(BaseTrainer):
         from torch.utils.data import DataLoader
         from torchvision import datasets, transforms
 
-        data_dir = config.get("images_dir") or config.get("data", "")
-        if not data_dir or not os.path.isdir(os.path.join(data_dir, "train")):
-            raise ValueError("classification needs images_dir containing train/ (and ideally val/) of class subfolders.")
+        images_dir = config.get("images_dir") or config.get("data", "")
+        if not images_dir:
+            raise ValueError("classification needs images_dir (an ImageFolder of class subfolders).")
+        # Auto-split a flat ImageFolder into train/val (no-op if already split).
+        dataset_info = prepare_classification_dataset(
+            images_dir,
+            val_ratio=float(config.get("val_ratio", 0.2)),
+            seed=int(config.get("seed", 0)),
+        )
+        data_dir = dataset_info["data_dir"]
 
         arch = config.get("model") or self.default_model
         epochs = int(config.get("epochs", 20))
         imgsz = int(config.get("imgsz", 224))
         batch = int(config.get("batch", 32))
         lr = float(config.get("lr0", 1e-3))
+        # patience: None / "" disables early stopping (the prior behavior).
+        patience_raw = config.get("patience")
+        patience = int(patience_raw) if patience_raw not in (None, "") else None
         device_str = config.get("device", "") or ("cuda" if torch.cuda.is_available() else "cpu")
         device = torch.device(device_str)
 
@@ -227,6 +244,7 @@ class TimmClassifierTrainer(BaseTrainer):
         os.makedirs(save_dir, exist_ok=True)
         best_acc, best_path = -1.0, os.path.join(save_dir, "best.pt")
         epochs_done = 0
+        epochs_since_best = 0  # for cooperative early stopping when patience is set
 
         for epoch in range(1, epochs + 1):
             model.train()
@@ -264,11 +282,20 @@ class TimmClassifierTrainer(BaseTrainer):
             score = val_acc if val_acc is not None else -train_loss
             if score is not None and score > best_acc:
                 best_acc = score
+                epochs_since_best = 0
                 torch.save({"model_state": model.state_dict(), "arch": arch,
                             "classes": classes, "num_classes": num_classes}, best_path)
+            else:
+                epochs_since_best += 1
 
             if is_stopped and is_stopped():
                 log.info("timm train: cooperative stop at epoch %d", epoch)
+                break
+
+            # Early stopping: bail once `patience` epochs pass with no improvement.
+            if patience is not None and epochs_since_best >= patience:
+                log.info("timm train: early stop at epoch %d (no improvement in %d epochs)",
+                         epoch, patience)
                 break
 
         return {
@@ -281,6 +308,7 @@ class TimmClassifierTrainer(BaseTrainer):
             "epochs_completed": epochs_done,
             "metrics": {"best_val_acc": best_acc if best_acc >= 0 else None},
             "classes": classes,
+            "dataset": dataset_info,
         }
 
 

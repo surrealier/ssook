@@ -60,6 +60,22 @@ class TestExportRegistry:
                 assert key in d
             assert isinstance(d["available"], bool)
 
+    def test_to_dict_accepts_and_uses_gpu(self):
+        by_name = {t.name: t.to_dict() for t in registry.list_all()}
+        # New fields present and correctly typed on every target.
+        for d in by_name.values():
+            assert isinstance(d["accepts"], list)
+            assert isinstance(d["uses_gpu"], bool)
+        # .pt-only targets.
+        assert by_name["coreml"]["accepts"] == ["pt"]
+        assert by_name["torchscript"]["accepts"] == ["pt"]
+        # GPU-building targets.
+        assert by_name["tensorrt"]["uses_gpu"] is True
+        assert by_name["onnxruntime_cuda"]["uses_gpu"] is True
+        # CPU ONNX takes both sources and is not a GPU build.
+        assert by_name["onnxruntime_cpu"]["uses_gpu"] is False
+        assert set(by_name["onnxruntime_cpu"]["accepts"]) == {"pt", "onnx"}
+
     def test_register_duplicate_raises(self):
         r = ExportTargetRegistry()
 
@@ -152,6 +168,56 @@ class TestOnnxExportFromOnnx:
         assert "error" in result
 
 
+# ── artifact validation + opset readback ───────────────
+class TestValidateArtifact:
+    def test_valid_onnx_cpu_target_ok(self, linear_onnx):
+        from core.deployment.runner import validate_artifact
+        cpu = registry.get("onnxruntime_cpu")
+        verdict = validate_artifact(linear_onnx, cpu)
+        # CPUExecutionProvider is always available — no warning, ok True.
+        assert verdict["ok"] is True
+        assert "warning" not in verdict
+
+    def test_missing_artifact(self, tmp_dir):
+        from core.deployment.runner import validate_artifact
+        cpu = registry.get("onnxruntime_cpu")
+        verdict = validate_artifact(os.path.join(tmp_dir, "nope.onnx"), cpu)
+        assert verdict["ok"] is False
+
+    def test_onnx_actual_opset_reads_17(self, linear_onnx):
+        from core.deployment.runner import onnx_actual_opset
+        assert onnx_actual_opset(linear_onnx) == 17
+
+    def test_onnx_actual_opset_unreadable(self, tmp_dir):
+        from core.deployment.runner import onnx_actual_opset
+        assert onnx_actual_opset(os.path.join(tmp_dir, "missing.onnx")) is None
+
+
+# ── int8 calibration data.yaml auto-gen ────────────────
+class TestCalibrationYaml:
+    def test_generates_yaml_for_bare_dir(self, tmp_dir):
+        from core.deployment.exporters import _calibration_data_yaml
+        calib = os.path.join(tmp_dir, "calib_images")
+        os.makedirs(calib, exist_ok=True)
+        yaml_path = _calibration_data_yaml(calib)
+        assert yaml_path != calib
+        assert os.path.isfile(yaml_path)
+        assert yaml_path.endswith((".yaml", ".yml"))
+        with open(yaml_path, encoding="utf-8") as f:
+            text = f.read()
+        # The generated yaml points train/val at the calibration dir.
+        assert os.path.abspath(calib).replace("\\", "/") in text.replace("\\", "/") \
+            or os.path.basename(calib) in text
+
+    def test_reuses_existing_yaml(self, tmp_dir):
+        from core.deployment.exporters import _calibration_data_yaml
+        calib = os.path.join(tmp_dir, "calib_with_yaml")
+        os.makedirs(calib, exist_ok=True)
+        existing = os.path.join(calib, "data.yaml")
+        open(existing, "w").close()
+        assert _calibration_data_yaml(calib) == existing
+
+
 # ── manifest ───────────────────────────────────────────
 from core.deployment.manifest import build_manifest, write_manifest, _session_recommendation
 
@@ -200,3 +266,33 @@ class TestDeployRoutes:
         r = self._client().post("/api/deploy/run", json={
             "model_path": linear_onnx, "target": "bogus"})
         assert "error" in r.json()
+
+    def test_targets_endpoint_exposes_accepts_uses_gpu(self):
+        targets = self._client().get("/api/deploy/targets").json()["targets"]
+        by_name = {t["name"]: t for t in targets}
+        assert by_name["coreml"]["accepts"] == ["pt"]
+        assert by_name["tensorrt"]["uses_gpu"] is True
+
+    def test_run_rejects_incompatible_source(self, linear_onnx):
+        # CoreML accepts only .pt; an .onnx source must be rejected up front
+        # with a clear source-requirement message (before any export starts).
+        r = self._client().post("/api/deploy/run", json={
+            "model_path": linear_onnx, "target": "coreml"})
+        body = r.json()
+        assert "error" in body
+        assert "requires" in body["error"] and "source" in body["error"]
+
+    def test_run_rejects_bad_opset(self, linear_onnx):
+        r = self._client().post("/api/deploy/run", json={
+            "model_path": linear_onnx, "target": "onnxruntime_cpu", "opset": 99})
+        assert "error" in r.json() and "opset" in r.json()["error"]
+
+    def test_run_rejects_zero_batch(self, linear_onnx):
+        r = self._client().post("/api/deploy/run", json={
+            "model_path": linear_onnx, "target": "onnxruntime_cpu", "batch": 0})
+        assert "error" in r.json() and "batch" in r.json()["error"]
+
+    def test_run_rejects_zero_workspace(self, linear_onnx):
+        r = self._client().post("/api/deploy/run", json={
+            "model_path": linear_onnx, "target": "onnxruntime_cpu", "workspace_gb": 0})
+        assert "error" in r.json() and "workspace_gb" in r.json()["error"]

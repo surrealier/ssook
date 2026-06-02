@@ -33,6 +33,12 @@ class BaseExportTarget(ABC):
     # OS where the artifact can be BUILT (not necessarily run). CoreML build
     # is macOS-only; the rest build cross-platform.
     platforms: tuple[str, ...] = ("win32", "linux", "darwin")
+    # Source kinds this target can consume ("pt" = .pt/.pth checkpoint,
+    # "onnx" = an already-built .onnx). CoreML/TorchScript require a .pt.
+    accepts: tuple[str, ...] = ("pt", "onnx")
+    # Whether BUILDING this target touches the GPU — drives the conditional
+    # GPU lock in the route. Reflects the target itself, not precision/dynamic.
+    uses_gpu: bool = False
 
     def is_available(self) -> tuple[bool, str]:
         """Return (available, reason). Default: only a platform check.
@@ -73,6 +79,8 @@ class BaseExportTarget(ABC):
             "provider": self.provider,
             "output_ext": self.output_ext,
             "platforms": list(self.platforms),
+            "accepts": list(self.accepts),
+            "uses_gpu": bool(self.uses_gpu),
             "available": available,
             "unavailable_reason": reason,
         }
