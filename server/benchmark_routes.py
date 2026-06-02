@@ -26,14 +26,26 @@ class BenchmarkRequest(BaseModel):
 
 @router.post("/api/benchmark/run")
 async def run_benchmark(req: BenchmarkRequest):
-    if bench_state["running"]:
+    # Atomic guard: try_start flips running=True under the lock or returns False,
+    # so two near-simultaneous POSTs can't both pass the check and clobber results.
+    if not bench_state.try_start(progress=0, total=1, msg="Starting...", results=[]):
         return {"error": "Benchmark already running"}
-
-    bench_state.update(running=True, progress=0, total=1, msg="Starting...", results=[])
 
     def _run():
         from core.benchmark_runner import BenchmarkConfig, run_benchmark_core
-        bench_state.update(progress=0, total=0, msg="Starting...", results=[])
+        # The live results list is owned by the worker and only ever published to
+        # bench_state via the locked __setitem__ below, so a status reader taking
+        # snapshot() sees a whole list — never one mid-append (torn) iteration.
+        results: list = []
+
+        def publish_results() -> None:
+            # Reassign (locked __setitem__) rather than mutate in place: the reader's
+            # snapshot() grabs the list reference under the same lock, so it observes
+            # either the pre- or post-publish list, never a half-appended one.
+            bench_state["results"] = list(results)
+
+        bench_state.update(progress=0, total=0, msg="Starting...")
+        publish_results()
 
         from core.app_config import AppConfig
         bench_cfg = AppConfig()
@@ -78,7 +90,8 @@ async def run_benchmark(req: BenchmarkRequest):
         bench_state["total"] = sum(c.warmup + c.iterations for c in configs)
         # 검증 실패한 모델 경로는 결과 목록에 에러로 노출 (조용히 누락하지 않음).
         for entry in skipped:
-            bench_state["results"].append(entry)
+            results.append(entry)
+        publish_results()
 
         # Pre-encode dummy frames per codec
         import time as _time
@@ -149,7 +162,7 @@ async def run_benchmark(req: BenchmarkRequest):
             total_with_decode = round(r.mean_total_ms + decode_ms * r.batch_size, 2)
             fps_with_decode = round(r.batch_size * 1000.0 / total_with_decode, 1) if total_with_decode > 0 else 0
 
-            bench_state["results"].append({
+            results.append({
                 "name": r.model_name, "codec": codec.upper() if codec != "none" else "Raw",
                 "provider": r.provider,
                 "fps": fps_with_decode if decode_ms > 0 else round(r.fps, 1),
@@ -171,6 +184,7 @@ async def run_benchmark(req: BenchmarkRequest):
                 "gpu_mem_used": r.gpu_mem_used,
                 "gpu_mem_total": r.gpu_mem_total,
             })
+            publish_results()
 
         def on_error(cfg_idx, msg):
             # 건너뛴(로드 실패/OOM) 모델도 어느 모델/codec이었는지 결과에 남긴다.
@@ -179,11 +193,12 @@ async def run_benchmark(req: BenchmarkRequest):
                 name = os.path.basename(configs[cfg_idx].model_path)
             except (IndexError, AttributeError):
                 name = "—"
-            bench_state["results"].append({
+            results.append({
                 "name": name,
                 "codec": codec.upper() if codec != "none" else "Raw",
                 "error": msg,
             })
+            publish_results()
 
         try:
             run_benchmark_core(configs, on_progress, on_result, on_error, lambda: not bench_state["running"])
@@ -213,22 +228,28 @@ async def benchmark_stop():
 
 @router.get("/api/benchmark/status")
 async def benchmark_status():
+    # snapshot() copies under the lock so FastAPI serializes a stable dict/list —
+    # never the live results list while the worker thread appends to it.
+    snap = bench_state.snapshot()
     return {
-        "running": bench_state["running"],
-        "progress": bench_state["progress"],
-        "total": bench_state["total"],
-        "msg": bench_state["msg"],
-        "results": bench_state["results"],
+        "running": snap.get("running", False),
+        "progress": snap.get("progress", 0),
+        "total": snap.get("total", 0),
+        "msg": snap.get("msg", ""),
+        "results": snap.get("results", []),
     }
 
 
 @router.get("/api/benchmark/export-csv")
 async def benchmark_export_csv():
-    results = bench_state.get("results", [])
+    # Read via snapshot so we iterate a copied list, not the live one the worker appends to.
+    results = bench_state.snapshot().get("results", [])
+    # latency_ms_p* (not fps_p*): the written values are p50/p95/p99 latency in ms
+    # (BenchmarkResult.p*_ms), not FPS. fps_mean is the only true FPS column.
     fieldnames = ["model_name", "codec", "provider", "fps_mean", "latency_ms_mean",
                   "decode_ms", "preprocess_ms", "inference_ms", "postprocess_ms",
-                  "fps_p50", "fps_p95", "fps_p99", "min_ms", "max_ms", "std_ms",
-                  "cpu_pct", "ram_mb"]
+                  "latency_ms_p50", "latency_ms_p95", "latency_ms_p99",
+                  "min_ms", "max_ms", "std_ms", "cpu_pct", "ram_mb"]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
@@ -245,9 +266,9 @@ async def benchmark_export_csv():
             "preprocess_ms": r.get("pre_ms", ""),
             "inference_ms": r.get("infer_ms", ""),
             "postprocess_ms": r.get("post_ms", ""),
-            "fps_p50": r.get("p50", ""),
-            "fps_p95": r.get("p95", ""),
-            "fps_p99": r.get("p99", ""),
+            "latency_ms_p50": r.get("p50", ""),
+            "latency_ms_p95": r.get("p95", ""),
+            "latency_ms_p99": r.get("p99", ""),
             "min_ms": r.get("min", ""),
             "max_ms": r.get("max", ""),
             "std_ms": r.get("std", ""),

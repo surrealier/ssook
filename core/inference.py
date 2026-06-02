@@ -10,6 +10,16 @@ from core.model_loader import ModelInfo
 
 _NMS_IOU = 0.45
 
+
+class UnsupportedModelError(Exception):
+    """Raised when a model type/output layout is advertised but not yet decodable.
+
+    WHY: pose (HRNet/ViTPose) and instance-seg (Mask R-CNN) types are exposed in
+    the UI/model_loader but only the YOLO layouts are implemented. Failing loudly
+    here lets the route surface a precise message instead of returning silent
+    empty results that look like "the model detected nothing".
+    """
+
 # 통합 14-class 체계
 UNIFIED_NAMES = {
     0: "person", 1: "falldown", 2: "crawl", 3: "jump",
@@ -1129,7 +1139,7 @@ COCO_KPT_NAMES = [
 class PoseResult:
     boxes: np.ndarray       # (N, 4) xyxy
     scores: np.ndarray      # (N,)
-    keypoints: np.ndarray   # (N, 17, 3) x,y,conf
+    keypoints: np.ndarray   # (N, K, 3) x,y,conf — K derived from model output
     infer_ms: float
 
     @classmethod
@@ -1140,23 +1150,41 @@ class PoseResult:
 
 def postprocess_pose_v8(output: np.ndarray, conf: float,
                         ratio: float, pad: tuple, orig_shape: tuple) -> PoseResult:
-    """YOLOv8/v11-pose output: (1, 56, 8400) = 4 box + 1 conf + 51 kpts(17*3)"""
-    data = output[0]  # (56, 8400)
-    n_kpts = 17
-    box_dim = 4
-    # conf is at index 4
-    if data.shape[0] == box_dim + 1 + n_kpts * 3:
-        scores_all = data[4]  # (8400,)
-    else:
-        # fallback: treat as (4 + nc + 51)
-        nc = data.shape[0] - box_dim - n_kpts * 3
-        scores_all = data[4:4+nc].max(axis=0) if nc > 0 else data[4]
+    """YOLOv8/v11-pose output: (1, 4+1+K*3, anchors) = 4 box + 1 conf + K kpts(x,y,v).
 
+    K (keypoint count) is derived from the channel dim, not hardcoded — so hand
+    (21), animal, or custom-kpt exports decode correctly. A non-YOLO-pose layout
+    (e.g. HRNet/ViTPose heatmaps, shape (1,K,Hh,Ww)) raises UnsupportedModelError
+    instead of mis-slicing heatmap rows as box+score+kpts and emitting garbage.
+    """
+    data = output[0]  # YOLO: (4+1+K*3, anchors); heatmap: (Hh, Ww) after batch strip
+
+    # Heatmap outputs are not 2D channel-major detection tensors. Reject anything
+    # that doesn't look like YOLO-pose (must be 2D and channel count = 5 + 3K).
+    if data.ndim != 2:
+        raise UnsupportedModelError(
+            f"Pose output rank {data.ndim} is not the YOLO-pose layout "
+            f"(expected a 2D (4+1+K*3, anchors) tensor). HRNet/ViTPose heatmap "
+            f"decoding is not implemented yet."
+        )
+
+    box_dim = 4
+    channels = data.shape[0]
+    kpt_channels = channels - box_dim - 1  # subtract box(4) + conf(1)
+    # TODO(later/L-effort): heatmap (soft-argmax) decoder for HRNet/ViTPose.
+    if kpt_channels <= 0 or kpt_channels % 3 != 0:
+        raise UnsupportedModelError(
+            f"Pose output has {channels} channels, which is not 4+1+K*3 for any "
+            f"K>=1 — not a YOLO-pose layout. HRNet/ViTPose are not supported yet."
+        )
+    n_kpts = kpt_channels // 3
+
+    scores_all = data[4]  # (anchors,)
     mask = scores_all > conf
     if not mask.any():
         return PoseResult.empty()
 
-    filtered = data[:, mask].T  # (K, 56)
+    filtered = data[:, mask].T  # (K, channels)
     boxes_xywh = filtered[:, :4]
     scores = scores_all[mask].astype(np.float32)
     kpt_raw = filtered[:, -n_kpts*3:].reshape(-1, n_kpts, 3)
@@ -1180,9 +1208,21 @@ def postprocess_pose_v8(output: np.ndarray, conf: float,
 
 
 def run_pose(model_info: ModelInfo, frame: np.ndarray, conf: float) -> PoseResult:
-    """Pose estimation inference"""
+    """Pose estimation inference. Only YOLO-pose is decodable.
+
+    HRNet/ViTPose emit heatmaps that postprocess_pose_v8 cannot decode; reject
+    those types up front with a precise message rather than emitting garbage.
+    """
     if model_info.session is None:
         return PoseResult.empty()
+
+    # TODO(later/L-effort): heatmap decoder for pose_hrnet / pose_vitpose.
+    if model_info.model_type != "pose_yolo":
+        raise UnsupportedModelError(
+            f"Pose estimation for model type '{model_info.model_type}' is not "
+            f"supported yet — only 'pose_yolo' (YOLO-pose) output is decodable."
+        )
+
     t0 = time.perf_counter()
     padded, ratio, pad = letterbox(frame, model_info.input_size)
     tensor = _padded_to_tensor(padded, model_info.input_size)
@@ -1213,9 +1253,23 @@ class InstanceSegResult:
 
 def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
                      conf: float) -> InstanceSegResult:
-    """YOLO-Seg instance segmentation: returns per-instance masks"""
+    """YOLO-Seg instance segmentation: returns per-instance masks.
+
+    Only the YOLO-Seg output layout (det tensor + proto tensor) is decoded.
+    Other advertised types (Mask R-CNN, custom) raise UnsupportedModelError so
+    the caller can report a precise error instead of a misleading empty result.
+    """
     if model_info.session is None:
         return InstanceSegResult.empty()
+
+    # TODO(later/L-effort): add a _run_maskrcnn_seg parser for the separate
+    # (boxes, labels, scores, masks) output set. Until then, fail loudly.
+    if model_info.model_type != "instseg_yolo":
+        raise UnsupportedModelError(
+            f"Instance segmentation for model type '{model_info.model_type}' is not "
+            f"supported yet — only 'instseg_yolo' (YOLO-Seg) output is decodable."
+        )
+
     t0 = time.perf_counter()
     h_orig, w_orig = frame.shape[:2]
     padded, ratio, pad = letterbox(frame, model_info.input_size)
@@ -1226,8 +1280,15 @@ def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
     output = model_info.session.run(None, {model_info.input_name: tensor})
     infer_ms = (time.perf_counter() - t0) * 1000.0
 
+    # YOLO-Seg requires a 3D det tensor + 4D proto tensor. A different layout
+    # (e.g. Mask R-CNN's separate boxes/labels/scores/masks) means this model
+    # was mislabeled as instseg_yolo — surface it rather than returning empty.
     if len(output) < 2 or output[0].ndim != 3 or output[1].ndim != 4:
-        return InstanceSegResult.empty()
+        raise UnsupportedModelError(
+            "Model output does not match the YOLO-Seg layout "
+            "(expected a 3D detection tensor + 4D prototype tensor). "
+            "This model cannot be decoded as 'instseg_yolo'."
+        )
 
     det = output[0][0]      # (116, 8400)
     protos = output[1][0]   # (32, mh, mw)

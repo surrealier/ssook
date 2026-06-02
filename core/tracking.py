@@ -30,6 +30,22 @@ def _iou_batch(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
     return inter / np.maximum(union, 1e-6)
 
 
+def _gate_iou_by_class(iou_mat: np.ndarray, track_cids: np.ndarray,
+                       det_cids: np.ndarray) -> np.ndarray:
+    """Zero out IoU where track class != detection class.
+
+    WHY: pure-IoU association can reassign a track to an overlapping detection of
+    a DIFFERENT class (e.g. person<->backpack), flipping its class_id and
+    corrupting per-class counts. Gating to same-class pairs prevents the swap;
+    the unmatched cross-class detection then spawns its own track. Opt-in so
+    pipelines that want class-agnostic tracking keep the old behavior.
+    """
+    if iou_mat.size == 0:
+        return iou_mat
+    class_match = track_cids[:, None] == det_cids[None, :]
+    return iou_mat * class_match
+
+
 def _linear_assignment(cost_matrix: np.ndarray, threshold: float):
     """Greedy assignment: returns (matches, unmatched_a, unmatched_b)"""
     if cost_matrix.size == 0:
@@ -53,10 +69,12 @@ def _linear_assignment(cost_matrix: np.ndarray, threshold: float):
 class SORTTracker:
     """Simple Online and Realtime Tracking (SORT) — IoU-based."""
 
-    def __init__(self, max_age: int = 30, min_hits: int = 3, iou_threshold: float = 0.3):
+    def __init__(self, max_age: int = 30, min_hits: int = 3, iou_threshold: float = 0.3,
+                 class_gating: bool = False):
         self.max_age = max_age
         self.min_hits = min_hits
         self.iou_threshold = iou_threshold
+        self.class_gating = class_gating  # opt-in: forbid cross-class IoU matches
         self.tracks: list[Track] = []
         self._next_id = 1
         self.frame_count = 0
@@ -79,6 +97,9 @@ class SORTTracker:
         if self.tracks:
             track_boxes = np.array([t.box for t in self.tracks])
             iou_mat = _iou_batch(track_boxes, boxes)
+            if self.class_gating:
+                track_cids = np.array([t.class_id for t in self.tracks])
+                iou_mat = _gate_iou_by_class(iou_mat, track_cids, class_ids)
             matches, unmatched_tracks, unmatched_dets = _linear_assignment(
                 iou_mat, self.iou_threshold)
         else:
@@ -121,12 +142,13 @@ class ByteTracker:
 
     def __init__(self, max_age: int = 30, min_hits: int = 3,
                  high_thresh: float = 0.5, low_thresh: float = 0.1,
-                 iou_threshold: float = 0.3):
+                 iou_threshold: float = 0.3, class_gating: bool = False):
         self.max_age = max_age
         self.min_hits = min_hits
         self.high_thresh = high_thresh
         self.low_thresh = low_thresh
         self.iou_threshold = iou_threshold
+        self.class_gating = class_gating  # opt-in: forbid cross-class IoU matches
         self.tracks: list[Track] = []
         self._next_id = 1
         self.frame_count = 0
@@ -156,6 +178,9 @@ class ByteTracker:
         if self.tracks and len(high_boxes) > 0:
             track_boxes = np.array([self.tracks[i].box for i in unmatched_track_indices])
             iou_mat = _iou_batch(track_boxes, high_boxes)
+            if self.class_gating:
+                track_cids = np.array([self.tracks[i].class_id for i in unmatched_track_indices])
+                iou_mat = _gate_iou_by_class(iou_mat, track_cids, high_cids)
             matches, um_tracks, um_dets_high = _linear_assignment(iou_mat, self.iou_threshold)
         else:
             matches, um_tracks = [], list(range(len(self.tracks)))
@@ -178,6 +203,9 @@ class ByteTracker:
         if remaining_tracks and len(low_boxes) > 0:
             track_boxes = np.array([self.tracks[i].box for i in remaining_tracks])
             iou_mat = _iou_batch(track_boxes, low_boxes)
+            if self.class_gating:
+                track_cids = np.array([self.tracks[i].class_id for i in remaining_tracks])
+                iou_mat = _gate_iou_by_class(iou_mat, track_cids, low_cids)
             matches2, um_tracks2, _ = _linear_assignment(iou_mat, self.iou_threshold)
             for t_idx, d_idx in matches2:
                 t = self.tracks[remaining_tracks[t_idx]]

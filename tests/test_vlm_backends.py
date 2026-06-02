@@ -120,13 +120,16 @@ def test_infer_openai_bogus_endpoint_is_inline_error(tmp_path):
         "model_type": "vlm",
         "backend": "openai",
         "model_id": "qwen2-vl",
-        "endpoint_url": "http://127.0.0.1:9/v1",  # port 9 = discard, refuses
+        "endpoint_url": "http://127.0.0.1:9/v1",  # loopback -> SSRF-blocked pre-flight
         "vlm_task": "caption",
     })
     assert r.status_code == 200
     body = r.json()
     assert "error" in body
-    assert "VLM inference failed" in body["error"]
+    # 127.0.0.1 is loopback, so the SSRF guard now blocks it BEFORE any request
+    # and still returns an inline {"error": ...} at HTTP 200 — which is exactly
+    # the guarantee this test protects (no framework 422/404, and now no SSRF).
+    assert body.get("code") == "VLM_ENDPOINT_BLOCKED"
 
 
 def test_infer_transformers_without_model_id_is_validation_error(tmp_path):

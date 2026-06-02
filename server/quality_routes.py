@@ -48,6 +48,10 @@ class LeakyRequest(BaseModel):
     val_dir: Optional[str] = ""
     test_dir: Optional[str] = ""
     threshold: int = 0
+    # Real split layouts nest images under train/images/, val/images/ etc.;
+    # without recursion the detector reports 0 leaks on a nested dataset —
+    # a false "clean" verdict that is worse than no tool at all (LEAKY P0).
+    recursive: bool = False
 
 
 class SimRequest(BaseModel):
@@ -63,34 +67,51 @@ class SimRequest(BaseModel):
 
 @router.post("/api/quality/anomaly")
 async def quality_anomaly(req: QualityDirRequest):
-    if anomaly_state["running"]:
-        return {"error": "Already running"}
     img_dir = safe_image_dir(req.img_dir)
     # Validate label_dir at the boundary too — it feeds open() below, so a
     # raw path would let a crafted request read arbitrary <stem>.txt files
     # outside the path-safety surface (QUAL-07).
     label_dir = safe_label_dir(req.label_dir) if req.label_dir else ""
     recursive = req.recursive
-    anomaly_state.update(running=True, progress=0, total=0, msg="Scanning...", results=[])
+    # Atomic start guard — a read-then-write pair let two near-simultaneous
+    # POSTs both pass the check and race on results/progress (QUAL P1).
+    if not anomaly_state.try_start(progress=0, total=0, msg="Scanning...", results=[]):
+        return {"error": "Already running"}
 
     @route_errors(state=anomaly_state, scope="anomaly")
     def _run():
         imgs = glob_images(img_dir, recursive=recursive)
         anomaly_state["total"] = len(imgs)
         results = []
+        # A data-quality tool must survive bad data: a single non-numeric
+        # token previously raised ValueError, route_errors aborted the whole
+        # run, and every anomaly found so far was discarded (anomaly P0).
+        # We now count corruption and keep scanning.
+        malformed_lines = 0
+        missing_labels = 0
         for i, fp in enumerate(imgs):
             if not anomaly_state.get("running", True):
                 anomaly_state.update(msg="Stopped by user")
                 break
             stem = os.path.splitext(os.path.basename(fp))[0]
             txt = os.path.join(label_dir, stem + ".txt") if label_dir else ""
-            if txt and os.path.isfile(txt):
+            if label_dir and not (txt and os.path.isfile(txt)):
+                # No label file for this image — a wrong label_dir would
+                # otherwise read as "0 issues found" / clean dataset (anomaly P1).
+                missing_labels += 1
+            elif txt and os.path.isfile(txt):
                 with open(txt) as f:
                     for ln, line in enumerate(f):
                         parts = line.strip().split()
                         if len(parts) < 5:
                             continue
-                        cx, cy, bw, bh = map(float, parts[1:5])
+                        try:
+                            cx, cy, bw, bh = map(float, parts[1:5])
+                        except ValueError:
+                            # Header row, CSV, or corrupt byte — skip this line,
+                            # tally it, and continue rather than aborting.
+                            malformed_lines += 1
+                            continue
                         issues = []
                         if cx - bw/2 < -0.01 or cy - bh/2 < -0.01 or cx + bw/2 > 1.01 or cy + bh/2 > 1.01:
                             issues.append("Out-of-bounds")
@@ -112,9 +133,15 @@ async def quality_anomaly(req: QualityDirRequest):
         anomaly_state["results"] = results[:ANOMALY_CAP]
         anomaly_state["truncated"] = truncated
         anomaly_state["total_found"] = total_found
+        anomaly_state["malformed_lines"] = malformed_lines
+        anomaly_state["missing_labels"] = missing_labels
         msg = f"Complete — {total_found} issues found"
         if truncated:
             msg += f" (showing first {ANOMALY_CAP})"
+        if missing_labels:
+            msg += f" ({missing_labels} images had no label file)"
+        if malformed_lines:
+            msg += f" ({malformed_lines} malformed label lines skipped)"
         anomaly_state.update(running=False, msg=msg)
 
     executor.submit(_run)
@@ -129,8 +156,6 @@ async def anomaly_status():
 
 @router.post("/api/quality/image-quality")
 async def quality_check(req: QualityDirRequest):
-    if quality_state["running"]:
-        return {"error": "Already running"}
     img_dir = safe_image_dir(req.img_dir)
     recursive = req.recursive
     # `threshold` is the legacy UI field; treat it as the blur cutoff so it
@@ -141,7 +166,9 @@ async def quality_check(req: QualityDirRequest):
     bright_threshold = req.bright_threshold
     entropy_threshold = req.entropy_threshold
     aspect_min, aspect_max = req.aspect_min, req.aspect_max
-    quality_state.update(running=True, progress=0, total=0, msg="Checking...", results=[])
+    # Atomic start guard (QUAL P1) — see quality_anomaly.
+    if not quality_state.try_start(progress=0, total=0, msg="Checking...", results=[]):
+        return {"error": "Already running"}
 
     @route_errors(state=quality_state, scope="quality")
     def _run():
@@ -220,12 +247,12 @@ def _dhash(img, size=8):
 
 @router.post("/api/quality/duplicate")
 async def quality_duplicate(req: QualityDirRequest):
-    if dup_state["running"]:
-        return {"error": "Already running"}
     img_dir = safe_image_dir(req.img_dir)
     threshold = int(req.threshold if req.threshold is not None else 10)
     recursive = req.recursive
-    dup_state.update(running=True, progress=0, total=0, msg="Hashing...", results=[])
+    # Atomic start guard (QUAL P1) — see quality_anomaly.
+    if not dup_state.try_start(progress=0, total=0, msg="Hashing...", results=[]):
+        return {"error": "Already running"}
 
     @route_errors(state=dup_state, scope="duplicate")
     def _run():
@@ -278,21 +305,24 @@ async def duplicate_status():
 
 @router.post("/api/quality/leaky")
 async def quality_leaky(req: LeakyRequest):
-    if leaky_state["running"]:
-        return {"error": "Already running"}
     dirs = {k: getattr(req, k) for k in ["train_dir", "val_dir", "test_dir"]}
     # Validate any provided dirs.
     for k, d in list(dirs.items()):
         if d:
             dirs[k] = safe_image_dir(d)
     threshold = int(req.threshold)
-    leaky_state.update(running=True, progress=0, total=0, msg="Scanning...", results=[])
+    recursive = req.recursive
+    # Atomic start guard (QUAL P1) — see quality_anomaly.
+    if not leaky_state.try_start(progress=0, total=0, msg="Scanning...", results=[]):
+        return {"error": "Already running"}
 
     @route_errors(state=leaky_state, scope="leaky")
     def _run():
         # Glob every split up front so the progress bar has a real `total`
         # before hashing starts (was set only afterwards → bar stuck at 0%).
-        split_files = {name: glob_images(d) for name, d in dirs.items() if d}
+        # Recursive so nested split layouts (train/images/...) are scanned —
+        # otherwise the tool falsely reports 0 leaks (LEAKY P0).
+        split_files = {name: glob_images(d, recursive=recursive) for name, d in dirs.items() if d}
         leaky_state["total"] = sum(len(v) for v in split_files.values())
         done = 0
         skipped = 0
@@ -353,15 +383,16 @@ _SIM_HASH_SIZE = 8
 
 @router.post("/api/quality/similarity")
 async def quality_similarity(req: SimRequest):
-    if sim_state["running"]:
-        return {"error": "Already running"}
     img_dir = safe_image_dir(req.img_dir)
     # Validate the query at the boundary — must_exist + image extension —
     # now that the frontend actually sends query_path (QUAL-01/QUAL-08).
     query = safe_image_file(req.query_path) if req.query_path else ""
     top_k = int(req.top_k)
     recursive = req.recursive
-    sim_state.update(running=True, progress=0, total=0, msg="Building index...", results=[])
+    # Atomic start guard (QUAL P1) — see quality_anomaly. Preserve the cached
+    # corpus index across runs (try_start only sets the keys we pass).
+    if not sim_state.try_start(progress=0, total=0, msg="Building index...", results=[]):
+        return {"error": "Already running"}
 
     @route_errors(state=sim_state, scope="similarity")
     def _run():

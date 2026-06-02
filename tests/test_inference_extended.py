@@ -6,8 +6,31 @@ import numpy as np
 import pytest
 from core.inference import (
     PoseResult, InstanceSegResult, SegmentationResult,
-    DetectionResult, postprocess_pose_v8,
+    DetectionResult, postprocess_pose_v8, run_pose, run_instance_seg,
+    UnsupportedModelError,
 )
+
+
+class _FakeSession:
+    """Minimal ORT-session stand-in: returns a fixed list of output arrays."""
+
+    def __init__(self, outputs):
+        self._outputs = outputs
+
+    def run(self, _output_names, _feed):
+        return self._outputs
+
+
+class _FakeModelInfo:
+    """Just enough of ModelInfo for run_pose / run_instance_seg."""
+
+    def __init__(self, model_type, outputs=None, input_size=(640, 640)):
+        self.model_type = model_type
+        self.session = _FakeSession(outputs) if outputs is not None else None
+        self.input_name = "images"
+        self.input_size = input_size
+        self.batch_size = 1
+        self.names = {}
 
 
 class TestPoseResult:
@@ -97,3 +120,174 @@ class TestDetectionResultConversion:
             class_ids=iseg.class_ids, infer_ms=iseg.infer_ms,
         )
         assert det.class_ids[0] == 2
+
+
+class TestPoseKeypointCount:
+    """P1: keypoint count is derived from output shape, not hardcoded to 17."""
+
+    def test_derives_21_keypoints(self):
+        # 21-kpt layout: 4 box + 1 conf + 21*3 = 68 channels
+        channels = 4 + 1 + 21 * 3
+        output = np.zeros((1, channels, 100), dtype=np.float32)
+        output[0, 0, 0] = 320  # cx
+        output[0, 1, 0] = 320  # cy
+        output[0, 2, 0] = 100  # w
+        output[0, 3, 0] = 200  # h
+        output[0, 4, 0] = 0.9  # conf
+        r = postprocess_pose_v8(output, conf=0.25, ratio=1.0, pad=(0, 0),
+                                orig_shape=(640, 640, 3))
+        assert len(r.boxes) == 1
+        assert r.keypoints.shape == (1, 21, 3)
+
+    def test_still_handles_coco_17(self):
+        channels = 4 + 1 + 17 * 3
+        output = np.zeros((1, channels, 100), dtype=np.float32)
+        output[0, 4, 0] = 0.9
+        r = postprocess_pose_v8(output, conf=0.25, ratio=1.0, pad=(0, 0),
+                                orig_shape=(640, 640, 3))
+        assert r.keypoints.shape == (1, 17, 3)
+
+
+class TestPoseUnsupported:
+    """P0: non-YOLO pose layouts raise instead of fabricating keypoints."""
+
+    def test_heatmap_shape_raises(self):
+        # HRNet/ViTPose-style heatmap (1,K,Hh,Ww): data=output[0] is rank 3 → reject
+        heatmap = np.zeros((1, 17, 64, 48), dtype=np.float32)
+        with pytest.raises(UnsupportedModelError):
+            postprocess_pose_v8(heatmap, conf=0.25, ratio=1.0, pad=(0, 0),
+                                orig_shape=(640, 640, 3))
+
+    def test_non_yolo_channel_count_raises(self):
+        # 2D but channel count not 4+1+3K: 18-5=13, not divisible by 3 → reject
+        bad = np.zeros((1, 18, 100), dtype=np.float32)
+        with pytest.raises(UnsupportedModelError):
+            postprocess_pose_v8(bad, conf=0.25, ratio=1.0, pad=(0, 0),
+                                orig_shape=(640, 640, 3))
+
+    def test_run_pose_rejects_hrnet_type(self):
+        mi = _FakeModelInfo("pose_hrnet",
+                            outputs=[np.zeros((1, 17, 64, 48), dtype=np.float32)])
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with pytest.raises(UnsupportedModelError):
+            run_pose(mi, frame, conf=0.25)
+
+    def test_run_pose_rejects_vitpose_type(self):
+        mi = _FakeModelInfo("pose_vitpose",
+                            outputs=[np.zeros((1, 17, 64, 48), dtype=np.float32)])
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with pytest.raises(UnsupportedModelError):
+            run_pose(mi, frame, conf=0.25)
+
+
+class TestInstanceSegUnsupported:
+    """P0: Mask R-CNN / non-YOLO-Seg layouts raise instead of silent empty."""
+
+    def test_maskrcnn_type_raises(self):
+        # Mask R-CNN emits separate boxes/labels/scores/masks; type guard fires
+        # before inference, so outputs are irrelevant here.
+        mi = _FakeModelInfo("instseg_maskrcnn",
+                            outputs=[np.zeros((1, 100, 4), dtype=np.float32),
+                                     np.zeros((1, 100), dtype=np.float32)])
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with pytest.raises(UnsupportedModelError):
+            run_instance_seg(mi, frame, conf=0.25)
+
+    def test_custom_type_raises(self):
+        mi = _FakeModelInfo("instseg_custom",
+                            outputs=[np.zeros((1, 116, 8400), dtype=np.float32),
+                                     np.zeros((1, 32, 160, 160), dtype=np.float32)])
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with pytest.raises(UnsupportedModelError):
+            run_instance_seg(mi, frame, conf=0.25)
+
+    def test_yolo_type_wrong_output_layout_raises(self):
+        # Declared instseg_yolo but output[1] is not the 4D proto tensor
+        mi = _FakeModelInfo("instseg_yolo",
+                            outputs=[np.zeros((1, 116, 8400), dtype=np.float32),
+                                     np.zeros((1, 100), dtype=np.float32)])  # 2D, not 4D
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with pytest.raises(UnsupportedModelError):
+            run_instance_seg(mi, frame, conf=0.25)
+
+    def test_yolo_type_valid_layout_returns_empty_not_raises(self):
+        # Valid YOLO-Seg layout with all-zero scores → empty result, no raise.
+        det = np.zeros((1, 116, 8400), dtype=np.float32)
+        protos = np.zeros((1, 32, 160, 160), dtype=np.float32)
+        mi = _FakeModelInfo("instseg_yolo", outputs=[det, protos])
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        r = run_instance_seg(mi, frame, conf=0.25)
+        assert len(r.boxes) == 0
+
+
+# ── Tracking: opt-in class-gating ───────────────────────
+from core.tracking import SORTTracker, ByteTracker, create_tracker
+
+
+def _det(box, score, cid):
+    return (np.array([box], dtype=np.float32),
+            np.array([score], dtype=np.float32),
+            np.array([cid], dtype=np.int32))
+
+
+class TestTrackingClassGating:
+    """P1: class-gating (default off) prevents a track ID jumping across classes."""
+
+    def test_default_is_class_agnostic(self):
+        # Default (gating off): a class-0 track matched to an overlapping class-1
+        # detection adopts class_id 1 (the pre-existing behavior, preserved).
+        tr = SORTTracker(min_hits=1, iou_threshold=0.3)
+        b, s, c = _det([0, 0, 10, 10], 0.9, 0)
+        tr.update(b, s, c)
+        # Same position, different class → matched & relabeled under gating-off.
+        b2, s2, c2 = _det([0, 0, 10, 10], 0.9, 1)
+        out = tr.update(b2, s2, c2)
+        assert len(out) == 1
+        assert out[0].class_id == 1  # relabeled — class-agnostic match
+
+    def test_gating_creates_new_id_on_class_flip_sort(self):
+        tr = SORTTracker(min_hits=1, iou_threshold=0.3, class_gating=True)
+        b, s, c = _det([0, 0, 10, 10], 0.9, 0)
+        first = tr.update(b, s, c)
+        first_id = first[0].id
+        assert first[0].class_id == 0
+
+        # Frame 2: a class-0 box slightly moved AND a higher-IoU class-1 box at
+        # nearly the same spot. The class-0 track must keep class_id 0 (matched
+        # to the same-class box) and a NEW track must appear for class 1.
+        boxes = np.array([[1, 1, 11, 11], [0, 0, 10, 10]], dtype=np.float32)
+        scores = np.array([0.9, 0.95], dtype=np.float32)
+        cids = np.array([0, 1], dtype=np.int32)
+        out = tr.update(boxes, scores, cids)
+
+        by_class = {t.class_id: t for t in out}
+        assert 0 in by_class and 1 in by_class
+        assert by_class[0].id == first_id          # original track kept, same class
+        assert by_class[1].id != first_id          # new id for the class-1 object
+
+    def test_gating_creates_new_id_on_class_flip_bytetrack(self):
+        tr = ByteTracker(min_hits=1, iou_threshold=0.3, high_thresh=0.5,
+                         class_gating=True)
+        b, s, c = _det([0, 0, 10, 10], 0.9, 0)
+        first = tr.update(b, s, c)
+        first_id = first[0].id
+
+        boxes = np.array([[1, 1, 11, 11], [0, 0, 10, 10]], dtype=np.float32)
+        scores = np.array([0.9, 0.95], dtype=np.float32)
+        cids = np.array([0, 1], dtype=np.int32)
+        out = tr.update(boxes, scores, cids)
+
+        by_class = {t.class_id: t for t in out}
+        assert 0 in by_class and 1 in by_class
+        assert by_class[0].id == first_id
+        assert by_class[1].id != first_id
+
+    def test_create_tracker_forwards_class_gating(self):
+        tr = create_tracker("bytetrack", class_gating=True)
+        assert isinstance(tr, ByteTracker)
+        assert tr.class_gating is True
+        sort = create_tracker("sort", class_gating=True)
+        assert isinstance(sort, SORTTracker)
+        assert sort.class_gating is True
+        # Default stays off.
+        assert create_tracker("bytetrack").class_gating is False

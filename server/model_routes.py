@@ -1,9 +1,12 @@
 """/api/model/*, /api/infer/*, /api/gt/*, /api/video/info 라우터."""
 import asyncio
 import base64
+import ipaddress
 import os
+import socket
 import time as _time
 from typing import Optional
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
@@ -20,6 +23,93 @@ from server.state import executor, vlm_state
 from server.utils import imread, generate_palette, get_color, draw_label, overlay_segmentation, glob_images
 
 router = APIRouter()
+
+
+# ── VLM endpoint SSRF guard ─────────────────────────────────
+class UnsafeEndpointError(ValueError):
+    """Raised when a VLM openai endpoint_url targets a forbidden host."""
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True for addresses an attacker could use to reach internal services.
+
+    Covers loopback, link-local (incl. the 169.254.169.254 cloud-metadata
+    IP), private RFC1918 ranges, the unspecified 0.0.0.0/::, and
+    IPv4-mapped IPv6 (which would otherwise smuggle a private v4 address).
+    """
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return (
+        ip.is_loopback
+        or ip.is_link_local
+        or ip.is_private
+        or ip.is_unspecified
+        or ip.is_reserved
+        or ip.is_multicast
+    )
+
+
+def _vlm_allow_internal() -> bool:
+    """Opt-in escape hatch for trusted on-host servers (vLLM/Ollama).
+
+    Off by default: the endpoint guard blocks internal hosts unless the
+    operator sets SSOOK_VLM_ALLOW_INTERNAL=1. Kept as an env var (not a
+    persisted setting) so the insecure mode is never silently saved.
+    """
+    return os.environ.get("SSOOK_VLM_ALLOW_INTERNAL", "").strip().lower() in ("1", "true", "yes")
+
+
+def validate_endpoint_url(url: Optional[str]) -> str:
+    """Validate a VLM openai endpoint_url against SSRF before any request.
+
+    Requires an http(s) URL with a host, then resolves the host and rejects
+    it if any resolved address falls in a loopback/link-local/private/
+    metadata range. Honors the SSOOK_VLM_ALLOW_INTERNAL opt-in for trusted
+    on-host inference servers. Returns the URL unchanged when allowed.
+    """
+    if not url or not isinstance(url, str):
+        raise UnsafeEndpointError("endpoint_url is required for the openai backend")
+    parts = urlsplit(url.strip())
+    if parts.scheme not in ("http", "https"):
+        raise UnsafeEndpointError(
+            f"endpoint_url must use http or https (got '{parts.scheme or 'none'}')"
+        )
+    host = parts.hostname
+    if not host:
+        raise UnsafeEndpointError("endpoint_url has no host")
+    if _vlm_allow_internal():
+        return url
+
+    # If the host is already a literal IP, check it directly; otherwise
+    # resolve EVERY address it maps to and block if ANY is internal (a
+    # hostname can resolve to 127.0.0.1 / a metadata IP to defeat a
+    # name-only blocklist — DNS-rebind-style).
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        if _is_blocked_ip(literal_ip):
+            raise UnsafeEndpointError(f"endpoint_url targets a blocked address: {host}")
+        return url
+
+    if host.lower() == "localhost":
+        raise UnsafeEndpointError("endpoint_url targets a blocked address: localhost")
+    try:
+        resolved = socket.getaddrinfo(host, parts.port or None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise UnsafeEndpointError(f"endpoint_url host does not resolve: {host} ({e})") from e
+    for family, _type, _proto, _canon, sockaddr in resolved:
+        addr = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if _is_blocked_ip(ip):
+            raise UnsafeEndpointError(
+                f"endpoint_url resolves to a blocked address: {host} -> {addr}"
+            )
+    return url
 
 
 # ── Pydantic models ─────────────────────────────────────
@@ -250,6 +340,14 @@ def _infer_image_vlm(req: InferRequest):
     from core.vlm_inference import make_backend
     backend_name = (req.backend or "clip").lower()
     # Path safety FIRST — before any imread/session — and use the safe paths.
+    # SSRF guard FIRST: validate the outbound endpoint before touching the
+    # filesystem so a blocked endpoint is reported even if the image is
+    # missing, and never before we've rejected an unsafe target.
+    if backend_name == "openai":
+        try:
+            validate_endpoint_url(req.endpoint_url)
+        except UnsafeEndpointError as e:
+            return {"error": f"Unsafe endpoint_url: {e}", "code": "VLM_ENDPOINT_BLOCKED"}
     try:
         safe_img = safe_image_file(req.image_path) if req.image_path else None
         # Only the clip backend points model_path/text_encoder at local ONNX
@@ -403,8 +501,6 @@ async def vlm_batch(req: VLMBatchRequest):
     Status is exposed via GET /api/vlm/status. Force-stop via
     POST /api/force-stop/vlm.
     """
-    if vlm_state.get("running"):
-        return {"error": "VLM batch already running", "code": "VLM_BUSY"}
     backend_name = (req.backend or "clip").lower()
     # Path safety: only the clip backend reads local ONNX files; transformers
     # uses an HF id and openai an HTTP endpoint.
@@ -415,6 +511,12 @@ async def vlm_batch(req: VLMBatchRequest):
         if not req.text_encoder:
             return {"error": "clip backend requires text_encoder", "code": "VLM_CONFIG"}
         text_encoder = safe_model_file(req.text_encoder)
+    # SSRF guard: validate the outbound endpoint BEFORE submitting the worker.
+    if backend_name == "openai":
+        try:
+            validate_endpoint_url(req.endpoint_url)
+        except UnsafeEndpointError as e:
+            return {"error": f"Unsafe endpoint_url: {e}", "code": "VLM_ENDPOINT_BLOCKED"}
     img_dir = safe_image_dir(req.img_dir)
     imgs = glob_images(img_dir)
     if not imgs:
@@ -429,7 +531,10 @@ async def vlm_batch(req: VLMBatchRequest):
         "endpoint_url": req.endpoint_url,
         "api_key": req.api_key,
     }
-    vlm_state.update(running=True, progress=0, total=len(imgs), msg="Starting...", results=[])
+    # Atomic start guard: collapses the old read-then-write running check into
+    # one locked critical section so two concurrent POSTs can't both launch.
+    if not vlm_state.try_start(progress=0, total=len(imgs), msg="Starting...", results=[]):
+        return {"error": "VLM batch already running", "code": "VLM_BUSY"}
 
     @route_errors(state=vlm_state, scope="vlm")
     def _run():

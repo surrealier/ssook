@@ -1,4 +1,5 @@
 """/api/config/* 라우터."""
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -8,9 +9,69 @@ from pydantic import BaseModel
 
 from core.app_config import AppConfig, ClassStyle, CustomModelType
 from core.model_loader import MODEL_TYPES
+from server.path_safety import UnsafePathError, safe_model_file
 
 router = APIRouter()
 ROOT = Path(__file__).resolve().parent.parent
+
+# Custom-type name becomes a `custom:<name>` key and a YAML mapping key, so
+# reject path separators / control chars that could break replay or traversal.
+_CUSTOM_NAME_RE = re.compile(r"^[\w.\- ]+$")
+
+# Valid coordinate groups recognized by core.inference.postprocess_custom.
+# A custom type with none of these silently yields zero detections, so we
+# reject registration up front (mirror the coord branches at inference.py:603+).
+_COORD_GROUPS: tuple[frozenset, ...] = (
+    frozenset({"x1", "y1", "x2", "y2"}),
+    frozenset({"x1", "y1", "width", "height"}),
+    frozenset({"x_center", "y_center", "width", "height"}),
+)
+
+
+def _validate_class_names(raw: Optional[dict]) -> Optional[dict]:
+    """Validate + coerce free-text class_names into {int: str}.
+
+    Keys originate from a user CSV, so a non-digit key would make int(k)
+    raise deep inside save(); validate here and raise a typed error instead.
+    """
+    if not raw:
+        return None
+    coerced: dict[int, str] = {}
+    for k, v in raw.items():
+        key = str(k).strip()
+        if not (key.lstrip("-").isdigit()):
+            raise UnsafePathError(
+                "BAD_CLASS_NAMES",
+                f"class_names keys must be integer ids, got '{k}'",
+            )
+        coerced[int(key)] = v
+    return coerced
+
+
+def _validate_roles(attr_roles: list) -> None:
+    """Ensure attr_roles carry a usable coord group + a conf source.
+
+    Without a recognizable coord group or any conf role, postprocess_custom
+    returns DetectionResult.empty() with no signal — better to reject at
+    registration than to silently save a type that never detects anything.
+    """
+    roles = set(attr_roles or [])
+    if not any(group <= roles for group in _COORD_GROUPS):
+        raise UnsafePathError(
+            "MISSING_COORDS",
+            "attr_roles must include a coord group: x1y1x2y2, x1y1+width/height, "
+            "or x_center/y_center/width/height",
+        )
+    has_conf = (
+        ("confidence" in roles and "class_id" in roles)
+        or any(r.startswith("conf_class") for r in roles)
+    )
+    if not has_conf:
+        raise UnsafePathError(
+            "MISSING_CONF",
+            "attr_roles must include a conf source: one or more conf_class* "
+            "roles, or both 'confidence' and 'class_id'",
+        )
 
 
 @router.get("/api/config")
@@ -51,8 +112,11 @@ class ConfigUpdate(BaseModel):
 async def save_config(cfg: ConfigUpdate):
     try:
         app_cfg = AppConfig()
-        for k, v in cfg.dict(exclude_none=True).items():
-            setattr(app_cfg, k, v)
+        # Mutate scalar fields under the same RLock save()/_load() use, so a
+        # concurrent save/reload cannot serialize a torn value.
+        with app_cfg._rw_lock:
+            for k, v in cfg.dict(exclude_none=True).items():
+                setattr(app_cfg, k, v)
         app_cfg.save()
         return {"ok": True}
     except Exception as e:
@@ -99,17 +163,29 @@ class CustomModelTypeRequest(BaseModel):
 @router.post("/api/config/custom-model-type")
 async def save_custom_model_type(req: CustomModelTypeRequest):
     try:
+        if not _CUSTOM_NAME_RE.match(req.name or ""):
+            return {"error": "INVALID_NAME"}
+        # Validate the model path before persisting — the path is later
+        # replayed by other tabs, so a bad path must be rejected at the source.
+        model_path = safe_model_file(req.model_path)
+        class_names = _validate_class_names(req.class_names)
+        _validate_roles(req.attr_roles)
         cfg = AppConfig()
         cmt = CustomModelType(
             name=req.name, output_index=req.output_index,
             dim_roles=req.dim_roles, attr_roles=req.attr_roles,
             has_objectness=req.has_objectness, nms=req.nms,
             conf_threshold=req.conf_threshold,
-            class_names={int(k): v for k, v in req.class_names.items()} if req.class_names else None,
+            class_names=class_names,
         )
-        cfg.custom_model_types[req.name] = cmt
+        # Insert under the RLock save()/_load() use so a concurrent save can't
+        # serialize a half-updated dict.
+        with cfg._rw_lock:
+            cfg.custom_model_types[req.name] = cmt
         cfg.save()
         return {"ok": True}
+    except UnsafePathError as e:
+        return {"error": e.code}
     except Exception as e:
         return {"error": str(e)}
 
@@ -117,9 +193,12 @@ async def save_custom_model_type(req: CustomModelTypeRequest):
 @router.post("/api/config/custom-model-type/test")
 async def test_custom_model_type(req: CustomModelTypeRequest):
     try:
+        # Validate before opening a session — never let an unvalidated path
+        # reach ort.InferenceSession (traversal / wrong-ext / missing file).
+        model_path = safe_model_file(req.model_path)
         import onnxruntime as ort
         from core.inference import letterbox, preprocess, postprocess_custom
-        session = ort.InferenceSession(req.model_path)
+        session = ort.InferenceSession(model_path)
         inp = session.get_inputs()[0]
         h = int(inp.shape[2]) if isinstance(inp.shape[2], int) else 640
         w = int(inp.shape[3]) if isinstance(inp.shape[3], int) else 640
@@ -136,6 +215,8 @@ async def test_custom_model_type(req: CustomModelTypeRequest):
         result = postprocess_custom(outputs, cmt, req.conf_threshold, ratio, pad, dummy.shape)
         shapes = [str(list(o.shape)) for o in outputs]
         return {"ok": True, "detections": len(result.boxes), "output_shapes": shapes}
+    except UnsafePathError as e:
+        return {"error": e.code}
     except Exception as e:
         return {"error": str(e)}
 

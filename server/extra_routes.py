@@ -38,15 +38,16 @@ class CLIPRequest(BaseModel):
 
 @router.post("/api/clip/run")
 async def run_clip(req: CLIPRequest):
-    if clip_state["running"]:
-        return {"error": "Already running"}
     # Validate user paths synchronously before submitting the worker so bad
     # input is rejected at the boundary rather than failing deep in ORT.
     image_encoder = safe_model_file(req.image_encoder)
     text_encoder = safe_model_file(req.text_encoder)
     img_dir = safe_image_dir(req.img_dir)
-    clip_state.update(running=True, progress=0, total=0, msg="Starting...",
-                      results=[], skipped=0)
+    # Atomic check-and-set: two concurrent POSTs (double-click / parallel tabs)
+    # would otherwise both pass a read-then-write guard and race clip_state.
+    if not clip_state.try_start(progress=0, total=0, msg="Starting...",
+                                results=[], detail=[], skipped=0, matched=0):
+        return {"error": "Already running"}
 
     @route_errors(state=clip_state, scope="clip")
     def _run():
@@ -62,9 +63,18 @@ async def run_clip(req: CLIPRequest):
         for label in labels:
             tokens = simple_tokenize(template.format(label))
             text_embs.append(model.encode_text(tokens))
-        imgs = glob_images(img_dir)
+        # GT label = each image's parent-folder name (ImageNet-style
+        # img_dir/<class>/*.jpg layout). A non-recursive glob only matched
+        # files directly under img_dir — whose parent IS img_dir — so GT never
+        # matched a label and accuracy was always 0. Scan recursively and skip
+        # images sitting directly in img_dir (no class subfolder = no GT).
+        img_dir_real = os.path.realpath(img_dir)
+        imgs = [fp for fp in glob_images(img_dir, recursive=True)
+                if os.path.realpath(os.path.dirname(fp)) != img_dir_real]
         if not imgs:
-            clip_state.update(running=False, msg="No images found")
+            clip_state.update(
+                running=False,
+                msg="No class-subfolder images found (expected img_dir/<label>/*.jpg)")
             return
         clip_state["total"] = len(imgs)
         clip_state["msg"] = "Running CLIP inference..."
@@ -115,7 +125,14 @@ async def run_clip(req: CLIPRequest):
         results.append({"label": "Overall", "total": total_count, "correct": total_correct, "accuracy": overall_acc})
         clip_state["results"] = results
         clip_state["detail"] = detail_log[:500]
-        msg = "Complete"
+        # `matched` = images whose parent folder matched a label. 0 means the
+        # folder layout didn't line up with any label — surface it so the user
+        # sees a layout mismatch instead of a silent 0% accuracy.
+        clip_state["matched"] = total_count
+        if total_count == 0:
+            msg = "Complete — 0 images matched any label folder (expected img_dir/<label>/*.jpg)"
+        else:
+            msg = "Complete"
         if skipped:
             msg += f" ({skipped} unreadable image(s) skipped)"
         clip_state.update(running=False, msg=msg, skipped=skipped)
@@ -139,13 +156,13 @@ class EmbedderRequest(BaseModel):
 
 @router.post("/api/embedder/run")
 async def run_embedder(req: EmbedderRequest):
-    if embedder_state["running"]:
-        return {"error": "Already running"}
     # Validate user paths synchronously before submitting the worker.
     model_path = safe_model_file(req.model_path)
     img_dir = safe_image_dir(req.img_dir)
-    embedder_state.update(running=True, progress=0, total=0, msg="Starting...",
-                          results=[], detail=[], skipped=0)
+    # Atomic start guard — see clip_state.try_start rationale.
+    if not embedder_state.try_start(progress=0, total=0, msg="Starting...",
+                                    results=[], detail=[], skipped=0):
+        return {"error": "Already running"}
 
     def _run():
         try:
@@ -286,11 +303,14 @@ async def embedder_compare(req: EmbedderCompareRequest):
     """Compare embeddings of multiple selected images using the loaded embedder model."""
     if len(req.img_paths) < 2:
         return {"error": "Need at least 2 images"}
-    safe_model_file(req.model_path)
+    # Validate + normalize the model path and feed the SESSION the validated
+    # path. Previously the safe_model_file return was discarded and the raw
+    # request string opened the ORT session, defeating the boundary check.
+    model_path = safe_model_file(req.model_path)
     safe_paths = [safe_image_file(p) for p in req.img_paths]
 
     import onnxruntime as ort
-    session = ort.InferenceSession(req.model_path)
+    session = ort.InferenceSession(model_path)
     inp = session.get_inputs()[0]
     h = int(inp.shape[2]) if isinstance(inp.shape[2], int) else 224
     w = int(inp.shape[3]) if isinstance(inp.shape[3], int) else 224
@@ -473,8 +493,15 @@ async def api_profile_model(req: ProfileModelRequest):
     # Enforce minimums so a UI default can't request unstable percentiles.
     num_runs = max(req.num_runs, 50)
     warmup = max(req.warmup, 10)
-    result = profile_model(path, num_runs=num_runs, warmup=warmup, provider=req.provider)
-    return profile_to_dict(result)
+
+    def _work():
+        result = profile_model(path, num_runs=num_runs, warmup=warmup, provider=req.provider)
+        return profile_to_dict(result)
+
+    # profile_model does warmup + 50..500 sess.run + a second ORT profiling
+    # session — tens of seconds on large models. Run off the event loop so it
+    # doesn't pin every other tab's requests for the whole benchmark.
+    return await asyncio.get_event_loop().run_in_executor(executor, _work)
 
 
 # ── Phase 1: Pose Estimation API ───────────────────────
@@ -483,36 +510,43 @@ async def api_infer_pose(req: InferImageRequest):
     model_path = safe_model_file(req.model_path)
     image_path = safe_image_file(req.image_path)
     model_type = req.model_type or "pose_yolo"
-    frame = imread(image_path)
-    if frame is None:
-        return {"error": "Cannot read image"}
-    mi = _load_model(model_path, model_type=model_type)
-    from core.inference import run_pose, COCO_SKELETON, COCO_KPT_NAMES
-    result = run_pose(mi, frame, req.conf)
-    vis = frame.copy()
-    for i in range(len(result.boxes)):
-        x1, y1, x2, y2 = result.boxes[i].astype(int)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        kpts = result.keypoints[i]
-        kpt_conf = req.kpt_conf
-        for j, (kx, ky, kc) in enumerate(kpts):
-            if kc > kpt_conf:
-                cv2.circle(vis, (int(kx), int(ky)), 3, (0, 0, 255), -1)
-        for a, b in COCO_SKELETON:
-            if kpts[a][2] > kpt_conf and kpts[b][2] > kpt_conf:
-                cv2.line(vis, (int(kpts[a][0]), int(kpts[a][1])),
-                         (int(kpts[b][0]), int(kpts[b][1])), (255, 255, 0), 2)
-    return {
-        "image": encode_jpeg(vis),
-        "num_persons": len(result.boxes),
-        "infer_ms": round(result.infer_ms, 2),
-        "detections": [
-            {"box": result.boxes[i].tolist(),
-             "score": round(float(result.scores[i]), 3),
-             "keypoints": result.keypoints[i].tolist()}
-            for i in range(len(result.boxes))
-        ],
-    }
+
+    def _work():
+        frame = imread(image_path)
+        if frame is None:
+            return {"error": "Cannot read image"}
+        mi = _load_model(model_path, model_type=model_type)
+        from core.inference import run_pose, COCO_SKELETON, COCO_KPT_NAMES
+        result = run_pose(mi, frame, req.conf)
+        vis = frame.copy()
+        for i in range(len(result.boxes)):
+            x1, y1, x2, y2 = result.boxes[i].astype(int)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            kpts = result.keypoints[i]
+            kpt_conf = req.kpt_conf
+            for j, (kx, ky, kc) in enumerate(kpts):
+                if kc > kpt_conf:
+                    cv2.circle(vis, (int(kx), int(ky)), 3, (0, 0, 255), -1)
+            for a, b in COCO_SKELETON:
+                if kpts[a][2] > kpt_conf and kpts[b][2] > kpt_conf:
+                    cv2.line(vis, (int(kpts[a][0]), int(kpts[a][1])),
+                             (int(kpts[b][0]), int(kpts[b][1])), (255, 255, 0), 2)
+        return {
+            "image": encode_jpeg(vis),
+            "num_persons": len(result.boxes),
+            "infer_ms": round(result.infer_ms, 2),
+            "detections": [
+                {"box": result.boxes[i].tolist(),
+                 "score": round(float(result.scores[i]), 3),
+                 "keypoints": result.keypoints[i].tolist()}
+                for i in range(len(result.boxes))
+            ],
+        }
+
+    # Model load + ORT run + per-keypoint cv2 drawing are blocking; running
+    # them on the event loop would freeze every other request (status pollers,
+    # MJPEG stream) for the full inference duration. Offload to the shared pool.
+    return await asyncio.get_event_loop().run_in_executor(executor, _work)
 
 
 # ── Phase 1: Instance Segmentation API ─────────────────
@@ -521,35 +555,41 @@ async def api_infer_instance_seg(req: InferImageRequest):
     model_path = safe_model_file(req.model_path)
     image_path = safe_image_file(req.image_path)
     model_type = req.model_type or "instseg_yolo"
-    frame = imread(image_path)
-    if frame is None:
-        return {"error": "Cannot read image"}
-    mi = _load_model(model_path, model_type=model_type)
-    from core.inference import run_instance_seg
-    result = run_instance_seg(mi, frame, req.conf)
-    vis = frame.copy()
-    colors = generate_palette(max(len(result.masks), 1))
-    for i in range(len(result.masks)):
-        mask = result.masks[i]
-        color = colors[i % len(colors)]
-        overlay = vis.copy()
-        overlay[mask > 0] = color
-        cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
-        x1, y1, x2, y2 = result.boxes[i].astype(int)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-        label = f"cls{result.class_ids[i]} {result.scores[i]:.2f}"
-        cv2.putText(vis, label, (x1, max(y1-4, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-    return {
-        "image": encode_jpeg(vis),
-        "num_instances": len(result.boxes),
-        "infer_ms": round(result.infer_ms, 2),
-        "detections": [
-            {"box": result.boxes[i].tolist(),
-             "score": round(float(result.scores[i]), 3),
-             "class_id": int(result.class_ids[i])}
-            for i in range(len(result.boxes))
-        ],
-    }
+
+    def _work():
+        frame = imread(image_path)
+        if frame is None:
+            return {"error": "Cannot read image"}
+        mi = _load_model(model_path, model_type=model_type)
+        from core.inference import run_instance_seg
+        result = run_instance_seg(mi, frame, req.conf)
+        vis = frame.copy()
+        colors = generate_palette(max(len(result.masks), 1))
+        for i in range(len(result.masks)):
+            mask = result.masks[i]
+            color = colors[i % len(colors)]
+            overlay = vis.copy()
+            overlay[mask > 0] = color
+            cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
+            x1, y1, x2, y2 = result.boxes[i].astype(int)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            label = f"cls{result.class_ids[i]} {result.scores[i]:.2f}"
+            cv2.putText(vis, label, (x1, max(y1-4, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        return {
+            "image": encode_jpeg(vis),
+            "num_instances": len(result.boxes),
+            "infer_ms": round(result.infer_ms, 2),
+            "detections": [
+                {"box": result.boxes[i].tolist(),
+                 "score": round(float(result.scores[i]), 3),
+                 "class_id": int(result.class_ids[i])}
+                for i in range(len(result.boxes))
+            ],
+        }
+
+    # ORT run + per-instance cv2.resize/overlay loop are blocking; offload off
+    # the event loop so concurrent requests aren't frozen (same as pose).
+    return await asyncio.get_event_loop().run_in_executor(executor, _work)
 
 
 # ── Phase 1: Tracking API ──────────────────────────────
@@ -697,6 +737,19 @@ class SegmentationRunRequest(BaseModel):
 # Mask extensions probed when locating a GT mask by image stem (SPEC-08).
 _MASK_EXTS = (".png", ".bmp", ".tif", ".tiff", ".jpg", ".jpeg")
 
+# Overlays are heavy (one base64 PNG per image), so only the N worst-scoring
+# images get one — that's where the user wants to look anyway. Bound the
+# per-image metrics list too so a huge directory can't balloon the snapshot.
+_SEG_OVERLAY_CAP = 12
+_SEG_DETAIL_CAP = 1000
+
+
+def _encode_png(img: np.ndarray) -> str:
+    """Base64-encode a BGR image as PNG (lossless overlays for the modal)."""
+    import base64
+    ok, buf = cv2.imencode(".png", img)
+    return base64.b64encode(buf).decode() if ok else ""
+
 
 def _find_gt_mask(gt_dir: str, stem: str, src_ext: str):
     """Return the first existing GT mask path for `stem`, else None.
@@ -722,8 +775,12 @@ async def api_segmentation_run(req: SegmentationRunRequest):
     gt_mask_dir = safe_image_dir(gt_dir_raw)
     num_classes = req.num_classes
 
-    seg_state.update(running=True, progress=0, total=0, msg="Starting...",
-                     results=[], skipped=0)
+    # Atomic check-and-set — two concurrent POSTs would otherwise both submit
+    # workers writing to the single seg_state. detail=[] / images=[] reset so a
+    # prior run's per-image overlays don't bleed into this one.
+    if not seg_state.try_start(progress=0, total=0, msg="Starting...",
+                               results=[], detail=[], images=[], skipped=0):
+        return {"error": "Segmentation evaluation already running"}
 
     @route_errors(state=seg_state, scope="seg")
     def _run():
@@ -742,6 +799,9 @@ async def api_segmentation_run(req: SegmentationRunRequest):
         all_dices: dict[int, list] = {}
         evaluated = 0
         skipped = 0
+        # Per-image records carry the predicted/source masks so the worst-N can
+        # be turned into overlays AFTER the loop (avoids encoding all images).
+        per_image: list[dict] = []
         for idx, fp in enumerate(images):
             if not seg_state.get("running", True):
                 seg_state.update(msg="Stopped by user")
@@ -775,39 +835,79 @@ async def api_segmentation_run(req: SegmentationRunRequest):
                     (gt_mask.shape[1], gt_mask.shape[0]),
                     interpolation=cv2.INTER_NEAREST)
             metrics = evaluate_segmentation(pred_mask, gt_mask, num_classes)
+            img_ious = []
             for k, v in metrics.items():
                 if k == "__overall__":
                     continue
                 all_ious.setdefault(k, []).append(v["iou"])
                 all_dices.setdefault(k, []).append(v["dice"])
+                if not np.isnan(v["iou"]) and v["gt_px"] > 0:
+                    img_ious.append(v["iou"])
+            img_iou = float(np.mean(img_ious)) if img_ious else 0.0
+            gt_classes_present = int(len([c for c in np.unique(gt_mask) if c != 0]))
+            if len(per_image) < _SEG_DETAIL_CAP:
+                per_image.append({
+                    "file": os.path.basename(fp),
+                    "iou": round(img_iou, 4),
+                    "classes": gt_classes_present,
+                    # frame/pred kept only long enough to render worst-N overlays.
+                    "_frame": frame,
+                    "_pred": pred_mask,
+                })
             evaluated += 1
             seg_state.update(progress=idx + 1,
                              msg=f"Evaluating {idx + 1}/{len(images)}...")
 
         # Average per-class IoU/Dice (NaN IoU = class absent in that image).
-        detail = {}
+        per_class: list[dict] = []
         valid_ious, valid_dices = [], []
         for k in sorted(all_ious.keys()):
             ious = [x for x in all_ious[k] if not np.isnan(x)]
             dices = all_dices[k]
             mean_iou = float(np.mean(ious)) if ious else 0.0
             mean_dice = float(np.mean(dices)) if dices else 0.0
-            detail[str(k)] = {"iou": round(mean_iou, 6), "dice": round(mean_dice, 6)}
+            per_class.append({
+                "class": int(k),
+                "iou": round(mean_iou, 6),
+                "dice": round(mean_dice, 6),
+            })
             if ious:
                 valid_ious.append(mean_iou)
                 valid_dices.append(mean_dice)
         miou = float(np.mean(valid_ious)) if valid_ious else 0.0
         mdice = float(np.mean(valid_dices)) if valid_dices else 0.0
+
+        # Public per-image rows (no in-memory frame/pred — those were kept only
+        # to render overlays). `path` mirrors the original spec field name.
+        images_out: list[dict] = [
+            {"path": rec["file"], "file": rec["file"], "iou": rec["iou"],
+             "classes": rec["classes"], "overlay": ""}
+            for rec in per_image
+        ]
+        # Overlay the worst-IoU images so the user lands on the failures first.
+        by_file = {e["file"]: e for e in images_out}
+        for rec in sorted(per_image, key=lambda r: r["iou"])[:_SEG_OVERLAY_CAP]:
+            vis = overlay_segmentation(rec["_frame"], rec["_pred"])
+            by_file[rec["file"]]["overlay"] = _encode_png(vis)
+
         results = {
+            "metrics": {
+                "mIoU": round(miou * 100, 4),
+                "mDice": round(mdice * 100, 4),
+                "per_class": per_class,
+            },
+            # Kept for backwards-compat with older UI that read these top-level.
             "mIoU": round(miou * 100, 4),
             "mDice": round(mdice * 100, 4),
-            "detail": detail,
             "num_images": evaluated,
         }
         msg = "Complete"
         if skipped:
             msg += f" ({skipped} image(s) skipped: no GT mask / unreadable)"
-        seg_state.update(running=False, msg=msg, results=results, skipped=skipped)
+        # `images` (per-image rows + worst-N overlays) lives at the top level of
+        # the status snapshot; `detail` mirrors it for the existing modal poller.
+        seg_state.update(running=False, msg=msg, results=results,
+                         images=images_out, detail=images_out, skipped=skipped)
 
     executor.submit(_run)
     return {"ok": True, "msg": "Segmentation evaluation started"}

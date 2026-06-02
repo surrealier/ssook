@@ -579,3 +579,81 @@ class TestModelCacheAtomic:
         # All workers get the same value; compute ran once (per-key lock).
         assert all(r == {"value": 42} for r in results)
         assert calls["n"] == 1
+
+
+# ============================================================
+# Diagnosis hardening — external-data models + bounded fusable scan
+# ============================================================
+def _make_external_data_model(path: str, in_features=64, out_features=32):
+    """Linear model whose weights live in a sidecar .data file (external data).
+
+    Mirrors how exporters emit >2GB models: numpy_helper.to_array() on these
+    initializers raises when the model is loaded with load_external_data=False.
+    """
+    import onnx
+    from onnx import helper, TensorProto, numpy_helper
+    from onnx.external_data_helper import convert_model_to_external_data
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, in_features])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, out_features])
+    W = numpy_helper.from_array(
+        np.random.randn(in_features, out_features).astype(np.float32), "W")
+    B = numpy_helper.from_array(np.random.randn(out_features).astype(np.float32), "B")
+    mm = helper.make_node("MatMul", ["X", "W"], ["mm"])
+    add = helper.make_node("Add", ["mm", "B"], ["Y"])
+    graph = helper.make_graph([mm, add], "lin_ext", [X], [Y], [W, B])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    onnx.save(model, path)
+    # Force every tensor out to a sidecar regardless of size.
+    loaded = onnx.load(path)
+    convert_model_to_external_data(
+        loaded, all_tensors_to_one_file=True,
+        location=os.path.basename(path) + ".data", size_threshold=0)
+    onnx.save(loaded, path)
+    return path
+
+
+class TestDiagnoseExternalData:
+    def test_external_data_with_sidecar_diagnoses(self, tmp_dir):
+        # Sidecar present: weights must be materialized and stats computed.
+        p = _make_external_data_model(os.path.join(tmp_dir, "ext.onnx"))
+        assert os.path.isfile(p + ".data")
+        result = ModelDiagnosisEngine().diagnose(p)
+        assert result["summary"]["total_params"] > 0
+        assert result["summary"]["weights_materialized"] is True
+        assert len(result["weight_analysis"]) > 0
+
+    def test_external_data_missing_sidecar_no_crash(self, tmp_dir):
+        # Sidecar deleted: diagnosis must NOT crash; it degrades to a
+        # structure-only report with a clear warning finding.
+        p = _make_external_data_model(os.path.join(tmp_dir, "ext_missing.onnx"))
+        os.remove(p + ".data")
+        result = ModelDiagnosisEngine().diagnose(p)  # must not raise
+        assert result["summary"]["weights_materialized"] is False
+        # Graph structure still analyzed (nodes counted).
+        assert result["summary"]["num_nodes"] >= 1
+        # A weights-category warning explains why stats are absent.
+        weight_warnings = [f for f in result["findings"]
+                           if f["category"] == "weights"
+                           and f["severity"] == "warning"]
+        assert weight_warnings, "expected a warning about unmaterialized weights"
+        assert "external data" in weight_warnings[0]["message"].lower()
+
+
+class TestDiagnoseFusableScanBounded:
+    def test_large_graph_scan_capped(self, conv_model, monkeypatch):
+        # Lower the cap so a tiny graph trips the bound, proving the scan is
+        # skipped (not run quadratically) and flagged instead of hanging.
+        import core.model_diagnosis as md
+        monkeypatch.setattr(md, "_FUSABLE_SCAN_MAX_NODES", 1)
+        result = ModelDiagnosisEngine().diagnose(conv_model)
+        ga = result["graph_analysis"]
+        assert ga["fusable_scan_capped"] is True
+        assert ga["fusable_patterns"] == 0  # scan skipped, nothing counted
+
+    def test_small_graph_scan_runs(self, conv_bn_conv_model):
+        # Under the default cap the scan runs and finds the Conv->BN fusion.
+        result = ModelDiagnosisEngine().diagnose(conv_bn_conv_model)
+        ga = result["graph_analysis"]
+        assert ga["fusable_scan_capped"] is False
+        assert ga["fusable_patterns"] >= 1
