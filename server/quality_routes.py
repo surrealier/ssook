@@ -239,6 +239,7 @@ from core.hashing import (
     hamming as _core_hamming,
     find_near_duplicates as _find_near_duplicates,
     cluster_near_duplicates as _cluster_near_duplicates,
+    BKTree as _BKTree,
 )
 
 
@@ -349,15 +350,20 @@ async def quality_leaky(req: LeakyRequest):
         names = list(split_hashes.keys())
         for i in range(len(names)):
             for j in range(i+1, len(names)):
+                # Build a BKTree over split B's hashes once, then query each of
+                # split A's hashes within `threshold` — O(M log N) instead of the
+                # old O(MxN) all-pairs Hamming scan that froze on real splits
+                # (LEAKY scale P1). Keep a parallel (file, hash) list so query
+                # indices map back to filenames for the sample list.
+                b_items = list(split_hashes[names[j]].items())
+                b_tree = _BKTree().build([h for _, h in b_items])
                 dupes = 0
                 files = []
                 for fa, ha in split_hashes[names[i]].items():
-                    for fb, hb in split_hashes[names[j]].items():
-                        dist = _core_hamming(ha, hb)
-                        if dist <= threshold:
-                            dupes += 1
-                            if len(files) < 10:
-                                files.append(f"{fa} ↔ {fb}")
+                    for b_idx in b_tree.query(ha, threshold):
+                        dupes += 1
+                        if len(files) < 10:
+                            files.append(f"{fa} ↔ {b_items[b_idx][0]}")
                 results.append({"pair": f"{names[i]} ↔ {names[j]}", "duplicates": dupes, "files": "; ".join(files)})
         leaky_state["results"] = results
         leaky_state["skipped"] = skipped
@@ -396,13 +402,15 @@ async def quality_similarity(req: SimRequest):
 
     @route_errors(state=sim_state, scope="similarity")
     def _run():
-        # Reuse the cached hash list when the corpus (dir, recursion, width)
-        # is unchanged so repeat queries against the same folder skip the
-        # full re-glob + re-decode (QUAL-04). Invalidated when the key differs.
+        # Reuse the cached hash list AND BKTree when the corpus (dir, recursion,
+        # width) is unchanged so repeat queries against the same folder skip the
+        # full re-glob + re-decode AND the re-build of the index (QUAL-04 + the
+        # similarity scale P1). Invalidated when the key differs.
         cache_key = (img_dir, recursive, _SIM_HASH_SIZE)
         cached = sim_state.get("index")
         if cached and cached.get("key") == cache_key:
             hashes = cached["hashes"]
+            tree = cached["tree"]
             skipped = cached.get("skipped", 0)
             sim_state["total"] = len(hashes)
             sim_state["progress"] = len(hashes)
@@ -421,7 +429,10 @@ async def quality_similarity(req: SimRequest):
                 else:
                     hashes.append((os.path.basename(fp), _dhash(frame, _SIM_HASH_SIZE)))
                 sim_state["progress"] = i + 1
-            sim_state["index"] = {"key": cache_key, "hashes": hashes, "skipped": skipped}
+            # Build the BKTree once and cache it; index i in the tree maps to
+            # hashes[i] so query results recover the filename.
+            tree = _BKTree().build([h for _, h in hashes])
+            sim_state["index"] = {"key": cache_key, "hashes": hashes, "tree": tree, "skipped": skipped}
 
         if query:
             q_frame = imread(query)
@@ -431,8 +442,13 @@ async def quality_similarity(req: SimRequest):
                 sim_state.update(running=False, msg="Error: query image could not be decoded")
                 return
             q_hash = _dhash(q_frame, _SIM_HASH_SIZE)
-            ranked = sorted(hashes, key=lambda x: _core_hamming(x[1], q_hash))
-            sim_state["results"] = [{"rank": i+1, "image": name, "distance": _core_hamming(h, q_hash)} for i, (name, h) in enumerate(ranked[:top_k])]
+            # Expanding-radius BKTree query returns the top-k (distance, index)
+            # without sorting all N — sublinear on a large cached corpus. 64 bits
+            # because _SIM_HASH_SIZE=8. Falls back to scanning everything only
+            # when the radius has to widen to the full width.
+            ranked = tree.query_top_k(q_hash, top_k, max_bits=_SIM_HASH_SIZE * _SIM_HASH_SIZE)
+            sim_state["results"] = [{"rank": rank + 1, "image": hashes[idx][0], "distance": dist}
+                                    for rank, (dist, idx) in enumerate(ranked)]
         else:
             sim_state["results"] = [{"rank": i+1, "image": name, "distance": 0} for i, (name, _) in enumerate(hashes[:top_k])]
         msg = "Complete"

@@ -803,8 +803,10 @@ async def data_merger(req: MergerRequest):
                 all_imgs.extend(glob_images(d, recursive=req.recursive))
             merger_state["total"] = len(all_imgs)
 
-            # Phase 1: hash every readable image (DATA-08 — BK-tree clustering
-            # replaces the old O(N²) incremental Hamming scan).
+            # Phase 1: hash every readable image (DATA-08). Clustering below uses
+            # cluster_near_duplicates, which is BK-tree-backed for large corpora
+            # (core.hashing routes find_near_duplicates through BKTree above its
+            # pair threshold) so large merges no longer hang on the O(N²) scan.
             merger_state["msg"] = "Hashing..."
             valid_imgs: list[str] = []
             hashes: list[int] = []

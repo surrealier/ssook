@@ -665,6 +665,37 @@ const I18n = {
     'tracking.no_tracks':   { en: 'No active tracks',      ko: '활성 트랙 없음' },
     'inspector.ep_unknown': { en: 'Unknown',               ko: '알 수 없음' },
     'profiler.provider_auto': { en: 'Auto (app default)',  ko: '자동 (앱 기본값)' },
+    // Wave 2 — segmentation metrics rendering
+    'seg.miou':             { en: 'mIoU',                  ko: 'mIoU' },
+    'seg.mdice':            { en: 'mDice',                 ko: 'mDice' },
+    'seg.images_evaluated': { en: '{n} images',            ko: '이미지 {n}개' },
+    // Wave 2 — image-quality threshold knobs
+    'quality.thresholds':   { en: 'Advanced thresholds',   ko: '고급 임계값' },
+    'quality.thresholds_hint': { en: 'Defaults reproduce the standard checks; adjust to tune sensitivity.', ko: '기본값은 표준 검사를 재현합니다. 민감도 조정 시 변경하세요.' },
+    'quality.blur_threshold': { en: 'Blur (Laplacian var <)', ko: '흐림 (라플라시안 분산 <)' },
+    'quality.dark':         { en: 'Dark (brightness <)',   ko: '어두움 (밝기 <)' },
+    'quality.bright':       { en: 'Overexposed (brightness >)', ko: '과다노출 (밝기 >)' },
+    'quality.entropy':      { en: 'Low detail (entropy <)', ko: '낮은 디테일 (엔트로피 <)' },
+    'quality.aspect_min':   { en: 'Aspect min',            ko: '종횡비 최소' },
+    'quality.aspect_max':   { en: 'Aspect max',            ko: '종횡비 최대' },
+    // Wave 2 — converter result summary + diagnostics
+    'conv.images':          { en: '{n} images',            ko: '이미지 {n}개' },
+    'conv.labels':          { en: '{n} labels',            ko: '라벨 {n}개' },
+    'conv.annotations':     { en: '{n} annotations',       ko: '어노테이션 {n}개' },
+    'conv.files':           { en: '{n} files',             ko: '파일 {n}개' },
+    'conv.objects':         { en: '{n} objects',           ko: '객체 {n}개' },
+    'conv.skipped_unsafe':  { en: '{n} skipped (unsafe name)', ko: '안전하지 않은 이름 {n}개 건너뜀' },
+    'conv.bad_lines':       { en: '{n} corrupt line(s)',   ko: '손상된 라인 {n}개' },
+    // Wave 2 — remapper / sampler
+    'remap.busy':           { en: 'Remapper is already running', ko: '리매퍼가 이미 실행 중입니다' },
+    'remap.collisions':     { en: '{n} renamed (name collision)', ko: '이름 충돌로 {n}개 이름 변경됨' },
+    'samp.collisions':      { en: '{n} renamed (name collision)', ko: '이름 충돌로 {n}개 이름 변경됨' },
+    // Wave 2 — CLIP folder-layout mismatch
+    'clip.no_match':        { en: 'No images matched any label folder (expected img_dir/<label>/*.jpg)', ko: '어떤 라벨 폴더와도 일치하는 이미지가 없습니다 (img_dir/<label>/*.jpg 형식 필요)' },
+    // Wave 2 — augmentation parameters
+    'aug.angle':            { en: 'Rotation angle (°)',    ko: '회전 각도 (°)' },
+    'aug.alpha':            { en: 'Contrast (alpha)',      ko: '대비 (alpha)' },
+    'aug.beta':             { en: 'Brightness (beta)',     ko: '밝기 (beta)' },
   },
 
   t(key, params) {

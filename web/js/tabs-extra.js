@@ -388,7 +388,7 @@ Tabs['embedding-viewer'] = {
           </div>
           <div style="display:flex;gap:0.5rem;margin-top:1rem;">
             <button class="btn btn-primary" onclick="Tabs['embedding-viewer'].run()">${t('run')}</button>
-            <button class="btn btn-danger btn-sm" id="ev-stop" disabled onclick="Tabs['embedding-viewer']._polling=false">${t('stop')}</button>
+            <button class="btn btn-danger btn-sm" id="ev-stop" disabled onclick="API.post('/api/force-stop/embedding',{});Tabs['embedding-viewer']._polling=false">${t('stop')}</button>
           </div>
           <div style="margin-top:0.5rem;"><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="ev-prog" style="width:0%;height:100%;"></div><span id="ev-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
             <span class="text-secondary" id="ev-status" style="margin-top:0.25rem;display:block;">${t('ready')}</span></div>
@@ -454,8 +454,9 @@ Tabs.segmentation = {
         </div>
         <div class="card" style="padding:1.5rem;">
           <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('bench.results')}</h3>
-          <div class="table-container"><table><thead><tr><th>Class</th><th>IoU</th><th>Dice</th><th>Images</th></tr></thead>
-          <tbody id="seg-results"><tr><td colspan="4" class="text-secondary" style="text-align:center;padding:2rem;">${t('seg.run_hint')}</td></tr></tbody></table></div>
+          <div id="seg-summary" class="text-secondary" style="margin-bottom:0.75rem;"></div>
+          <div class="table-container"><table><thead><tr><th>Class</th><th>IoU</th><th>Dice</th></tr></thead>
+          <tbody id="seg-results"><tr><td colspan="3" class="text-secondary" style="text-align:center;padding:2rem;">${t('seg.run_hint')}</td></tr></tbody></table></div>
         </div>
       </div>`;
   },
@@ -481,24 +482,58 @@ Tabs.segmentation = {
       const segPt = document.getElementById('seg-prog-text'); if (segPt) segPt.textContent = prog + '%';
       if (msgEl) msgEl.textContent = s.msg || `${s.progress}/${s.total}`;
       if (s.running) setTimeout(() => this._poll(), 500);
-      else App.setStatus((s.msg || 'Complete') + (s.skipped ? ` (${t('spec.skipped', {n: s.skipped})})` : ''));
+      else {
+        this._renderResults(s);
+        App.setStatus((s.msg || 'Complete') + (s.skipped ? ` (${t('spec.skipped', {n: s.skipped})})` : ''));
+      }
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  },
+  // Render the overall + per-class metrics table from results.metrics (Wave 1 shape:
+  // {mIoU, mDice, per_class:[{class,iou,dice}]}). Stash status for the Detail modal.
+  _renderResults(s) {
+    this._lastStatus = s;
+    const tbody = document.getElementById('seg-results');
+    const summaryEl = document.getElementById('seg-summary');
+    const results = s.results || {};
+    const metrics = results.metrics || {};
+    const perClass = metrics.per_class || [];
+    const mIoU = metrics.mIoU != null ? metrics.mIoU : results.mIoU;
+    const mDice = metrics.mDice != null ? metrics.mDice : results.mDice;
+    if (summaryEl) {
+      if (mIoU != null) {
+        summaryEl.innerHTML = `${t('seg.miou')}: <strong>${Number(mIoU).toFixed(2)}%</strong> · ${t('seg.mdice')}: <strong>${Number(mDice).toFixed(2)}%</strong>`
+          + (results.num_images != null ? ` · ${t('seg.images_evaluated', {n: results.num_images})}` : '');
+      } else summaryEl.textContent = '';
+    }
+    if (!tbody) return;
+    if (!perClass.length) {
+      tbody.innerHTML = `<tr><td colspan="3" class="text-secondary" style="text-align:center;padding:2rem;">${t('seg.run_hint')}</td></tr>`;
+      return;
+    }
+    let rows = '';
+    // per_class iou/dice are 0-1 floats per Wave 1 contract; show as percentages for parity with mIoU.
+    for (const c of perClass) {
+      rows += `<tr><td>${escHtml(c.class)}</td><td>${(Number(c.iou) * 100).toFixed(2)}%</td><td>${(Number(c.dice) * 100).toFixed(2)}%</td></tr>`;
+    }
+    tbody.innerHTML = rows;
   },
   _showDetail() {
     const tbody = document.getElementById('seg-results');
     if (!tbody) return;
-    // Fetch detail from last status
+    // Fetch detail from last status. Wave 1 contract: top-level `detail`/`images` is the
+    // per-image list [{path,file,iou,classes,overlay}]; overlay is a base64 PNG (only for
+    // the lowest-IoU images), so render it as PNG and escape all model-supplied filenames.
     API.get('/api/segmentation/status').then(s => {
-      const detail = s.detail || [];
+      const detail = s.detail || s.images || [];
       let html = '<div style="font-size:12px;">';
-      // Summary table
+      // Summary table (copy the live per-class metrics table)
       html += '<h4 style="margin-bottom:0.5rem;">' + t('seg.per_class') + '</h4>';
       html += tbody.parentElement.parentElement.outerHTML;
       html += '<h4 style="margin:1rem 0 0.5rem;">' + t('seg.flow') + '</h4>';
       html += '<div style="display:flex;gap:0.5rem;align-items:center;font-size:11px;color:#aaa;margin-bottom:1rem;">';
       t('seg.flow_steps').split(',').forEach((step, i) => {
         if (i > 0) html += '→';
-        html += '<span style="padding:4px 8px;background:#333;border-radius:4px;">' + step + '</span>';
+        html += '<span style="padding:4px 8px;background:#333;border-radius:4px;">' + escHtml(step) + '</span>';
       });
       html += '</div>';
       if (detail.length) {
@@ -508,14 +543,14 @@ Tabs.segmentation = {
         if (withOverlay.length) {
           html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:0.5rem;margin-bottom:1rem;">';
           for (const d of withOverlay) {
-            html += `<div style="text-align:center;"><img src="data:image/jpeg;base64,${d.overlay}" style="max-width:100%;border-radius:4px;"><div style="font-size:10px;margin-top:2px;">${d.file} (IoU: ${d.iou})</div></div>`;
+            html += `<div style="text-align:center;"><img src="data:image/png;base64,${d.overlay}" style="max-width:100%;border-radius:4px;"><div style="font-size:10px;margin-top:2px;">${escHtml(d.file || d.path)} (IoU: ${escHtml(d.iou)})</div></div>`;
           }
           html += '</div>';
         }
         html += '<table style="width:100%;"><thead><tr><th>File</th><th>Mean IoU</th><th>Classes</th></tr></thead><tbody>';
         for (const d of detail.slice(0, 100)) {
-          const color = d.iou < 0.3 ? 'style="background:rgba(255,0,0,0.08);"' : '';
-          html += `<tr ${color}><td>${d.file}</td><td>${d.iou}</td><td>${d.classes}</td></tr>`;
+          const color = Number(d.iou) < 0.3 ? 'style="background:rgba(255,0,0,0.08);"' : '';
+          html += `<tr ${color}><td>${escHtml(d.file || d.path)}</td><td>${escHtml(d.iou)}</td><td>${escHtml(d.classes)}</td></tr>`;
         }
         html += '</tbody></table>';
         if (detail.length > 100) html += `<div style="color:#888;margin-top:0.5rem;">${t('seg.more', {n: detail.length - 100})}</div>`;
@@ -557,7 +592,10 @@ Tabs.clip = {
             <label class="form-label" for="clip-prompt-template">${t('clip.prompt_template')}</label>
             <input type="text" class="form-input input-normal" placeholder="${t('clip.prompt_template_ph')}" id="clip-prompt-template" value="a photo of a {}">
           </div>
-          <button class="btn btn-primary" style="margin-top:1rem;" id="clip-run-btn" onclick="Tabs.clip.run()">${t('run')}</button>
+          <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+            <button class="btn btn-primary" id="clip-run-btn" onclick="Tabs.clip.run()">${t('run')}</button>
+            <button class="btn btn-danger btn-sm" id="clip-stop" disabled onclick="API.post('/api/force-stop/clip',{})">${t('stop')}</button>
+          </div>
         </div>
         <div>
           <div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="clip-prog" style="width:0%;height:100%;"></div><span id="clip-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
@@ -585,6 +623,7 @@ Tabs.clip = {
         prompt_template: promptTemplate
       });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      const stopBtn = document.getElementById('clip-stop'); if (stopBtn) stopBtn.disabled = false;
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
@@ -600,13 +639,18 @@ Tabs.clip = {
       if (s.results && s.results.length) {
         const tbody = document.getElementById('clip-results');
         if (tbody) tbody.innerHTML = s.results.map(r =>
-          `<tr><td>${r.label}</td><td>${r.total}</td><td>${r.correct}</td><td>${r.accuracy}</td></tr>`
+          `<tr><td>${escHtml(r.label)}</td><td>${r.total}</td><td>${r.correct}</td><td>${r.accuracy}</td></tr>`
         ).join('');
         this._detail = s.detail || [];
       }
       if (s.running) setTimeout(() => this._poll(), 500);
       else {
-        App.setStatus((s.msg || 'Complete') + (s.skipped ? ` (${t('spec.skipped', {n: s.skipped})})` : ''));
+        const stopBtn = document.getElementById('clip-stop'); if (stopBtn) stopBtn.disabled = true;
+        // matched==0 means no image's parent folder matched a label — a folder-layout
+        // mismatch (expects img_dir/<label>/*.jpg), not a 0% model (Wave 1 `matched`).
+        let extra = s.skipped ? ` (${t('spec.skipped', {n: s.skipped})})` : '';
+        if (s.matched === 0) extra += ' — ' + t('clip.no_match');
+        App.setStatus((s.msg || 'Complete') + extra);
         if (this._detail && this._detail.length) {
           const btn = document.getElementById('clip-run-btn');
           if (btn) btn.insertAdjacentHTML('afterend',
@@ -624,7 +668,9 @@ Tabs.clip = {
     html += '<div style="max-height:400px;overflow-y:auto;"><table style="width:100%;font-size:12px;"><thead><tr><th>File</th><th>GT</th><th>Pred</th><th>Score</th><th>Top-3</th></tr></thead><tbody>';
     for (const r of d.slice(0, 200)) {
       const color = r.correct ? '' : 'style="background:rgba(255,0,0,0.08);"';
-      html += `<tr ${color}><td>${r.file}</td><td>${r.gt}</td><td>${r.pred}</td><td>${r.score}</td><td>${r.top3.map(t=>t[0]+':'+t[1]).join(', ')}</td></tr>`;
+      // file/gt/pred/top3 labels come from dataset folder names — escape against DOM-XSS.
+      const top3 = (r.top3 || []).map(pair => escHtml(pair[0]) + ':' + escHtml(pair[1])).join(', ');
+      html += `<tr ${color}><td>${escHtml(r.file)}</td><td>${escHtml(r.gt)}</td><td>${escHtml(r.pred)}</td><td>${escHtml(r.score)}</td><td>${top3}</td></tr>`;
     }
     html += '</tbody></table></div>';
     if (d.length > 200) html += `<div class="text-secondary" style="margin-top:0.5rem;">${t('seg.more', {n: d.length - 200})}</div>`;
@@ -749,10 +795,11 @@ Tabs.embedder = {
       const names = res.names;
       const matrix = res.matrix;
       let html = '<div style="overflow-x:auto;"><table style="width:100%;font-size:11px;"><thead><tr><th></th>';
-      names.forEach(n => { html += `<th style="max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${n}">${n}</th>`; });
+      // names are image filenames from the chosen dir — escape against DOM-XSS.
+      names.forEach(n => { html += `<th style="max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(n)}">${escHtml(n)}</th>`; });
       html += '</tr></thead><tbody>';
       matrix.forEach((row, i) => {
-        html += `<tr><td style="font-weight:600;max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${names[i]}">${names[i]}</td>`;
+        html += `<tr><td style="font-weight:600;max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(names[i])}">${escHtml(names[i])}</td>`;
         row.forEach((v, j) => {
           const bg = i === j ? '#333' : v > 0.9 ? 'rgba(74,222,128,0.3)' : v > 0.7 ? 'rgba(74,158,255,0.2)' : v < 0.3 ? 'rgba(255,107,107,0.2)' : '';
           html += `<td style="text-align:center;${bg ? 'background:'+bg+';' : ''}">${v.toFixed(3)}</td>`;
@@ -812,14 +859,21 @@ Tabs.converter = {
       if (m) m.textContent = s.msg || `${s.progress}/${s.total}`;
       if (s.running) setTimeout(() => this._poll(), 500);
       else {
-        // DATA-06: converter skips labels whose source image dimensions are unknown
-        // (separate labels/images dirs) and labels whose image was never found.
-        // Surface those counts instead of a silent 640×640 fallback.
+        // Surface the real conversion summary + diagnostics. The backend returns
+        // direction-specific keys (images/annotations/labels/files/objects) plus
+        // skip counters (missing_image, skipped_no_size, skipped_unsafe, bad_lines).
+        // The old code read res.converted, which the backend never sets (Wave 1).
         const res = s.results || {};
         const notes = [];
-        if (res.converted !== undefined) notes.push(`${res.converted} ${t('conv.converted')}`);
+        if (res.images !== undefined) notes.push(t('conv.images', {n: res.images}));
+        if (res.labels !== undefined) notes.push(t('conv.labels', {n: res.labels}));
+        if (res.annotations !== undefined) notes.push(t('conv.annotations', {n: res.annotations}));
+        if (res.files !== undefined) notes.push(t('conv.files', {n: res.files}));
+        if (res.objects !== undefined) notes.push(t('conv.objects', {n: res.objects}));
         if (res.missing_image) notes.push(t('conv.missing_image', {n: res.missing_image}));
         if (res.skipped_no_size) notes.push(t('conv.skipped_no_size', {n: res.skipped_no_size}));
+        if (res.skipped_unsafe) notes.push(t('conv.skipped_unsafe', {n: res.skipped_unsafe}));
+        if (res.bad_lines) notes.push(t('conv.bad_lines', {n: res.bad_lines}));
         App.setStatus((s.msg || 'Complete') + (notes.length ? ` — ${notes.join(', ')}` : ''));
       }
     } catch(e) { console.warn('poll error:', e); }
@@ -863,7 +917,12 @@ Tabs.remapper = {
     const w = document.getElementById('remap-pbar-wrap'); if (w) w.style.display = 'block';
     try {
       const r = await API.post('/api/data/remapper', { label_dir, output_dir, mapping, auto_reindex: document.getElementById('remap-reindex')?.checked, recursive: document.getElementById('remap-recursive')?.checked });
-      if (r.error) { App.setStatus('Error: ' + r.error); if (w) w.style.display = 'none'; return; }
+      if (r.error) {
+        // The start-guard now returns code 'BUSY' (Wave 1) — show a clear message.
+        App.setStatus(r.error === 'BUSY' ? t('remap.busy') : 'Error: ' + r.error);
+        if (w) w.style.display = 'none';
+        return;
+      }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
@@ -875,8 +934,13 @@ Tabs.remapper = {
       const pt = document.getElementById('remap-pbar-text'); if (pt) pt.textContent = pct + '%';
       if (s.running) { setTimeout(() => this._poll(), 300); return; }
       if (p) p.style.width = '100%'; if (pt) pt.textContent = '100%';
-      if (s.results) App.setStatus(`Remap complete — ${s.results.files} files, ${s.results.labels} labels`);
-      else App.setStatus(s.msg || 'Complete');
+      if (s.results) {
+        // Recursive mode mirrors the input subtree and de-dups basenames; surface the
+        // collision count so silently-renamed files are visible (Wave 1).
+        let summary = `Remap complete — ${s.results.files} files, ${s.results.labels} labels`;
+        if (s.results.collisions) summary += ` — ${t('remap.collisions', {n: s.results.collisions})}`;
+        App.setStatus(summary);
+      } else App.setStatus(s.msg || 'Complete');
       // DATA-04: surface the applied reindex map (old class id → new contiguous id).
       const rmap = s.results && s.results.reindex_map;
       const box = document.getElementById('remap-reindex-result');
@@ -915,7 +979,10 @@ Tabs.merger = {
             <div class="text-secondary" style="font-size:10px;margin-top:0.25rem;">${t('merger.dhash_desc')}</div>
           </div>
           <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="merge-recursive"> ${t('common.recursive')}</label>
-          <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.merger.run()">${t('merger.run')}</button>
+          <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+            <button class="btn btn-primary" onclick="Tabs.merger.run()">${t('merger.run')}</button>
+            <button class="btn btn-danger btn-sm" id="merge-stop" disabled onclick="API.post('/api/force-stop/merger',{})">${t('stop')}</button>
+          </div>
           <div id="merge-pbar-wrap" style="display:none;margin-top:0.75rem;">
             <div class="progress-track" style="height:20px;position:relative;">
               <div class="progress-fill" id="merge-pbar" style="width:0%;height:100%;"></div>
@@ -941,9 +1008,15 @@ Tabs.merger = {
     const output_dir = document.getElementById('merge-out')?.value;
     if (!datasets.length || !output_dir) { App.setStatus(t('common.select_dirs')); return; }
     const w = document.getElementById('merge-pbar-wrap'); if (w) w.style.display = 'block';
+    const stopBtn = document.getElementById('merge-stop'); if (stopBtn) stopBtn.disabled = false;
     try {
       const r = await API.post('/api/data/merger', { datasets, output_dir, dhash_threshold: +(document.getElementById('merge-dhash')?.value || 10), recursive: document.getElementById('merge-recursive')?.checked });
-      if (r.error) { App.setStatus('Error: ' + r.error); if (w) w.style.display = 'none'; return; }
+      if (r.error) {
+        App.setStatus('Error: ' + r.error);
+        if (w) w.style.display = 'none';
+        if (stopBtn) stopBtn.disabled = true;
+        return;
+      }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
@@ -955,6 +1028,7 @@ Tabs.merger = {
       const pt = document.getElementById('merge-pbar-text'); if (pt) pt.textContent = pct + '%';
       if (s.running) { setTimeout(() => this._poll(), 300); return; }
       if (p) p.style.width = '100%'; if (pt) pt.textContent = '100%';
+      const stopBtn = document.getElementById('merge-stop'); if (stopBtn) stopBtn.disabled = true;
       if (s.results) App.setStatus(`Merge complete — ${s.results.copied} copied, ${s.results.duplicates} duplicates skipped`);
       else App.setStatus(s.msg || 'Complete');
       setTimeout(() => { const w = document.getElementById('merge-pbar-wrap'); if (w) w.style.display = 'none'; }, 1000);
@@ -977,7 +1051,10 @@ Tabs.sampler = {
         </div>
         <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" checked id="samp-lbl-chk"> ${t('sampler.include_lbl')}</label>
         <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="samp-recursive"> ${t('common.recursive')}</label>
-        <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.sampler.run()">${t('run')}</button>
+        <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+          <button class="btn btn-primary" onclick="Tabs.sampler.run()">${t('run')}</button>
+          <button class="btn btn-danger btn-sm" id="samp-stop" disabled onclick="API.post('/api/force-stop/sampler',{})">${t('stop')}</button>
+        </div>
         <div id="samp-pbar-wrap" style="display:none;margin-top:0.75rem;">
           <div class="progress-track" style="height:20px;position:relative;">
             <div class="progress-fill" id="samp-pbar" style="width:0%;height:100%;"></div>
@@ -997,6 +1074,7 @@ Tabs.sampler = {
     if (!img_dir || !output_dir) { App.setStatus(t('common.select_dirs')); return; }
     const w = document.getElementById('samp-pbar-wrap'); if (w) w.style.display = 'block';
     const rc = document.getElementById('samp-result-card'); if (rc) rc.style.display = 'none';
+    const stopBtn = document.getElementById('samp-stop'); if (stopBtn) stopBtn.disabled = false;
     try {
       const r = await API.post('/api/data/sampler', {
         img_dir, label_dir: document.getElementById('samp-lbl')?.value || G.lblDir, output_dir,
@@ -1006,7 +1084,12 @@ Tabs.sampler = {
         include_labels: document.getElementById('samp-lbl-chk')?.checked,
         recursive: document.getElementById('samp-recursive')?.checked
       });
-      if (r.error) { App.setStatus('Error: ' + r.error); if (w) w.style.display = 'none'; return; }
+      if (r.error) {
+        App.setStatus('Error: ' + r.error);
+        if (w) w.style.display = 'none';
+        if (stopBtn) stopBtn.disabled = true;
+        return;
+      }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
@@ -1018,13 +1101,17 @@ Tabs.sampler = {
       const pt = document.getElementById('samp-pbar-text'); if (pt) pt.textContent = pct + '%';
       if (s.running) { setTimeout(() => this._poll(), 300); return; }
       if (p) p.style.width = '100%'; if (pt) pt.textContent = '100%';
+      const stopBtn = document.getElementById('samp-stop'); if (stopBtn) stopBtn.disabled = true;
       if (s.results) {
         App.setStatus(`Sampled ${s.results.sampled} from ${s.results.total} images`);
         const before = s.results.before || {}, after = s.results.after || {};
         const classes = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort((a,b)=>a-b);
         const tb = document.getElementById('samp-results');
-        if (tb) tb.innerHTML = classes.map(c => `<tr><td>${c}</td><td>${before[c]||0}</td><td>${after[c]||0}</td></tr>`).join('');
-        const sm = document.getElementById('samp-summary'); if (sm) sm.textContent = `Sampled ${s.results.sampled} images`;
+        if (tb) tb.innerHTML = classes.map(c => `<tr><td>${escHtml(c)}</td><td>${before[c]||0}</td><td>${after[c]||0}</td></tr>`).join('');
+        // Recursive sampling de-dups basenames; surface the collision count (Wave 1).
+        let summary = `Sampled ${s.results.sampled} images`;
+        if (s.results.collisions) summary += ` — ${t('samp.collisions', {n: s.results.collisions})}`;
+        const sm = document.getElementById('samp-summary'); if (sm) sm.textContent = summary;
         const rc = document.getElementById('samp-result-card'); if (rc) rc.style.display = 'block';
       } else App.setStatus(s.msg || 'Complete');
       setTimeout(() => { const w = document.getElementById('samp-pbar-wrap'); if (w) w.style.display = 'none'; }, 1000);
@@ -1084,6 +1171,18 @@ Tabs.quality = {
         <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('quality.title')}</h3>
         ${imgDirInput('qual-img')}
         <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="qual-recursive"> ${t('common.recursive')}</label>
+        <details style="margin-top:0.75rem;">
+          <summary style="cursor:pointer;color:var(--text-04);">${t('quality.thresholds')}</summary>
+          <div class="text-secondary" style="font-size:11px;margin:0.5rem 0;">${t('quality.thresholds_hint')}</div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0.75rem;margin-top:0.25rem;">
+            <div class="form-group"><label class="form-label" for="qual-blur">${t('quality.blur_threshold')}</label><input type="number" step="any" class="form-input input-normal" id="qual-blur" value="50"></div>
+            <div class="form-group"><label class="form-label" for="qual-dark">${t('quality.dark')}</label><input type="number" step="any" class="form-input input-normal" id="qual-dark" value="40"></div>
+            <div class="form-group"><label class="form-label" for="qual-bright">${t('quality.bright')}</label><input type="number" step="any" class="form-input input-normal" id="qual-bright" value="220"></div>
+            <div class="form-group"><label class="form-label" for="qual-entropy">${t('quality.entropy')}</label><input type="number" step="any" class="form-input input-normal" id="qual-entropy" value="3.0"></div>
+            <div class="form-group"><label class="form-label" for="qual-aspect-min">${t('quality.aspect_min')}</label><input type="number" step="any" class="form-input input-normal" id="qual-aspect-min" value="0.25"></div>
+            <div class="form-group"><label class="form-label" for="qual-aspect-max">${t('quality.aspect_max')}</label><input type="number" step="any" class="form-input input-normal" id="qual-aspect-max" value="4.0"></div>
+          </div>
+        </details>
         <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.quality.run()">${t('run')}</button>
         <div style="margin-top:0.5rem;"><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="qual-prog" style="width:0%;height:100%;"></div><span id="qual-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
           <span class="text-secondary" id="qual-msg" style="margin-top:0.25rem;display:block;">${t('ready')}</span></div>
@@ -1094,8 +1193,19 @@ Tabs.quality = {
   async run() {
     const img_dir = document.getElementById('qual-img')?.value || G.imgDir;
     if (!img_dir) { App.setStatus(t('eval.select_images')); return; }
+    // Read a numeric threshold input, falling back to the backend default when blank/NaN.
+    const num = (id, def) => { const v = parseFloat(document.getElementById(id)?.value); return isNaN(v) ? def : v; };
     try {
-      const r = await API.post('/api/quality/image-quality', { img_dir, recursive: document.getElementById('qual-recursive')?.checked });
+      const r = await API.post('/api/quality/image-quality', {
+        img_dir,
+        recursive: document.getElementById('qual-recursive')?.checked,
+        blur_threshold: num('qual-blur', 50),
+        dark_threshold: num('qual-dark', 40),
+        bright_threshold: num('qual-bright', 220),
+        entropy_threshold: num('qual-entropy', 3.0),
+        aspect_min: num('qual-aspect-min', 0.25),
+        aspect_max: num('qual-aspect-max', 4.0)
+      });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
@@ -1109,10 +1219,19 @@ Tabs.quality = {
       const m = document.getElementById('qual-msg'); if (m) m.textContent = s.msg || '';
       if (!s.running && s.results) {
         document.getElementById('qual-results').innerHTML = s.results.map(r =>
-          `<tr><td>${escHtml(r.file)}</td><td>${r.blur}</td><td>${r.brightness}</td><td>${r.entropy}</td><td>${r.aspect}</td><td>${escHtml(r.issues)}</td></tr>`).join('');
+          `<tr><td>${escHtml(r.file)}</td><td>${r.blur}</td><td>${r.brightness}</td><td>${r.entropy}</td><td>${r.aspect}</td><td>${this._issuesLabel(r.issues)}</td></tr>`).join('');
         App.setStatus((s.msg || '') + truncationNote(s, s.results.length));
       } else if (s.running) setTimeout(() => this._poll(), 500);
     } catch(e) { console.warn('poll error:', e); }
+  },
+  // The backend joins issue tokens with ', '. Most are already display English, but
+  // 'low_detail' leaks the raw i18n key into the table — translate that one token here
+  // (backend is out of this wave's ownership). All tokens are escaped against XSS.
+  _issuesLabel(issues) {
+    return String(issues || '').split(',').map(tok => {
+      const t0 = tok.trim();
+      return escHtml(t0 === 'low_detail' ? t('quality.low_detail') : t0);
+    }).join(', ');
   }
 };
 
@@ -1273,10 +1392,18 @@ Tabs.augmentation = {
           ${imgDirInput('aug-img')}
           <div class="form-group" style="margin-top:0.75rem;">
             <label class="form-label">${t('aug.type')}</label>
-            <select class="form-input input-normal" id="aug-type">
+            <select class="form-input input-normal" id="aug-type" onchange="Tabs.augmentation._syncParams()">
               <option>Mosaic 2×2</option><option>Flip</option><option>Rotate</option>
               <option>Brightness</option>
             </select>
+          </div>
+          <div class="form-group" id="aug-angle-group" style="margin-top:0.75rem;display:none;">
+            <label class="form-label" for="aug-angle">${t('aug.angle')}</label>
+            <input type="number" step="any" class="form-input input-normal" id="aug-angle" value="15">
+          </div>
+          <div id="aug-bright-group" style="margin-top:0.75rem;display:none;grid-template-columns:1fr 1fr;gap:0.75rem;">
+            <div class="form-group"><label class="form-label" for="aug-alpha">${t('aug.alpha')}</label><input type="number" step="any" class="form-input input-normal" id="aug-alpha" value="1.3"></div>
+            <div class="form-group"><label class="form-label" for="aug-beta">${t('aug.beta')}</label><input type="number" step="any" class="form-input input-normal" id="aug-beta" value="30"></div>
           </div>
           <p class="text-secondary" style="margin-top:0.75rem;font-size:12px;">${t('aug.preview_only')}</p>
           <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.augmentation.run()">${t('aug.preview')}</button>
@@ -1287,14 +1414,31 @@ Tabs.augmentation = {
         </div>
       </div>`;
   },
+  // Show the relevant parameter inputs for the chosen augmentation type. The backend
+  // BatchAugmentRequest accepts angle (Rotate) and alpha/beta (Brightness).
+  _syncParams() {
+    const type = document.getElementById('aug-type')?.value || '';
+    const angleGroup = document.getElementById('aug-angle-group');
+    const brightGroup = document.getElementById('aug-bright-group');
+    if (angleGroup) angleGroup.style.display = type === 'Rotate' ? 'block' : 'none';
+    if (brightGroup) brightGroup.style.display = type === 'Brightness' ? 'grid' : 'none';
+  },
   async run() {
     const img_dir = document.getElementById('aug-img')?.value || G.imgDir;
     if (!img_dir) { App.setStatus(t('eval.select_images')); return; }
     App.setStatus(t('aug.generating'));
+    const num = (id, def) => { const v = parseFloat(document.getElementById(id)?.value); return isNaN(v) ? def : v; };
     try {
-      const r = await API.post('/api/batch/augmentation', { img_dir, aug_type: document.getElementById('aug-type').value });
+      // Send angle/alpha/beta so Rotate/Brightness are user-tunable (were hardcoded).
+      const r = await API.post('/api/batch/augmentation', {
+        img_dir,
+        aug_type: document.getElementById('aug-type').value,
+        angle: num('aug-angle', 15),
+        alpha: num('aug-alpha', 1.3),
+        beta: num('aug-beta', 30)
+      });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
-      document.getElementById('aug-orig').innerHTML = `<div style="text-align:center;"><img src="data:image/jpeg;base64,${r.original}" style="max-width:100%;max-height:300px;"><div class="text-secondary" style="margin-top:0.25rem;">${r.file}</div></div>`;
+      document.getElementById('aug-orig').innerHTML = `<div style="text-align:center;"><img src="data:image/jpeg;base64,${r.original}" style="max-width:100%;max-height:300px;"><div class="text-secondary" style="margin-top:0.25rem;">${escHtml(r.file)}</div></div>`;
       document.getElementById('aug-result').innerHTML = `<img src="data:image/jpeg;base64,${r.augmented}" style="max-width:100%;max-height:300px;">`;
       App.setStatus(t('aug.ready'));
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
@@ -1529,21 +1673,21 @@ Tabs['inspector'] = {
       html += `<div class="card-flat" style="padding:1rem;">
         <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.basic')}</div>
         <table style="width:100%;font-size:12px;">
-          <tr><td class="text-secondary">File</td><td>${r.file_name}</td></tr>
-          <tr><td class="text-secondary">Size</td><td>${r.file_size_mb} MB</td></tr>
-          <tr><td class="text-secondary">Opset</td><td>${r.opset_version}</td></tr>
-          <tr><td class="text-secondary">IR Version</td><td>${r.ir_version}</td></tr>
-          <tr><td class="text-secondary">Producer</td><td>${r.producer || '—'}</td></tr>
-          <tr><td class="text-secondary">Nodes</td><td>${r.num_nodes}</td></tr>
+          <tr><td class="text-secondary">File</td><td>${escHtml(r.file_name)}</td></tr>
+          <tr><td class="text-secondary">Size</td><td>${escHtml(r.file_size_mb)} MB</td></tr>
+          <tr><td class="text-secondary">Opset</td><td>${escHtml(r.opset_version)}</td></tr>
+          <tr><td class="text-secondary">IR Version</td><td>${escHtml(r.ir_version)}</td></tr>
+          <tr><td class="text-secondary">Producer</td><td>${r.producer ? escHtml(r.producer) : '—'}</td></tr>
+          <tr><td class="text-secondary">Nodes</td><td>${escHtml(r.num_nodes)}</td></tr>
           <tr><td class="text-secondary">Parameters</td><td>${r.num_parameters ? r.num_parameters.toLocaleString() : '—'}</td></tr>
         </table></div>`;
       // I/O
       html += `<div class="card-flat" style="padding:1rem;">
         <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.io')}</div>
         <div style="font-size:12px;"><strong>Inputs:</strong><ul style="margin:0.25rem 0;">`;
-      (r.inputs||[]).forEach(i => { html += `<li>${i.name}: [${i.shape.join(', ')}] (${i.dtype})</li>`; });
+      (r.inputs||[]).forEach(i => { html += `<li>${escHtml(i.name)}: [${escHtml((i.shape||[]).join(', '))}] (${escHtml(i.dtype)})</li>`; });
       html += `</ul><strong>Outputs:</strong><ul style="margin:0.25rem 0;">`;
-      (r.outputs||[]).forEach(o => { html += `<li>${o.name}: [${o.shape.join(', ')}] (${o.dtype})</li>`; });
+      (r.outputs||[]).forEach(o => { html += `<li>${escHtml(o.name)}: [${escHtml((o.shape||[]).join(', '))}] (${escHtml(o.dtype)})</li>`; });
       html += '</ul></div></div>';
       // EP compatibility — show per-EP op-support ratio. EPs not in the heuristic
       // table report known=false / supported_ratio=null → render 'unknown', not 100%.
@@ -1568,7 +1712,7 @@ Tabs['inspector'] = {
         <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.ops')}</div>
         <div style="font-size:12px;">`;
       const ops = Object.entries(r.node_op_counts||{}).sort((a,b)=>b[1]-a[1]).slice(0,10);
-      ops.forEach(([op, cnt]) => { html += `<div style="display:flex;justify-content:space-between;"><span>${op}</span><span>${cnt}</span></div>`; });
+      ops.forEach(([op, cnt]) => { html += `<div style="display:flex;justify-content:space-between;"><span>${escHtml(op)}</span><span>${escHtml(cnt)}</span></div>`; });
       html += '</div></div>';
       // Metadata
       if (r.metadata && Object.keys(r.metadata).length) {
@@ -1576,8 +1720,8 @@ Tabs['inspector'] = {
           <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.metadata')}</div>
           <div style="font-size:11px;max-height:200px;overflow-y:auto;word-break:break-all;">`;
         Object.entries(r.metadata).forEach(([k,v]) => {
-          const val = String(v).length > 200 ? String(v).substring(0,200) + '…' : v;
-          html += `<div><strong>${k}:</strong> ${val}</div>`;
+          const val = String(v).length > 200 ? String(v).substring(0,200) + '…' : String(v);
+          html += `<div><strong>${escHtml(k)}:</strong> ${escHtml(val)}</div>`;
         });
         html += '</div></div>';
       }

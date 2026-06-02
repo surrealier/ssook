@@ -54,17 +54,44 @@ def hamming(a: int, b: int) -> int:
     return bin(a ^ b).count("1")
 
 
+# Below this many hashes the O(n²) double loop is cheaper than paying the
+# BK-tree build + traversal overhead; above it the tree wins decisively
+# (a 20k-image merge went from a multi-second hang to well under a second).
+_BKTREE_PAIR_THRESHOLD = 2000
+
+
 def find_near_duplicates(hashes: list[int], threshold: int = 10) -> list[tuple[int, int]]:
     """Return index pairs (i, j) with i<j whose Hamming distance is
-    within `threshold`. O(n²) — fine for the local-app dataset sizes we
-    actually see; use `BKTree` below if datasets exceed ~50k images.
+    within `threshold`.
+
+    Small inputs use a direct O(n²) scan; large inputs (>= _BKTREE_PAIR_THRESHOLD)
+    route through a `BKTree` so the merger/duplicate detector stay responsive on
+    real datasets instead of freezing on the all-pairs comparison. Both paths
+    return the identical (i<j) pair set — the tree only prunes comparisons that
+    provably exceed `threshold`, it does not change the result.
     """
-    pairs: list[tuple[int, int]] = []
-    for i in range(len(hashes)):
-        for j in range(i + 1, len(hashes)):
-            if hamming(hashes[i], hashes[j]) <= threshold:
-                pairs.append((i, j))
-    return pairs
+    n = len(hashes)
+    if n < _BKTREE_PAIR_THRESHOLD:
+        pairs: list[tuple[int, int]] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if hamming(hashes[i], hashes[j]) <= threshold:
+                    pairs.append((i, j))
+        return pairs
+
+    tree = BKTree().build(hashes)
+    seen: set[tuple[int, int]] = set()
+    for i in range(n):
+        for j in tree.query(hashes[i], threshold):
+            if i == j:
+                continue
+            # Canonical (low, high) ordering so each unordered pair is emitted once
+            # regardless of which endpoint the query started from.
+            pair = (i, j) if i < j else (j, i)
+            seen.add(pair)
+    # Sorted to match the deterministic (ascending) order of the brute path,
+    # so callers (and tests) see identical output from both implementations.
+    return sorted(seen)
 
 
 def cluster_near_duplicates(hashes: list[int], threshold: int = 10) -> list[int]:
@@ -78,8 +105,9 @@ def cluster_near_duplicates(hashes: list[int], threshold: int = 10) -> list[int]
     other (QUAL-05). Group ids are small contiguous ints assigned in order
     of first appearance.
 
-    Union-find over `find_near_duplicates`. The pair search is O(n²); for
-    large datasets feed candidate pairs from `BKTree` instead.
+    Union-find over `find_near_duplicates`, which itself switches to a
+    `BKTree`-backed candidate search above `_BKTREE_PAIR_THRESHOLD`, so large
+    datasets no longer pay the all-pairs O(n²) cost here.
     """
     n = len(hashes)
     parent = list(range(n))
@@ -172,3 +200,32 @@ class BKTree:
                 if lo <= edge <= hi:
                     stack.append(child)
         return found
+
+    def query_top_k(self, h: int, k: int, max_bits: int = 64) -> list[tuple[int, int]]:
+        """Return the `k` nearest indices to `h` as (distance, index) pairs,
+        sorted by ascending distance then index.
+
+        Used by similarity search: instead of computing the Hamming distance to
+        every cached hash and sorting all N, we widen the BK-tree radius until at
+        least `k` hits are collected, then sort just those. For a small `k`
+        against a large corpus this visits far fewer nodes than a full scan.
+
+        Ties at the boundary distance are broken by index so the ordering is
+        deterministic and matches a stable brute-force sort. `max_bits` caps the
+        radius (64 for the project-wide 64-bit dHash) so the loop terminates even
+        when the corpus has fewer than `k` items.
+        """
+        if self._root is None or k <= 0:
+            return []
+        # Expand the radius geometrically: cheap when the nearest neighbours are
+        # close, and at most log2(max_bits) widenings before we cover everything.
+        radius = 1
+        hits: list[int] = []
+        while True:
+            capped = min(radius, max_bits)
+            hits = self.query(h, capped)
+            if len(hits) >= k or capped >= max_bits:
+                break
+            radius *= 2
+        ranked = sorted(((hamming(h, self._hashes[i]), i) for i in hits))
+        return ranked[:k]

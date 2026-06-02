@@ -657,3 +657,134 @@ class TestDiagnoseFusableScanBounded:
         ga = result["graph_analysis"]
         assert ga["fusable_scan_capped"] is False
         assert ga["fusable_patterns"] >= 1
+
+
+# ============================================================
+# Quantizer P0s — FP16 I/O preservation + static-calib preprocessing spec
+# ============================================================
+def _make_square_image_dir(d: str, n: int = 3, size: int = 32):
+    """Write a few small JPEGs so the calibration reader has inputs."""
+    import cv2
+    for i in range(n):
+        img = (np.random.rand(size, size, 3) * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(d, f"img_{i}.jpg"), img)
+
+
+def _make_fp32_conv_model(path: str, hw: int = 8):
+    """Square-input Conv+Relu fp32 model with fixed I/O for fp16/static tests."""
+    import onnx
+    from onnx import helper, TensorProto, numpy_helper
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 3, hw, hw])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4, hw, hw])
+    W = numpy_helper.from_array(np.random.randn(4, 3, 3, 3).astype(np.float32), "W")
+    B = numpy_helper.from_array(np.zeros(4, dtype=np.float32), "B")
+    conv = helper.make_node("Conv", ["X", "W", "B"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    relu = helper.make_node("Relu", ["c"], ["Y"])
+    g = helper.make_graph([conv, relu], "fp32_conv", [X], [Y], [W, B])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+    m.ir_version = 8
+    onnx.save(m, path)
+    return path
+
+
+@pytest.fixture
+def import_cv2():
+    import cv2  # noqa: F401 — guard: skip quantizer tests when cv2 absent
+    return cv2
+
+
+class TestConvertFp16IOTypes:
+    def test_keeps_float32_graph_io(self, tmp_dir, import_cv2):
+        import onnxruntime as ort
+        from core.quantizer import convert_fp16
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "fp32.onnx"))
+        out = os.path.join(tmp_dir, "fp16.onnx")
+        result = convert_fp16(src, out)
+        assert os.path.isfile(out)
+        assert result["method"] == "fp16"
+        sess = ort.InferenceSession(out, providers=["CPUExecutionProvider"])
+        # I/O must remain fp32 so the benchmark/profiler hand-off keeps working.
+        assert sess.get_inputs()[0].type == "tensor(float)"
+        assert sess.get_outputs()[0].type == "tensor(float)"
+        # And it must actually run on an fp32 feed.
+        feed = {sess.get_inputs()[0].name: np.random.rand(1, 3, 8, 8).astype(np.float32)}
+        out_vals = sess.run(None, feed)
+        assert out_vals[0].dtype == np.float32
+
+    def test_external_data_model_converts_and_loads(self, tmp_dir, import_cv2):
+        import onnxruntime as ort
+        from core.quantizer import convert_fp16
+        # Force external data so the load_external_data=True path is exercised.
+        src = _make_external_data_model(os.path.join(tmp_dir, "ext_fp32.onnx"))
+        assert os.path.isfile(src + ".data")
+        out = os.path.join(tmp_dir, "ext_fp16.onnx")
+        result = convert_fp16(src, out)
+        assert os.path.isfile(out)
+        # The converted model must still load and keep fp32 I/O.
+        sess = ort.InferenceSession(out, providers=["CPUExecutionProvider"])
+        assert sess.get_inputs()[0].type == "tensor(float)"
+        assert "external_data" in result
+
+
+class TestStaticCalibPreprocessing:
+    def test_auto_guess_is_reported(self, tmp_dir, import_cv2):
+        from core.quantizer import quantize_static
+        _make_square_image_dir(tmp_dir)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "calib_src.onnx"))
+        out = os.path.join(tmp_dir, "calib_int8.onnx")
+        result = quantize_static(src, out, calibration_dir=tmp_dir, max_images=3)
+        # The auto-guessed preprocessing must be surfaced, not silent.
+        assert result["preprocess_auto_guessed"] is True
+        pp = result["preprocess"]
+        assert pp["color_order"] == "rgb"
+        assert pp["scale"] == 255.0
+        # Square input (H==W) -> letterbox guessed on.
+        assert pp["use_letterbox"] is True
+
+    def test_explicit_spec_overrides_and_is_reported(self, tmp_dir, import_cv2, monkeypatch):
+        import core.inference as inference
+        from core.quantizer import quantize_static, PreprocessSpec
+        _make_square_image_dir(tmp_dir)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "calib_src2.onnx"))
+        out = os.path.join(tmp_dir, "calib_int8_2.onnx")
+
+        # Spy on letterbox: with use_letterbox=False it must NOT be called.
+        called = {"n": 0}
+        real_letterbox = inference.letterbox
+
+        def _spy(img, shape):
+            called["n"] += 1
+            return real_letterbox(img, shape)
+
+        monkeypatch.setattr(inference, "letterbox", _spy)
+
+        spec = PreprocessSpec(use_letterbox=False, color_order="bgr",
+                              mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+        result = quantize_static(src, out, calibration_dir=tmp_dir, max_images=3,
+                                 preprocess=spec)
+        assert called["n"] == 0  # plain resize path, letterbox never invoked
+        assert result["preprocess_auto_guessed"] is False
+        pp = result["preprocess"]
+        assert pp["use_letterbox"] is False
+        assert pp["color_order"] == "bgr"
+        assert pp["mean"] == [0.5, 0.5, 0.5]
+
+    def test_letterbox_spec_invokes_letterbox(self, tmp_dir, import_cv2, monkeypatch):
+        import core.inference as inference
+        from core.quantizer import quantize_static, PreprocessSpec
+        _make_square_image_dir(tmp_dir)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "calib_src3.onnx"))
+        out = os.path.join(tmp_dir, "calib_int8_3.onnx")
+
+        called = {"n": 0}
+        real_letterbox = inference.letterbox
+
+        def _spy(img, shape):
+            called["n"] += 1
+            return real_letterbox(img, shape)
+
+        monkeypatch.setattr(inference, "letterbox", _spy)
+
+        quantize_static(src, out, calibration_dir=tmp_dir, max_images=3,
+                        preprocess=PreprocessSpec(use_letterbox=True))
+        assert called["n"] >= 1  # letterbox used for every calibration image

@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 import cv2
 
 from server import quality_routes
-from server.state import anomaly_state, leaky_state
+from server.state import anomaly_state, leaky_state, sim_state
 
 
 @pytest.fixture
@@ -169,3 +169,157 @@ def test_anomaly_try_start_rejects_second_run(client, tmp_path):
         assert resp.json() == {"error": "Already running"}
     finally:
         _reset(anomaly_state)
+
+
+# ── Structured-image helper ─────────────────────────────────────────
+# A flat color block dHashes to 0 (no row-diffs), so distinct flat colors are
+# indistinguishable. We embed a per-image gradient/stripe pattern so each image
+# yields a different 64-bit hash, exercising the real BKTree vs brute-force path.
+
+def _write_pattern_png(path: str, seed: int) -> None:
+    rng = np.random.default_rng(seed)
+    img = rng.integers(0, 256, size=(32, 32, 3), dtype=np.uint8)
+    cv2.imwrite(path, img)
+
+
+# ── leaky: BKTree path equals brute-force reference on a small fixture (scale P1) ──
+
+def test_leaky_bktree_matches_bruteforce_reference(client, tmp_path):
+    """The cross-split detector now queries a BKTree per split-pair instead of
+    the old O(MxN) nested Hamming scan. On a small mixed fixture (some shared,
+    some unique images across two splits) the reported duplicate count and the
+    sorted file-pair set must equal an independent brute-force reference."""
+    _reset(leaky_state)
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "val"
+    train_dir.mkdir()
+    val_dir.mkdir()
+
+    # Shared images (identical bytes → identical hash, distance 0 cross-split).
+    shared = {}
+    for k in range(4):
+        p = train_dir / f"shared_{k}.png"
+        _write_pattern_png(str(p), seed=1000 + k)
+        shared[f"shared_{k}.png"] = cv2.imread(str(p))
+    for name, arr in shared.items():
+        cv2.imwrite(str(val_dir / name), arr)
+    # Unique images per split (different seeds → far hashes, no cross leak).
+    for k in range(3):
+        _write_pattern_png(str(train_dir / f"tonly_{k}.png"), seed=2000 + k)
+        _write_pattern_png(str(val_dir / f"vonly_{k}.png"), seed=3000 + k)
+
+    threshold = 2
+    resp = client.post("/api/quality/leaky",
+                       json={"train_dir": str(train_dir), "val_dir": str(val_dir),
+                             "threshold": threshold, "recursive": False})
+    assert resp.json() == {"ok": True}
+    data = _wait_until_done(client, "/api/quality/leaky/status")
+    assert data["running"] is False
+    rows = data["results"]
+    assert len(rows) == 1  # exactly the train↔val pair
+    got_dupes = rows[0]["duplicates"]
+
+    # Independent brute-force reference over the same on-disk images.
+    from core.hashing import compute_dhash, hamming
+    train_hashes = {p.name: compute_dhash(str(p)) for p in sorted(train_dir.iterdir())}
+    val_hashes = {p.name: compute_dhash(str(p)) for p in sorted(val_dir.iterdir())}
+    ref_pairs = []
+    for fa, ha in train_hashes.items():
+        for fb, hb in val_hashes.items():
+            if hamming(ha, hb) <= threshold:
+                ref_pairs.append(f"{fa} ↔ {fb}")
+    assert got_dupes == len(ref_pairs)
+    # The 4 shared images each leak across the split.
+    assert got_dupes == 4
+    # The reported sample file list is a subset of the true brute-force pairs.
+    reported = [s for s in rows[0]["files"].split("; ") if s]
+    assert set(reported).issubset(set(ref_pairs))
+
+
+# ── similarity: ranking is correct and repeat query does not re-hash (scale P1) ──
+
+def test_similarity_query_ranks_exact_copy_first(client, tmp_path):
+    """The query's exact copy must rank #1 at distance 0; unrelated images rank
+    after it. Exercises the expanding-radius BKTree top-k path."""
+    _reset(sim_state)
+    sim_state.pop("index", None)
+    img_dir = tmp_path / "corpus"
+    img_dir.mkdir()
+    for k in range(8):
+        _write_pattern_png(str(img_dir / f"img_{k}.png"), seed=4000 + k)
+    # The query is an exact copy of img_3.
+    query = tmp_path / "query.png"
+    cv2.imwrite(str(query), cv2.imread(str(img_dir / "img_3.png")))
+
+    resp = client.post("/api/quality/similarity",
+                       json={"img_dir": str(img_dir), "query_path": str(query),
+                             "top_k": 5, "recursive": False})
+    assert resp.json() == {"ok": True}
+    data = _wait_until_done(client, "/api/quality/similarity/status")
+    assert data["running"] is False
+    results = data["results"]
+    assert results[0]["image"] == "img_3.png"
+    assert results[0]["distance"] == 0
+    assert results[0]["rank"] == 1
+    # Distances are non-decreasing (a valid top-k ranking).
+    dists = [r["distance"] for r in results]
+    assert dists == sorted(dists)
+    _reset(sim_state)
+    sim_state.pop("index", None)
+
+
+def test_similarity_repeat_query_reuses_cache_no_rehash(client, tmp_path, monkeypatch):
+    """A second query against the same folder must reuse the cached (hash, tree)
+    index and decode ZERO corpus images — only the new query image is read."""
+    _reset(sim_state)
+    sim_state.pop("index", None)
+    img_dir = tmp_path / "corpus"
+    img_dir.mkdir()
+    for k in range(6):
+        _write_pattern_png(str(img_dir / f"img_{k}.png"), seed=5000 + k)
+    query1 = tmp_path / "q1.png"
+    query2 = tmp_path / "q2.png"
+    cv2.imwrite(str(query1), cv2.imread(str(img_dir / "img_0.png")))
+    cv2.imwrite(str(query2), cv2.imread(str(img_dir / "img_2.png")))
+
+    # Count how many times imread is called, distinguishing corpus vs query.
+    real_imread = quality_routes.imread
+    corpus_dir_str = str(img_dir)
+    calls = {"corpus": 0, "query": 0}
+
+    def counting_imread(path, *a, **kw):
+        if os.path.dirname(str(path)) == corpus_dir_str:
+            calls["corpus"] += 1
+        else:
+            calls["query"] += 1
+        return real_imread(path, *a, **kw)
+
+    monkeypatch.setattr(quality_routes, "imread", counting_imread)
+
+    # First query builds the index: all 6 corpus images decoded once.
+    resp = client.post("/api/quality/similarity",
+                       json={"img_dir": str(img_dir), "query_path": str(query1),
+                             "top_k": 3, "recursive": False})
+    assert resp.json() == {"ok": True}
+    _wait_until_done(client, "/api/quality/similarity/status")
+    assert calls["corpus"] == 6
+    index_obj = sim_state.get("index")
+    assert index_obj is not None and "tree" in index_obj
+
+    # Second query against the SAME folder: no corpus re-decode, same cache object.
+    calls["corpus"] = 0
+    resp = client.post("/api/quality/similarity",
+                       json={"img_dir": str(img_dir), "query_path": str(query2),
+                             "top_k": 3, "recursive": False})
+    assert resp.json() == {"ok": True}
+    data = _wait_until_done(client, "/api/quality/similarity/status")
+    assert data["running"] is False
+    assert calls["corpus"] == 0          # cache reused — zero corpus re-hash
+    assert calls["query"] >= 1           # only the query image was decoded
+    assert sim_state.get("index") is index_obj  # same cached index, not rebuilt
+    # The img_2 copy ranks first on the second query.
+    assert data["results"][0]["image"] == "img_2.png"
+    assert data["results"][0]["distance"] == 0
+
+    _reset(sim_state)
+    sim_state.pop("index", None)
