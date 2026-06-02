@@ -428,7 +428,7 @@ Tabs.viewer = {
       const vlmPrompt = document.getElementById('v-vlm-prompt')?.value;
       if (vlmPrompt) body.vlm_prompt = vlmPrompt;
       const r = await API.post('/api/infer/image', body);
-      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      if (r.error) { App.setStatus(this._viewerErrorText(r.error), r.error); return; }
       document.getElementById('viewer-canvas').innerHTML = `<img src="data:image/jpeg;base64,${r.image}" style="max-width:100%;max-height:100%;">`;
       const resEl = document.getElementById('viewer-results');
       if (r.classification) resEl.innerHTML = `<b>${r.classification}</b>` + (r.top_k ? '<br>' + r.top_k.map(t=>`${t.class}: ${t.score}`).join('<br>') : '');
@@ -448,6 +448,17 @@ Tabs.viewer = {
       }
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
+  // Map stable backend error codes to localized messages instead of printing raw
+  // tokens (e.g. 'vlm_unsupported', 'Cannot open video') to the user.
+  _viewerErrorText(code) {
+    const map = {
+      'vlm_unsupported': 'viewer.vlm_unsupported',
+      'embedding_unsupported': 'viewer.embedding_unsupported',
+      'Cannot open video': 'viewer.cannot_open_video',
+    };
+    const key = map[code];
+    return key ? t(key) : 'Error: ' + code;
+  },
   _streamSessionId: null,
   _paused: false,
   async _startStream() {
@@ -457,7 +468,7 @@ Tabs.viewer = {
         model_path: G.model, video_path: G.videoPath, conf,
         tracker_type: document.getElementById('v-tracker-type')?.value || 'none'
       });
-      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      if (r.error) { App.setStatus(this._viewerErrorText(r.error), r.error); return; }
       this._streamSessionId = r.session_id;
       this._paused = false;
       document.getElementById('viewer-canvas').innerHTML = `<img src="/api/viewer/stream/${r.session_id}" style="max-width:100%;max-height:100%;">`;
@@ -480,6 +491,13 @@ Tabs.viewer = {
       document.getElementById('viewer-results').textContent = `${s.detections} detections`;
       document.getElementById('v-infer-stats').innerHTML = `Infer: ${s.infer_ms} ms`;
       document.getElementById('v-frame-counter').textContent = `${s.frame_idx} / ${s.total}`;
+      // The /status payload has no dedicated fps field yet, so derive an effective
+      // FPS from per-frame infer_ms (TODO: prefer a real measured fps field — see contract_notes).
+      const fpsEl = document.getElementById('v-fps');
+      if (fpsEl) {
+        const ms = Number(s.infer_ms);
+        fpsEl.textContent = (s.playing && ms > 0) ? t('viewer.fps', { n: (1000 / ms).toFixed(1) }) : 'FPS: —';
+      }
       const seek = document.getElementById('v-seek');
       if (seek && !seek.matches(':active')) seek.value = s.frame_idx;
       if (s.playing && !s.paused) setTimeout(() => this._pollStatus(), 300);
@@ -500,6 +518,8 @@ Tabs.viewer = {
     btn.innerHTML = Icons.play(14) + ' ' + t('viewer.play');
     document.getElementById('btn-stop').disabled = true;
     document.getElementById('btn-snapshot').disabled = true;
+    const fpsEl = document.getElementById('v-fps');
+    if (fpsEl) fpsEl.textContent = 'FPS: —';
   },
   async _togglePause() {
     if (!this._streamSessionId) return;
@@ -1075,10 +1095,10 @@ Tabs.benchmark = {
       if (s.results && s.results.length) {
         const tb = document.getElementById('bench-results');
         tb.innerHTML = s.results.map((x, i) => {
-          if (x.error) return `<tr><td colspan="15" style="color:var(--action-danger-05);">${x.error}</td></tr>`;
+          if (x.error) return `<tr><td colspan="15" style="color:var(--action-danger-05);">${escHtml(x.error)}</td></tr>`;
           const hl = i === 0 ? ' style="background:var(--status-success-01);font-weight:600;"' : '';
           const gpu = x.gpu_pct != null ? `${x.gpu_pct}%` : 'N/A';
-          return `<tr${hl}><td>${x.name||'—'}</td><td>${x.codec||'—'}</td><td>${x.provider||'—'}</td><td>${x.fps||'—'}</td><td>${x.avg||'—'}</td><td>${x.decode_ms||'—'}</td><td>${x.pre_ms||'—'}</td><td>${x.infer_ms||'—'}</td><td>${x.post_ms||'—'}</td><td>${x.p50||'—'}</td><td>${x.p95||'—'}</td><td>${x.p99||'—'}</td><td>${x.cpu_pct||'—'}</td><td>${x.ram_mb||'—'}</td><td>${gpu}</td></tr>`;
+          return `<tr${hl}><td>${escHtml(x.name)||'—'}</td><td>${escHtml(x.codec)||'—'}</td><td>${escHtml(x.provider)||'—'}</td><td>${x.fps||'—'}</td><td>${x.avg||'—'}</td><td>${x.decode_ms||'—'}</td><td>${x.pre_ms||'—'}</td><td>${x.infer_ms||'—'}</td><td>${x.post_ms||'—'}</td><td>${x.p50||'—'}</td><td>${x.p95||'—'}</td><td>${x.p99||'—'}</td><td>${x.cpu_pct||'—'}</td><td>${x.ram_mb||'—'}</td><td>${gpu}</td></tr>`;
         }).join('');
       }
       if (s.running) {
@@ -1090,6 +1110,12 @@ Tabs.benchmark = {
         document.getElementById('bench-stop').disabled = true;
         document.getElementById('bench-progress').style.width = '100%';
         const _bpt2 = document.getElementById('bench-progress-text'); if (_bpt2) _bpt2.textContent = '100%';
+        // Distinguish a clean finish from a run where every model failed to load/run
+        // (results stays empty) so the user does not stare at a blank table.
+        if (!s.results || !s.results.length) {
+          const tb = document.getElementById('bench-results');
+          if (tb) tb.innerHTML = `<tr><td colspan="15" style="text-align:center;color:var(--text-02);padding:1rem;">${t('bench.no_results')}</td></tr>`;
+        }
         App.setStatus(t('bench.complete'));
       }
     } catch(e) { console.warn('poll error:', e); document.getElementById('bench-status').textContent = 'Poll error: ' + e.message; setTimeout(() => this._poll(), 1000); }
@@ -1721,6 +1747,10 @@ Tabs.analysis = {
                 <button class="btn btn-secondary btn-sm" onclick="pickFile('ana-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
               </div>
             </div>
+            <div class="form-group">
+              <label class="form-label">${t('analysis.conf')}</label>
+              <input type="number" class="form-input input-normal" id="ana-conf" value="0.25" min="0" max="1" step="0.05" style="width:auto;">
+            </div>
             <button class="btn btn-primary" style="margin-top:0.5rem;" onclick="Tabs.analysis.run()">${t('run')}</button>
           </div>
           <div class="card" style="flex:1;padding:1rem;display:flex;flex-wrap:wrap;gap:0.5rem;align-items:flex-start;justify-content:center;min-height:300px;overflow-y:auto;" id="ana-panels">
@@ -1746,8 +1776,9 @@ Tabs.analysis = {
     if (!model_path||!image_path) { App.setStatus(t('common.select_model_img')); return; }
     App.setStatus(t('viewer.starting'));
     try {
+      const conf = parseFloat(document.getElementById('ana-conf')?.value) || 0.25;
       const r = await API.post('/api/analysis/inference-analysis', {
-        model_path, model_type: document.getElementById('ana-type').value, image_path, conf: 0.25
+        model_path, model_type: document.getElementById('ana-type').value, image_path, conf
       });
       if (r.error) { App.setStatus('Error: '+r.error); return; }
       let html = '';
@@ -1759,8 +1790,8 @@ Tabs.analysis = {
       document.getElementById('ana-stats').innerHTML = `Pre: ${tm.pre_ms||'—'}ms<br>Infer: ${tm.infer_ms||'—'}ms<br>Post: ${tm.post_ms||'—'}ms<br>Total: ${tm.total_ms||'—'}ms`;
       const dets = r.detections || [];
       document.getElementById('ana-dets').innerHTML = Array.isArray(dets)
-        ? dets.map(d => `${d.class_name}: ${d.confidence}`).join('<br>') || 'No detections'
-        : dets + ' detections';
+        ? dets.map(d => `${escHtml(d.class_name)}: ${escHtml(d.confidence)}`).join('<br>') || 'No detections'
+        : escHtml(dets) + ' detections';
       App.setStatus('Inference analysis complete');
     } catch(e) { App.setStatus('Error: '+e.message); }
   }
@@ -1829,6 +1860,11 @@ Tabs.explorer = {
             </div>
           </div>
           <div style="flex:1;">
+            <div style="display:flex;justify-content:flex-end;margin-bottom:0.5rem;">
+              <label style="font-size:12px;display:flex;align-items:center;gap:0.4rem;cursor:pointer;">
+                <input type="checkbox" id="exp-thumbs" onchange="Tabs.explorer._renderGalleryPage()"> ${t('explorer.thumbs_show')}
+              </label>
+            </div>
             <div id="exp-gallery" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:0.5rem;">
               <div class="text-secondary" style="grid-column:1/-1;text-align:center;padding:3rem;">${t('explorer.load_hint')}</div>
             </div>
@@ -2052,6 +2088,10 @@ Tabs.explorer = {
   _filteredFiles: [],
   _page: 0,
   _pageSize: 500,
+  // Thumbnails are fetched lazily via the existing preview endpoint; cap how many
+  // we materialize per page so a 500-card page never fires 500 full-res decodes.
+  _thumbCap: 60,
+  _thumbToken: 0,
   _renderGalleryPage() {
     const gallery = document.getElementById('exp-gallery');
     if (!gallery) return;
@@ -2065,12 +2105,17 @@ Tabs.explorer = {
     if (this._page >= pageCount) this._page = 0;
     const start = this._page * this._pageSize;
     const slice = files.slice(start, start + this._pageSize);
+    const showThumbs = document.getElementById('exp-thumbs')?.checked || false;
     // ondblclick uses the absolute index so _preview/_filteredFiles stays correct across pages.
     const cards = slice.map((f, i) => {
       const abs = start + i;
+      const thumbBox = showThumbs && i < this._thumbCap
+        ? `<div id="exp-thumb-${abs}" style="height:90px;display:flex;align-items:center;justify-content:center;background:var(--background-neutral-03);border-radius:4px;margin-bottom:0.25rem;overflow:hidden;">${UX.spinner(12)}</div>`
+        : '';
       return `<div class="card-flat" style="padding:0.5rem;font-size:11px;text-align:center;cursor:pointer;" ondblclick="Tabs.explorer._preview(${abs})">
-          <div style="font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${f.name}">${f.name}</div>
-          <div class="text-secondary">${f.boxes} boxes</div>
+          ${thumbBox}
+          <div style="font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
+          <div class="text-secondary">${escHtml(f.boxes)} boxes</div>
         </div>`;
     }).join('');
     let pager = '';
@@ -2082,6 +2127,32 @@ Tabs.explorer = {
       </div>`;
     }
     gallery.innerHTML = cards + pager;
+    if (showThumbs) this._loadThumbs(start, slice);
+  },
+  // Lazily fill the page's thumbnail slots via the existing preview endpoint.
+  // Sequential to bound concurrency; a token guards against stale page loads.
+  async _loadThumbs(start, slice) {
+    const token = ++this._thumbToken;
+    const n = Math.min(slice.length, this._thumbCap);
+    for (let i = 0; i < n; i++) {
+      if (token !== this._thumbToken) return;  // page changed — abandon stale fetch
+      const abs = start + i;
+      const slot = document.getElementById('exp-thumb-' + abs);
+      if (!slot) continue;
+      try {
+        // Empty label_dir -> preview returns the image without box overlay (cheaper).
+        const r = await API.post('/api/data/explorer/preview', { img_path: slice[i].path, label_dir: '' });
+        if (token !== this._thumbToken) return;
+        if (r && r.image) {
+          slot.innerHTML = `<img src="data:image/jpeg;base64,${r.image}" loading="lazy" style="max-width:100%;max-height:90px;object-fit:contain;">`;
+        } else {
+          slot.innerHTML = `<span class="text-muted" style="font-size:10px;">${t('explorer.thumb_failed')}</span>`;
+        }
+      } catch (e) {
+        if (token !== this._thumbToken) return;
+        slot.innerHTML = `<span class="text-muted" style="font-size:10px;">${t('explorer.thumb_failed')}</span>`;
+      }
+    }
   },
   _changePage(delta) {
     this._page += delta;
@@ -2100,7 +2171,7 @@ Tabs.explorer = {
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       showDetailModal(f.name, `<div style="text-align:center;">
         <img src="data:image/jpeg;base64,${r.image}" style="max-width:100%;max-height:70vh;">
-        <div class="text-secondary" style="margin-top:0.5rem;">${r.width}×${r.height} — ${r.box_count} boxes</div>
+        <div class="text-secondary" style="margin-top:0.5rem;">${escHtml(r.width)}×${escHtml(r.height)} — ${escHtml(r.box_count)} boxes</div>
       </div>`);
     } catch(e) { App.setStatus('Error: ' + e.message); }
   }
@@ -2134,6 +2205,17 @@ Tabs.splitter = {
             <div class="form-group"><label class="form-label">${t('splitter.test')}</label><input type="number" class="form-input input-normal" value="0.1" min="0" max="1" step="0.05" id="split-test"></div>
           </div>
           <div class="text-secondary" style="font-size:11px;margin-top:0.5rem;">${t('splitter.ratio_hint')}</div>
+        </div>
+        <div class="card" style="padding:1.5rem;">
+          <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('splitter.options')}</h3>
+          <div class="form-group" style="margin-bottom:0.75rem;">
+            <label class="form-label">${t('splitter.seed')}</label>
+            <input type="number" class="form-input input-normal" id="split-seed" placeholder="" step="1" style="width:140px;">
+            <div class="text-secondary" style="font-size:11px;margin-top:0.25rem;">${t('splitter.seed_hint')}</div>
+          </div>
+          <label style="font-size:12px;display:flex;align-items:center;gap:0.4rem;cursor:pointer;">
+            <input type="checkbox" id="split-overwrite"> ${t('splitter.overwrite')}
+          </label>
         </div>
         <div id="split-pbar-wrap" style="display:none;">
           <div class="progress-track" style="height:20px;position:relative;">
@@ -2172,13 +2254,17 @@ Tabs.splitter = {
     const val = parseFloat(document.getElementById('split-val')?.value || '0.2');
     const test = parseFloat(document.getElementById('split-test')?.value || '0.1');
     const strategy = document.getElementById('split-strategy')?.value || 'random';
+    const overwrite = document.getElementById('split-overwrite')?.checked || false;
+    const seedRaw = document.getElementById('split-seed')?.value;
+    // Blank seed -> null (non-reproducible); only send an int when the user typed one.
+    const seed = (seedRaw !== undefined && seedRaw !== '') ? parseInt(seedRaw, 10) : null;
     const pbarWrap = document.getElementById('split-pbar-wrap');
     if (pbarWrap) pbarWrap.style.display = 'block';
     const stopBtn = document.getElementById('split-stop-btn');
     if (stopBtn) stopBtn.style.display = '';
     App.setStatus('Splitting...');
     try {
-      const r = await API.post('/api/data/splitter', { img_dir, label_dir, output_dir, train, val, test, strategy });
+      const r = await API.post('/api/data/splitter', { img_dir, label_dir, output_dir, train, val, test, strategy, seed, overwrite });
       if (r.error) { App.setStatus('Error: ' + r.error); if (stopBtn) stopBtn.style.display = 'none'; return; }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); if (stopBtn) stopBtn.style.display = 'none'; }
@@ -2202,12 +2288,24 @@ Tabs.splitter = {
       if (s.results) {
         const res = document.getElementById('split-result');
         const r = s.results;
-        const counts = `Train: ${r.train||0}, Val: ${r.val||0}, Test: ${r.test||0}`;
-        // Echo the normalized ratios so the user sees what the backend actually used (DATA-10).
-        let ratioNote = '';
-        if (r.ratios) ratioNote = ` (ratios — train ${r.ratios.train}, val ${r.ratios.val}, test ${r.ratios.test})`;
-        if (res) res.innerHTML = `Done — ${counts}${ratioNote}`;
-        App.setStatus(`Split complete — ${counts}`);
+        // Stale-dir refusal (WAVE1): results = {error:'OUTPUT_NOT_EMPTY', existing_splits:[...]}.
+        if (r.error === 'OUTPUT_NOT_EMPTY') {
+          const splits = (r.existing_splits || []).join(', ');
+          const warn = t('splitter.output_not_empty', { splits: escHtml(splits) });
+          if (res) res.innerHTML = `<span style="color:var(--action-danger-05);">${warn}</span>`;
+          App.setStatus(warn);
+        } else {
+          const counts = `Train: ${r.train||0}, Val: ${r.val||0}, Test: ${r.test||0}`;
+          // Echo the normalized ratios so the user sees what the backend actually used (DATA-10).
+          let ratioNote = '';
+          if (r.ratios) ratioNote = ` (ratios — train ${escHtml(r.ratios.train)}, val ${escHtml(r.ratios.val)}, test ${escHtml(r.ratios.test)})`;
+          let seedNote = '';
+          if (r.seed !== undefined && r.seed !== null) seedNote = ` — ${t('splitter.seed')}: ${escHtml(r.seed)}`;
+          let missingNote = '';
+          if (r.missing_labels) missingNote = `<br><span style="color:var(--status-warning-05,#b58900);">${t('splitter.missing_labels', { n: r.missing_labels })}</span>`;
+          if (res) res.innerHTML = `Done — ${counts}${ratioNote}${seedNote}${missingNote}`;
+          App.setStatus(`Split complete — ${counts}`);
+        }
       } else {
         App.setStatus(s.msg || 'Complete');
       }

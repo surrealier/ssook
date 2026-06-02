@@ -51,6 +51,18 @@ class ProfileResult:
     output_info: list[dict] = field(default_factory=list)
     provider: str = "CPUExecutionProvider"
     flops_approximate: bool = False
+    # Fixed-batch correctness: a single sess.run() processes batch_size samples,
+    # so avg_infer_ms below is PER-BATCH latency. Per-sample latency / throughput
+    # are derived from batch_size in profile_to_dict so callers cannot mistake a
+    # batch-N latency for a single-sample one.
+    batch_size: int = 1
+    # EP fallback signal: when the user requested a specific GPU EP that ORT could
+    # not honor, it silently runs on CPU. requested_provider captures the ask and
+    # provider_fallback flags the mismatch so the latency numbers aren't trusted
+    # as GPU numbers when they're really CPU.
+    requested_provider: str | None = None
+    provider_fallback: bool = False
+    warnings: list[str] = field(default_factory=list)
 
 
 # ── Helpers ─────────────────────────────────────────────
@@ -381,8 +393,26 @@ def _analyze_graph(path: str, layer_profiles: list[LayerProfile]):
 
 # ── Main profiler ───────────────────────────────────────
 
-def _resolve_providers(provider):
+def _detect_batch_size(sess) -> int:
+    """Fixed batch from the first input's leading dim, else 1.
+
+    Matches core.model_loader's detection: only a positive integer leading dim
+    is a real fixed batch; symbolic/dynamic ('batch', -1, None) means batch 1.
+    """
+    inputs = sess.get_inputs()
+    if not inputs:
+        return 1
+    batch_dim = inputs[0].shape[0] if inputs[0].shape else None
+    return int(batch_dim) if isinstance(batch_dim, int) and batch_dim > 0 else 1
+
+
+def _resolve_providers(provider) -> tuple[list[str], str | None]:
     """Map a provider request to an ORT providers list.
+
+    Returns (providers, requested_provider). requested_provider is the specific
+    non-CPU EP the user explicitly asked for (so the caller can detect a silent
+    CPU fallback), or None for auto / CPU / list requests where no single EP was
+    demanded.
 
     None / "auto" → the app's auto-EP (GPU-first, matching deployment).
     A provider name string → [that EP, CPU fallback]. A list → used as-is.
@@ -390,24 +420,41 @@ def _resolve_providers(provider):
     if provider is None or provider == "auto":
         try:
             from core.model_loader import _build_providers
-            return _build_providers()
+            return _build_providers(), None
         except Exception:
-            return ["CPUExecutionProvider"]
+            return ["CPUExecutionProvider"], None
     if isinstance(provider, str):
         if provider == "CPUExecutionProvider":
-            return ["CPUExecutionProvider"]
-        return [provider, "CPUExecutionProvider"]
-    return list(provider)
+            return ["CPUExecutionProvider"], None
+        return [provider, "CPUExecutionProvider"], provider
+    return list(provider), None
 
 
 def profile_model(path: str, num_runs: int = 50, warmup: int = 10,
                   provider=None) -> ProfileResult:
     # Profiling CPU-only gives meaningless numbers for GPU deployments; default
     # to the app auto-EP so latency reflects how the model actually runs.
-    providers = _resolve_providers(provider)
+    providers, requested_provider = _resolve_providers(provider)
     sess = ort.InferenceSession(path, providers=providers)
     chosen_provider = sess.get_providers()[0] if sess.get_providers() else "CPUExecutionProvider"
     input_feed = _build_dummy_feed(sess)
+
+    # Detect fixed batch from the first input's leading dim — same rule as
+    # core.model_loader so the profiler agrees with the inference path. A single
+    # sess.run() then processes batch_size samples at once.
+    batch_size = _detect_batch_size(sess)
+
+    # A specific GPU EP was requested but ORT created a session on a different
+    # provider (typically a silent CPU fallback when the EP isn't installed).
+    # Mirror the inspector's EP-probe: compare requested vs session.get_providers().
+    warnings: list[str] = []
+    provider_fallback = False
+    if requested_provider is not None and requested_provider not in sess.get_providers():
+        provider_fallback = True
+        warnings.append(
+            f"Requested {requested_provider} is unavailable — ran on {chosen_provider}. "
+            f"These latency numbers are NOT {requested_provider} numbers."
+        )
 
     # Input/output info
     input_info = [{"name": i.name, "shape": [str(d) for d in i.shape], "type": i.type} for i in sess.get_inputs()]
@@ -480,10 +527,21 @@ def profile_model(path: str, num_runs: int = 50, warmup: int = 10,
         output_info=output_info,
         provider=chosen_provider,
         flops_approximate=flops_approximate,
+        batch_size=batch_size,
+        requested_provider=requested_provider,
+        provider_fallback=provider_fallback,
+        warnings=warnings,
     )
 
 
 def profile_to_dict(result: ProfileResult) -> dict:
+    # avg_infer_ms is the measured time of one sess.run(), which processes
+    # batch_size samples. For batch>1 that is a PER-BATCH figure, so derive the
+    # per-sample latency and throughput here rather than letting the frontend
+    # compute FPS=1000/avg_infer_ms (which would be batch_size× too low).
+    batch_size = max(result.batch_size, 1)
+    per_sample_ms = result.avg_infer_ms / batch_size
+    throughput_fps = (1000.0 / per_sample_ms) if per_sample_ms > 0 else 0.0
     d = {
         "avg_infer_ms": round(result.avg_infer_ms, 3),
         "min_infer_ms": round(result.min_infer_ms, 3),
@@ -493,10 +551,19 @@ def profile_to_dict(result: ProfileResult) -> dict:
         "p99_ms": round(result.p99_ms, 3),
         "warmup_ms": round(result.warmup_ms, 3),
         "num_runs": result.num_runs,
+        # Batch-aware latency/throughput. latency_per_batch_ms == avg_infer_ms;
+        # named explicitly so the unit is unambiguous for batch>1 models.
+        "batch_size": batch_size,
+        "latency_per_batch_ms": round(result.avg_infer_ms, 3),
+        "avg_latency_per_sample_ms": round(per_sample_ms, 3),
+        "throughput_fps": round(throughput_fps, 2),
         "num_parameters": result.num_parameters,
         "estimated_flops": result.estimated_flops,
         "flops_approximate": result.flops_approximate,
         "provider": result.provider,
+        "requested_provider": result.requested_provider,
+        "provider_fallback": result.provider_fallback,
+        "warnings": result.warnings,
         "peak_memory_mb": result.peak_memory_mb,
         "top_bottlenecks": [
             {"name": l.name, "op_type": l.op_type, "duration_us": round(l.duration_us, 1)}

@@ -238,3 +238,173 @@ def test_vlm_batch_second_post_returns_busy(monkeypatch):
     second = client.post("/api/vlm/batch", json=payload).json()
     assert second.get("code") == "VLM_BUSY"
     vlm_state.update(running=False)
+
+
+# ── Batch export / persistence (P1 missing-goal) ─────────────────────────
+class _FakeBackend:
+    """Minimal VLMBackend stand-in — no torch/onnx. describe/answer echo the
+    file so tests can assert per-row content without real inference.
+    """
+
+    def __init__(self, tag: str = "fake"):
+        self.tag = tag
+        self.calls = 0
+
+    def describe(self, frame, prompt, *, max_new_tokens=128, temperature=0.0):
+        self.calls += 1
+        return f"caption-{self.calls}"
+
+    def answer(self, frame, question, *, candidates=None, max_new_tokens=128, temperature=0.0):
+        self.calls += 1
+        return f"answer-{self.calls}"
+
+
+def _run_inline_batch(monkeypatch, n_images: int = 3):
+    """Drive /api/vlm/batch synchronously with a fake backend (no model load).
+
+    executor.submit is patched to run the worker inline so the request returns
+    only after results are persisted. Returns the parsed POST response body.
+    """
+    import numpy as np
+    import server.model_routes as mr
+    from server.state import vlm_state
+
+    vlm_state.update(running=False)
+    # Run the worker inline instead of on the thread pool.
+    monkeypatch.setattr(mr.executor, "submit", lambda fn, *a, **k: fn(*a, **k))
+    # Skip path safety + image globbing; never touch the filesystem for inputs.
+    monkeypatch.setattr(mr, "safe_model_file", lambda p: p)
+    monkeypatch.setattr(mr, "safe_image_dir", lambda p: p)
+    monkeypatch.setattr(mr, "glob_images", lambda d: [f"img{i}.jpg" for i in range(n_images)])
+    monkeypatch.setattr(mr, "imread", lambda p: np.zeros((4, 4, 3), dtype=np.uint8))
+    # No real backend — patch the factory get_cached_backend imports lazily.
+    import core.vlm_inference as vi
+    monkeypatch.setattr(vi, "make_backend", lambda spec: _FakeBackend())
+    # Empty the backend cache so the fake is used, not a previously cached one.
+    mr._BACKEND_CACHE.clear()
+
+    payload = {
+        "model_path": "img.onnx",
+        "text_encoder": "txt.onnx",
+        "img_dir": ".",
+        "backend": "clip",
+        "task": "caption",
+        "prompt": "Describe.",
+    }
+    return client.post("/api/vlm/batch", json=payload).json()
+
+
+def test_vlm_batch_writes_retrievable_json(monkeypatch):
+    import json
+    from server.state import vlm_state
+
+    body = _run_inline_batch(monkeypatch, n_images=3)
+    assert body.get("ok") is True
+    snap = vlm_state.snapshot()
+    assert snap.get("running") is False
+    # The worker recorded where it saved results.
+    saved = snap.get("saved") or {}
+    assert "json" in saved and "csv" in saved
+    assert os.path.isfile(saved["json"])
+    rows = json.loads(open(saved["json"], encoding="utf-8").read())
+    assert len(rows) == 3
+    # file/result columns mirror the in-memory results; task/prompt are stamped.
+    assert [r["file"] for r in rows] == ["img0.jpg", "img1.jpg", "img2.jpg"]
+    assert all(r["task"] == "caption" and r["prompt"] == "Describe." for r in rows)
+    assert all(r["result"].startswith("caption-") for r in rows)
+
+
+def test_vlm_export_endpoint_returns_saved_rows(monkeypatch):
+    import json
+    from server.state import vlm_state
+
+    _run_inline_batch(monkeypatch, n_images=2)
+    trace_id = vlm_state.snapshot().get("trace_id")
+    assert trace_id
+
+    # JSON export by trace_id.
+    r = client.get(f"/api/vlm/export?trace_id={trace_id}&fmt=json")
+    assert r.status_code == 200
+    assert "attachment" in r.headers.get("content-disposition", "")
+    rows = json.loads(r.content.decode("utf-8"))
+    assert len(rows) == 2
+
+    # CSV export (default fmt) for the most recent run (no trace_id).
+    r_csv = client.get("/api/vlm/export")
+    assert r_csv.status_code == 200
+    text = r_csv.content.decode("utf-8-sig")  # CSV is written with a BOM
+    assert "file,result,ms,task,prompt" in text.splitlines()[0]
+    assert len([ln for ln in text.splitlines() if ln.strip()]) == 3  # header + 2 rows
+
+
+def test_vlm_export_unknown_trace_returns_error():
+    # A bogus/short trace id never resolves to a run dir → clean error envelope.
+    r = client.get("/api/vlm/export?trace_id=deadbeef0000")
+    assert r.status_code == 200
+    assert r.json().get("code") == "VLM_NO_RESULTS"
+
+
+def test_vlm_export_rejects_traversal_trace_id():
+    # Path-traversal style trace ids must be rejected by the isalnum guard,
+    # not resolved into some sibling directory.
+    for bad in ("../etc", "a/b", "..", "x.y"):
+        r = client.get("/api/vlm/export", params={"trace_id": bad})
+        assert r.status_code == 200
+        assert r.json().get("code") == "VLM_NO_RESULTS"
+
+
+# ── Transformers backend cross-request cache (P1 scale) ──────────────────
+def test_get_cached_backend_reuses_same_object(monkeypatch):
+    import server.model_routes as mr
+    import core.vlm_inference as vi
+
+    mr._BACKEND_CACHE.clear()
+    built = []
+
+    def _fake_make(spec):
+        b = _FakeBackend(tag=spec.get("model_id") or "x")
+        built.append(b)
+        return b
+
+    monkeypatch.setattr(vi, "make_backend", _fake_make)
+
+    spec = {"backend": "transformers", "model_id": "Qwen/Qwen2.5-VL-3B"}
+    first = mr.get_cached_backend(spec)
+    second = mr.get_cached_backend(dict(spec))  # same identity, new dict
+    # Second call must reuse the warm backend — no second construction.
+    assert first is second
+    assert len(built) == 1
+
+    # A different model_id builds (and caches) a distinct instance.
+    other = mr.get_cached_backend({"backend": "transformers", "model_id": "llava-hf/llava-1.5-7b-hf"})
+    assert other is not first
+    assert len(built) == 2
+    mr._BACKEND_CACHE.clear()
+
+
+def test_backend_cache_evicts_beyond_max(monkeypatch):
+    import server.model_routes as mr
+    import core.vlm_inference as vi
+
+    mr._BACKEND_CACHE.clear()
+    monkeypatch.setattr(vi, "make_backend", lambda spec: _FakeBackend(tag=spec.get("model_id")))
+
+    # Fill past the bound; the oldest (least-recently-used) entry is evicted.
+    ids = [f"model-{i}" for i in range(mr._BACKEND_CACHE_MAX + 1)]
+    backends = [mr.get_cached_backend({"backend": "transformers", "model_id": m}) for m in ids]
+    assert len(mr._BACKEND_CACHE) == mr._BACKEND_CACHE_MAX
+    # The first id was evicted, so re-fetching it constructs a NEW instance.
+    refetched = mr.get_cached_backend({"backend": "transformers", "model_id": ids[0]})
+    assert refetched is not backends[0]
+    mr._BACKEND_CACHE.clear()
+
+
+def test_backend_cache_key_excludes_api_key():
+    import server.model_routes as mr
+
+    k1 = mr._backend_cache_key({"backend": "openai", "endpoint_url": "https://x/v1",
+                                "model_id": "m", "api_key": "secret-A"})
+    k2 = mr._backend_cache_key({"backend": "openai", "endpoint_url": "https://x/v1",
+                                "model_id": "m", "api_key": "secret-B"})
+    # Two tokens to the same served model share a cache entry (key ignores key).
+    assert k1 == k2

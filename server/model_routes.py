@@ -2,15 +2,18 @@
 import asyncio
 import base64
 import ipaddress
+import logging
 import os
 import socket
 import time as _time
+from collections import OrderedDict
 from typing import Optional
 from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
 from fastapi import APIRouter
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from core.app_config import AppConfig
@@ -19,10 +22,69 @@ from core.model_loader import load_model as _load_core
 from server.errors import route_errors
 from server.model_manager import ensure_model, get_model, get_model_meta, load_fresh
 from server.path_safety import safe_label_dir, safe_image_dir, safe_image_file, safe_model_file
-from server.state import executor, vlm_state
+from server.state import executor, task_locks, vlm_state
 from server.utils import imread, generate_palette, get_color, draw_label, overlay_segmentation, glob_images
 
+log = logging.getLogger("ssook.vlm")
+
 router = APIRouter()
+
+
+# ── VLM backend cache ───────────────────────────────────────
+# A bounded, thread-safe cache of constructed VLMBackend instances. The
+# transformers backend loads multi-GB weights (and first-time HF download)
+# in its __init__, so building a fresh backend on every single-image request
+# costs tens of seconds to minutes. Keying by spec identity lets repeat
+# single-image calls and successive batch runs reuse a warm backend.
+#
+# Guarded by task_locks['gpu_infer'] because (a) the dict mutation races
+# under the 4-worker executor and (b) the cached HF model is itself not
+# thread-safe, so serializing construction here is the right granularity.
+_BACKEND_CACHE: "OrderedDict[tuple, object]" = OrderedDict()
+_BACKEND_CACHE_MAX = 2  # VLM weights are large; keep only a couple resident.
+
+
+def _backend_cache_key(spec: dict) -> tuple:
+    """Identity of a backend for caching, by the fields that change behavior.
+
+    clip is keyed on its encoder paths, transformers on its model_id, openai
+    on (endpoint_url, model_id). api_key is deliberately excluded from the key
+    (and never logged) — two requests to the same served model reuse the same
+    client regardless of token.
+    """
+    name = (spec.get("backend") or "clip").lower()
+    if name == "clip":
+        return (name, spec.get("model_path") or spec.get("image_encoder"),
+                spec.get("text_encoder"))
+    if name == "transformers":
+        return (name, spec.get("model_id") or spec.get("model_path"))
+    if name == "openai":
+        return (name, spec.get("endpoint_url"), spec.get("model_id"))
+    return (name,)
+
+
+def get_cached_backend(spec: dict):
+    """Return a VLMBackend for `spec`, building+caching it on first use.
+
+    Reuses a previously constructed backend when the cache key matches, so a
+    warm transformers model is shared across requests. Bounded LRU eviction
+    keeps at most _BACKEND_CACHE_MAX models resident. Thread-safe via the
+    shared gpu_infer lock.
+    """
+    from core.vlm_inference import make_backend
+    key = _backend_cache_key(spec)
+    with task_locks["gpu_infer"]:
+        cached = _BACKEND_CACHE.get(key)
+        if cached is not None:
+            _BACKEND_CACHE.move_to_end(key)  # mark most-recently-used
+            return cached
+        backend = make_backend(spec)
+        _BACKEND_CACHE[key] = backend
+        _BACKEND_CACHE.move_to_end(key)
+        while len(_BACKEND_CACHE) > _BACKEND_CACHE_MAX:
+            evicted_key, _ = _BACKEND_CACHE.popitem(last=False)
+            log.info("VLM backend cache evicted %s", evicted_key[:2])
+        return backend
 
 
 # ── VLM endpoint SSRF guard ─────────────────────────────────
@@ -337,7 +399,6 @@ def _infer_image_vlm(req: InferRequest):
     """Single-image VLM path. Validates paths up front, then dispatches to the
     selected backend. Reached when model_type resolves to 'vlm'.
     """
-    from core.vlm_inference import make_backend
     backend_name = (req.backend or "clip").lower()
     # Path safety FIRST — before any imread/session — and use the safe paths.
     # SSRF guard FIRST: validate the outbound endpoint before touching the
@@ -368,7 +429,8 @@ def _infer_image_vlm(req: InferRequest):
 
     t0 = _time.perf_counter()
     try:
-        backend = make_backend(_vlm_spec(req))
+        # Reuse a warm backend across requests — see get_cached_backend.
+        backend = get_cached_backend(_vlm_spec(req))
         task = (req.vlm_task or "caption").lower()
         prompt = req.vlm_prompt or ""
         if task == "vqa":
@@ -536,25 +598,33 @@ async def vlm_batch(req: VLMBatchRequest):
     if not vlm_state.try_start(progress=0, total=len(imgs), msg="Starting...", results=[]):
         return {"error": "VLM batch already running", "code": "VLM_BUSY"}
 
+    task = (req.task or "caption").lower()
+
     @route_errors(state=vlm_state, scope="vlm")
     def _run():
-        from core.vlm_inference import make_backend
         from core.run_record import RunRecorder
         from core.paths import tmp_dir
-        out_dir = tmp_dir("vlm")
+        # Per-trace subdir so concurrent/successive runs never overwrite each
+        # other's run.yaml or results files. RunRecorder mints the trace_id;
+        # we read it, then write all artefacts under tmp/vlm/<trace_id>/.
+        out_root = tmp_dir("vlm")
         # NOTE: api_key is intentionally excluded from the run record inputs.
-        with RunRecorder(run_type="vlm_batch", output_dir=out_dir,
-                         inputs={"backend": backend_name, "task": req.task,
-                                 "prompt": req.prompt, "candidates": req.candidates,
-                                 "model_id": req.model_id,
-                                 "endpoint_url": req.endpoint_url,
-                                 "img_dir": img_dir, "max_images": len(imgs)},
-                         model_path=model_path if backend_name == "clip" else None) as rec:
+        rec = RunRecorder(run_type="vlm_batch", output_dir=out_root / "_pending",
+                          inputs={"backend": backend_name, "task": task,
+                                  "prompt": req.prompt, "candidates": req.candidates,
+                                  "model_id": req.model_id,
+                                  "endpoint_url": req.endpoint_url,
+                                  "img_dir": img_dir, "max_images": len(imgs)},
+                          model_path=model_path if backend_name == "clip" else None)
+        run_dir = out_root / rec.trace_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        rec.output_dir = run_dir  # land run.yaml in the per-trace dir
+        with rec:
             vlm_state["trace_id"] = rec.trace_id
-            backend = make_backend(spec)
-            task = (req.task or "caption").lower()
+            # Reuse a warm backend across runs (esp. transformers weights).
+            backend = get_cached_backend(spec)
             cands = [c for c in (req.candidates or "").split(",") if c.strip()]
-            results = []
+            results: list[dict] = []
             for i, fp in enumerate(imgs):
                 if not vlm_state.get("running", True):
                     rec.note(f"Stopped at {i}/{len(imgs)}")
@@ -581,10 +651,42 @@ async def vlm_batch(req: VLMBatchRequest):
                 vlm_state["progress"] = i + 1
                 vlm_state["msg"] = f"{i+1}/{len(imgs)}"
                 vlm_state["results"] = results
-            vlm_state.update(running=False, msg="Complete")
+            # Persist results so a multi-hundred-image run survives the next
+            # run and a server restart (the in-memory list is wiped on both).
+            saved = _write_vlm_results(run_dir, results, task=task, prompt=req.prompt)
+            vlm_state.update(running=False, msg="Complete",
+                             output_dir=str(run_dir), saved=saved)
 
     executor.submit(_run)
     return {"ok": True, "total": len(imgs)}
+
+
+def _write_vlm_results(run_dir, results: list[dict], *, task: str,
+                       prompt: Optional[str]) -> dict:
+    """Write batch results to results.json + results.csv under run_dir.
+
+    Each row carries the run-level task/prompt so a single exported file is
+    self-describing. Returns {json, csv} absolute paths (best effort — a write
+    failure is logged, not raised, so a usable in-memory result is never lost
+    to an export-time error).
+    """
+    from core.exports import rows_to_csv, rows_to_json
+    rows = [{**r, "task": task, "prompt": prompt or ""} for r in results]
+    columns = ["file", "result", "ms", "task", "prompt"]
+    saved: dict[str, str] = {}
+    json_path = run_dir / "results.json"
+    csv_path = run_dir / "results.csv"
+    try:
+        json_path.write_bytes(rows_to_json(rows))
+        saved["json"] = str(json_path)
+    except OSError as e:
+        log.warning("VLM results.json write failed for %s: %s", run_dir, e)
+    try:
+        csv_path.write_bytes(rows_to_csv(rows, columns=columns))
+        saved["csv"] = str(csv_path)
+    except OSError as e:
+        log.warning("VLM results.csv write failed for %s: %s", run_dir, e)
+    return saved
 
 
 @router.get("/api/vlm/backends")
@@ -607,6 +709,55 @@ async def vlm_backends():
 @router.get("/api/vlm/status")
 async def vlm_status():
     return vlm_state.snapshot() if hasattr(vlm_state, "snapshot") else dict(vlm_state)
+
+
+def _vlm_run_dir(trace_id: Optional[str]):
+    """Resolve a batch run's output dir under tmp/vlm, traversal-safe.
+
+    A trace_id is a 12-char hex string from RunRecorder; we reject anything
+    else (path separators, '..') so the trace_id can never escape tmp/vlm.
+    When trace_id is omitted, fall back to the most recent run recorded in
+    vlm_state. Returns None if no valid run dir exists.
+    """
+    from core.paths import tmp_dir
+    out_root = tmp_dir("vlm")
+    if trace_id:
+        if not trace_id.isalnum():
+            return None
+        candidate = out_root / trace_id
+        return candidate if candidate.is_dir() else None
+    # No trace_id → most recent completed run from state.
+    recorded = vlm_state.snapshot().get("output_dir")
+    if recorded:
+        candidate = out_root / os.path.basename(recorded)
+        return candidate if candidate.is_dir() else None
+    return None
+
+
+@router.get("/api/vlm/export")
+async def vlm_export(trace_id: Optional[str] = None, fmt: str = "csv"):
+    """Download a persisted batch result (csv|json).
+
+    Reads the file written by _write_vlm_results under tmp/vlm/<trace_id>/.
+    Without a trace_id, serves the most recent run. The batch must have
+    completed (the file is written at run end) — returns an error envelope
+    otherwise so the UI can show a clear message.
+    """
+    run_dir = _vlm_run_dir(trace_id)
+    if run_dir is None:
+        return {"error": "No VLM batch results found", "code": "VLM_NO_RESULTS"}
+    fmt = (fmt or "csv").lower()
+    if fmt not in ("csv", "json"):
+        fmt = "csv"
+    target = run_dir / f"results.{fmt}"
+    if not target.is_file():
+        return {"error": f"results.{fmt} not found for this run", "code": "VLM_NO_RESULTS"}
+    media = "text/csv; charset=utf-8" if fmt == "csv" else "application/json"
+    return Response(
+        content=target.read_bytes(),
+        media_type=media,
+        headers={"Content-Disposition": f"attachment; filename=vlm_results.{fmt}"},
+    )
 
 
 # ── Video Info ───────────────────────────────────────────

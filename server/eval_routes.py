@@ -29,6 +29,40 @@ router = APIRouter()
 
 _EVAL_HISTORY_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "eval_history")
 
+# run_inference_batch shares the generic letterbox + v8/v5 path; it does NOT
+# handle the specialized branches (custom/detr/yolo_nas/pose_/instseg_/seq_)
+# that run_inference routes separately. Batching those would silently mis-decode
+# their outputs, so we only batch the model types whose single-frame path is the
+# same generic letterbox→v8/v5 pipeline (EVAL: scale P1, run_inference_batch reuse).
+_BATCH_UNSAFE_PREFIXES = ("pose_", "instseg_", "seq_")
+_BATCH_UNSAFE_TYPES = {"custom", "detr", "yolo_nas"}
+# Dynamic-batch models get a modest window so eval throughput improves without a
+# memory blow-up; fixed-batch models use their own batch_size.
+_EVAL_DYNAMIC_BATCH = 8
+
+
+def _can_batch(model_info) -> bool:
+    """Whether run_inference_batch produces results identical to per-frame
+    run_inference for this model_type (only the generic letterbox→v8/v5 path)."""
+    mt = model_info.model_type
+    if mt in _BATCH_UNSAFE_TYPES or any(mt.startswith(p) for p in _BATCH_UNSAFE_PREFIXES):
+        return False
+    return True
+
+
+def _gt_missing_warnings(missing_gt: int, total: int, label_dir: str) -> list:
+    """Human-readable warnings when some/all images lack a GT label file.
+
+    An entirely-missing GT dir scores every prediction as FP, yielding a
+    meaningless 0 mAP that looks like a broken model rather than a config error;
+    surfacing it as a warning is the point of the EVAL GT-missing P1.
+    """
+    if total > 0 and missing_gt >= total:
+        return [f"no GT labels found in {label_dir or '(empty label_dir)'}"]
+    if missing_gt > 0:
+        return [f"{missing_gt} of {total} images had no GT label file"]
+    return []
+
 
 def _build_confusion_matrix(gt_data, pred_data, iou_thres=0.5):
     """Build class confusion matrix from GT and prediction dicts.
@@ -101,6 +135,7 @@ class EvalAsyncRequest(BaseModel):
     per_model_mappings: Optional[dict] = None  # {model_name: {model_cls_id: gt_cls_id}}
     mapped_only: bool = True
     task: str = "detection"            # detection | classification | segmentation | clip | embedder
+    averaging: str = "micro"           # P/R/F1 pooling: "micro" (legacy) | "macro" (equal-weight per class)
     cm_iou: float = 0.5                # confusion-matrix IoU threshold (EVAL-08)
     num_classes: int = 80              # for segmentation
     gt_mask_dir: str = ""              # for segmentation
@@ -164,7 +199,7 @@ async def run_evaluation_async(req: EvalAsyncRequest):
     def _run():
         import glob
         from core.model_loader import load_model as _load_model
-        from core.inference import run_inference
+        from core.inference import run_inference, run_inference_batch
         from core.evaluation import evaluate_dataset, evaluate_map50_95
 
         try:
@@ -190,8 +225,11 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                 return
 
             # GT 로드 — 손상된 라벨 라인은 건너뛰고 카운트만 (EVAL-05).
+            # 라벨 파일이 아예 없는 이미지도 카운트(missing_gt) — label_dir 오설정 시
+            # 모든 예측이 조용히 FP로 채점되어 0 mAP가 "고장난 모델"처럼 보이는 것을 방지.
             gt_data = {}
             gt_skipped = 0
+            missing_gt = 0
             for fp in img_files:
                 stem = os.path.splitext(os.path.basename(fp))[0]
                 txt = os.path.join(req.label_dir, stem + ".txt")
@@ -207,6 +245,8 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                             except ValueError:
                                 # 헤더 라인·비숫자 토큰 — 한 줄 오류로 전체 run을 중단하지 않음.
                                 gt_skipped += 1
+                else:
+                    missing_gt += 1
                 gt_data[stem] = boxes
 
             total_work = len(img_files)
@@ -237,34 +277,63 @@ async def run_evaluation_async(req: EvalAsyncRequest):
             eval_state["model_name"] = ", ".join(name for name, _, _, _ in loaded)
             pred_per_model = {name: {} for name, _, _, _ in loaded}
 
-            for fp in img_files:
-                # 협조적 취소: Stop 후 running=False면 즉시 종료 (EVAL-02).
+            def _to_yolo_boxes(res, w: int, h: int, mapping: dict, mapped_only: bool) -> list:
+                """DetectionResult → normalized YOLO (cid, cx, cy, bw, bh, score) with mapping."""
+                out = []
+                for box, score, cid in zip(res.boxes, res.scores, res.class_ids):
+                    cid = int(cid)
+                    if mapping:
+                        if cid in mapping:
+                            cid = mapping[cid]
+                        elif mapped_only:
+                            continue
+                    x1, y1, x2, y2 = box
+                    cx = ((x1 + x2) / 2) / w; cy = ((y1 + y2) / 2) / h
+                    bw = (x2 - x1) / w; bh = (y2 - y1) / h
+                    out.append((cid, cx, cy, bw, bh, float(score)))
+                return out
+
+            # 디코드 1회·모든 모델 적용(EVAL-06)을 유지하되, 이미지를 윈도우로 모아
+            # 배치 가능 모델은 run_inference_batch로 한 번에 추론(스케일 P1).
+            # window 크기는 모든 로드된 모델의 batch_size를 수용하도록 정함.
+            window_size = max(
+                [_EVAL_DYNAMIC_BATCH] +
+                [mi.batch_size for _, mi, _, _ in loaded if mi.batch_size > 1])
+            for start in range(0, len(img_files), window_size):
+                # 협조적 취소: 윈도우 경계에서 Stop 확인 (EVAL-02).
                 if not eval_state["running"]:
                     eval_state.update(running=False, msg="Stopped")
                     return
-                frame = imread(fp)
-                done += 1
+                window_fps = img_files[start:start + window_size]
+                frames, stems, dims = [], [], []
+                for fp in window_fps:
+                    frame = imread(fp)
+                    done += 1
+                    if frame is None:
+                        continue
+                    frames.append(frame)
+                    stems.append(os.path.splitext(os.path.basename(fp))[0])
+                    dims.append(frame.shape[:2])  # (h, w)
                 eval_state["progress"] = done
-                if frame is None:
+                if not frames:
                     continue
-                h, w = frame.shape[:2]
-                stem = os.path.splitext(os.path.basename(fp))[0]
                 for name, mi, mapping, mapped_only in loaded:
-                    res = run_inference(mi, frame, req.conf)
-                    boxes = []
-                    for box, score, cid in zip(res.boxes, res.scores, res.class_ids):
-                        cid = int(cid)
-                        if mapping:
-                            if cid in mapping:
-                                cid = mapping[cid]
-                            elif mapped_only:
-                                continue
-                        x1, y1, x2, y2 = box
-                        cx = ((x1+x2)/2)/w; cy = ((y1+y2)/2)/h
-                        bw = (x2-x1)/w; bh = (y2-y1)/h
-                        boxes.append((cid, cx, cy, bw, bh, float(score)))
-                    pred_per_model[name][stem] = boxes
+                    if _can_batch(mi):
+                        # 고정 배치 모델은 batch_size를 초과해 먹이면 ORT shape mismatch가 나므로
+                        # 모델의 배치 용량 단위로 잘라 run_inference_batch에 넘긴다(동적은 윈도우 통째).
+                        chunk = mi.batch_size if mi.batch_size > 1 else len(frames)
+                        results = []
+                        for c in range(0, len(frames), chunk):
+                            results.extend(run_inference_batch(mi, frames[c:c + chunk], req.conf))
+                    else:
+                        results = [run_inference(mi, f, req.conf) for f in frames]
+                    for res, stem, (h, w) in zip(results, stems, dims):
+                        pred_per_model[name][stem] = _to_yolo_boxes(res, w, h, mapping, mapped_only)
                 eval_state["msg"] = f"{done}/{total_work}" + (f" ({gt_skipped} GT lines skipped)" if gt_skipped else "")
+
+            # GT가 한 장도 없으면(label_dir 누락/오설정) 모든 예측이 FP로 채점되어
+            # 무의미한 0 mAP가 나옴 — 결과에 명시적 경고를 실어 설정 오류임을 알림.
+            warnings = _gt_missing_warnings(missing_gt, total_work, req.label_dir)
 
             for name, _, mapping, mapped_only in loaded:
                 # GT 필터링 (매핑된 클래스만)
@@ -276,7 +345,7 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                     gt_eval = gt_data
                 pred_data = pred_per_model[name]
 
-                res50 = evaluate_dataset(gt_eval, pred_data, 0.5)
+                res50 = evaluate_dataset(gt_eval, pred_data, 0.5, averaging=req.averaging)
                 map5095 = evaluate_map50_95(gt_eval, pred_data)
                 ov = res50.get("__overall__", {})
                 # per-class detail (JSON serializable)
@@ -299,12 +368,21 @@ async def run_evaluation_async(req: EvalAsyncRequest):
                     "precision": round(ov.get("precision", 0) * 100, 4),
                     "recall": round(ov.get("recall", 0) * 100, 4),
                     "f1": round(ov.get("f1", 0) * 100, 4),
+                    "averaging": req.averaging,
+                    "missing_gt_files": missing_gt,
+                    "warnings": list(warnings),
                     "detail": detail,
                     "confusion_matrix": conf_matrix,
                     "confusion_classes": conf_classes,
                 })
 
-            complete_msg = "Complete" + (f" ({gt_skipped} GT lines skipped)" if gt_skipped else "")
+            complete_msg = "Complete"
+            if missing_gt >= total_work and total_work > 0:
+                complete_msg += f" (WARNING: no GT labels found in {req.label_dir or 'label_dir'})"
+            elif missing_gt > 0:
+                complete_msg += f" ({missing_gt} images had no GT label)"
+            if gt_skipped:
+                complete_msg += f" ({gt_skipped} GT lines skipped)"
             eval_state.update(running=False, msg=complete_msg)
             _auto_save_results()
         except Exception as e:
@@ -673,6 +751,7 @@ class EvalRequest(BaseModel):
     img_dir: str
     label_dir: str
     conf: float = 0.25
+    averaging: str = "micro"           # P/R/F1 pooling: "micro" (legacy) | "macro"
 
 
 @router.post("/api/evaluation/run")
@@ -698,8 +777,9 @@ async def run_evaluation(req: EvalRequest):
             img_files.extend(glob.glob(os.path.join(img_dir, e)))
         img_files.sort()
 
-        # Load GT — 손상된 라벨 라인은 건너뜀 (EVAL-05).
+        # Load GT — 손상된 라벨 라인은 건너뜀 (EVAL-05). 라벨 파일 부재도 카운트.
         gt_data = {}
+        missing_gt = 0
         for fp in img_files:
             stem = os.path.splitext(os.path.basename(fp))[0]
             txt = os.path.join(label_dir, stem + ".txt")
@@ -714,7 +794,12 @@ async def run_evaluation(req: EvalRequest):
                             boxes.append((int(parts[0]), *map(float, parts[1:5])))
                         except ValueError:
                             continue
+            else:
+                missing_gt += 1
             gt_data[stem] = boxes
+
+        # GT가 한 장도 없으면 모든 예측이 FP로 채점됨 — 무의미한 0 mAP에 경고를 동봉.
+        warnings = _gt_missing_warnings(missing_gt, len(img_files), label_dir)
 
         results = []
         for model_path in model_paths:
@@ -738,7 +823,7 @@ async def run_evaluation(req: EvalRequest):
                         boxes.append((int(cid), cx, cy, bw, bh, float(score)))
                     pred_data[stem] = boxes
 
-                res50 = evaluate_dataset(gt_data, pred_data, 0.5)
+                res50 = evaluate_dataset(gt_data, pred_data, 0.5, averaging=req.averaging)
                 map5095 = evaluate_map50_95(gt_data, pred_data)
                 ov = res50.get("__overall__", {})
                 results.append({
@@ -748,6 +833,9 @@ async def run_evaluation(req: EvalRequest):
                     "precision": round(ov.get("precision", 0) * 100, 4),
                     "recall": round(ov.get("recall", 0) * 100, 4),
                     "f1": round(ov.get("f1", 0) * 100, 4),
+                    "averaging": req.averaging,
+                    "missing_gt_files": missing_gt,
+                    "warnings": list(warnings),
                 })
             except Exception as e:
                 results.append({"name": name, "error": str(e),

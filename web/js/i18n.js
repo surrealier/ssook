@@ -145,7 +145,10 @@ const I18n = {
     'viewer.csv_rec':       { en: 'CSV Record', ko: 'CSV 기록' },
     'viewer.csv_export':    { en: 'CSV Export', ko: 'CSV 저장' },
     'viewer.vlm_unsupported': { en: 'VLM models are not supported in the viewer. Use the VLM tab.', ko: 'VLM 모델은 뷰어에서 지원되지 않습니다. VLM 탭을 사용하세요.' },
+    'viewer.embedding_unsupported': { en: 'Embedding/CLIP models are not supported in the viewer. Use the Embedder/CLIP tab.', ko: '임베딩/CLIP 모델은 뷰어에서 지원되지 않습니다. 임베더/CLIP 탭을 사용하세요.' },
+    'viewer.cannot_open_video': { en: 'Cannot open the video/image — check the path and codec.', ko: '비디오/이미지를 열 수 없습니다 — 경로와 코덱을 확인하세요.' },
     'viewer.stream_error':  { en: 'Stream error', ko: '스트림 오류' },
+    'viewer.fps':           { en: 'FPS: {n}', ko: 'FPS: {n}' },
     // Settings
     'settings.model':       { en: 'Model',              ko: '모델' },
     'settings.display':     { en: 'Display',            ko: '표시' },
@@ -174,6 +177,7 @@ const I18n = {
     'bench.running':   { en: 'Benchmark running...', ko: '벤치마크 실행 중...' },
     'bench.complete':  { en: 'Benchmark complete',   ko: '벤치마크 완료' },
     'bench.no_models': { en: 'No models selected',   ko: '모델이 선택되지 않음' },
+    'bench.no_results': { en: 'No results — all models failed to load or run.', ko: '결과 없음 — 모든 모델의 로드/실행이 실패했습니다.' },
     'bench.add_hint':  { en: 'Click "Add Model" to add benchmark slots', ko: '"모델 추가"를 클릭하여 벤치마크 슬롯을 추가하세요' },
     'bench.run_hint':  { en: 'Run a benchmark to see results', ko: '벤치마크를 실행하여 결과를 확인하세요' },
     // Evaluation
@@ -205,6 +209,9 @@ const I18n = {
     'explorer.view_size_dist':   { en: 'Box Size Dist.',      ko: '박스 크기 분포' },
     'explorer.view_aspect_dist': { en: 'Image Aspect Ratio',  ko: '이미지 종횡비 분포' },
     'explorer.view_box_aspect_dist': { en: 'Box Aspect Ratio', ko: '박스 종횡비 분포' },
+    'explorer.thumbs':     { en: 'Thumbnails',  ko: '썸네일' },
+    'explorer.thumbs_show': { en: 'Show thumbnails', ko: '썸네일 표시' },
+    'explorer.thumb_failed': { en: 'preview unavailable', ko: '미리보기 불가' },
     // Splitter
     'splitter.input':      { en: 'Input Dataset',     ko: '입력 데이터셋' },
     'splitter.output':     { en: 'Output Directory',  ko: '출력 디렉토리' },
@@ -220,6 +227,12 @@ const I18n = {
     'splitter.strategy_stratified':      { en: 'Stratified', ko: '층화 분할' },
     'splitter.strategy_random_desc':     { en: 'Randomly shuffle and split images by ratio.', ko: '이미지를 랜덤으로 섞어 비율대로 분할합니다.' },
     'splitter.strategy_stratified_desc': { en: 'Split while preserving class distribution balance.', ko: '클래스 분포 균형을 유지하며 분할합니다.' },
+    'splitter.options':    { en: 'Options', ko: '옵션' },
+    'splitter.seed':       { en: 'Random Seed', ko: '랜덤 시드' },
+    'splitter.seed_hint':  { en: 'Leave blank for a non-reproducible split', ko: '비워두면 매번 다른 분할이 됩니다' },
+    'splitter.overwrite':  { en: 'Overwrite existing output (clear train/val/test first)', ko: '기존 출력 덮어쓰기 (train/val/test 먼저 비움)' },
+    'splitter.output_not_empty': { en: 'Output directory already contains splits ({splits}). Enable "Overwrite" to replace them.', ko: '출력 디렉토리에 이미 분할 결과가 있습니다 ({splits}). "덮어쓰기"를 활성화하면 교체됩니다.' },
+    'splitter.missing_labels': { en: '{n} image(s) had no matching label file', ko: '라벨 파일이 없는 이미지 {n}개' },
     // Generic tab
     'tab.coming_soon':     { en: 'Full implementation coming soon', ko: '전체 구현 예정' },
     // Common UI labels (tabs-extra)
@@ -230,6 +243,7 @@ const I18n = {
     'common.no_results':   { en: 'No results',        ko: '결과 없음' },
     // Analysis tab labels
     'analysis.conf_opt':   { en: 'Confidence Threshold Optimizer', ko: 'Confidence 임계값 최적화' },
+    'analysis.conf':       { en: 'Confidence', ko: '신뢰도 임계값' },
     'analysis.embedding':  { en: 'Embedding Visualization',        ko: '임베딩 시각화' },
     'analysis.error':      { en: 'Error Analysis',    ko: '오탐/미탐 분석' },
     'analysis.model_cmp':  { en: 'Model Compare',     ko: '모델 비교' },
