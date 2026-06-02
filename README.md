@@ -17,7 +17,20 @@
 <img src="docs/screenshots/screenshot_00_Viewer.png" width="800" alt="ssook Screenshot" />
 
 </div>
+---
 
+## Demo
+
+<div align="center">
+  <img src="docs/screenshots/demo.gif" width="800" alt="ssook demo GIF" />
+</div>
+
+## Screenshots
+
+<div align="center">
+  <img src="docs/screenshots/screenshot_00_Viewer.png" width="48%" alt="ssook inference viewer" />
+  <img src="docs/screenshots/AIO_Viewer.png" width="48%" alt="ssook all-in-one viewer" />
+</div>
 ---
 
 ## Do You Need…?
