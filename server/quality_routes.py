@@ -260,6 +260,10 @@ async def quality_duplicate(req: QualityDirRequest):
         imgs = glob_images(img_dir, recursive=recursive)
         dup_state["total"] = len(imgs)
         names: list[str] = []
+        # Path relative to img_dir uniquely identifies a file under a recursive
+        # scan, where two same-named images in different subfolders share a
+        # basename and are otherwise indistinguishable / un-actionable (QUAL P1).
+        rels: list[str] = []
         hashes: list[int] = []
         skipped = 0
         for i, fp in enumerate(imgs):
@@ -271,6 +275,7 @@ async def quality_duplicate(req: QualityDirRequest):
                 skipped += 1
             else:
                 names.append(os.path.basename(fp))
+                rels.append(os.path.relpath(fp, img_dir))
                 hashes.append(_dhash(frame))
             dup_state["progress"] = i + 1
         dup_state["msg"] = "Comparing..."
@@ -278,7 +283,11 @@ async def quality_duplicate(req: QualityDirRequest):
         # instead of a per-pair counter that never expressed clusters (QUAL-05).
         groups = _cluster_near_duplicates(hashes, threshold)
         pairs = _find_near_duplicates(hashes, threshold)
+        # image_a/image_b stay as basenames for back-compat; rel_a/rel_b carry
+        # the subfolder-qualified path so the frontend can resolve thumbnails
+        # and the user can act on the right file under a recursive scan.
         results = [{"group": groups[i], "image_a": names[i], "image_b": names[j],
+                    "rel_a": rels[i], "rel_b": rels[j],
                     "distance": _core_hamming(hashes[i], hashes[j])}
                    for i, j in pairs[:DUP_CAP]]
         total_found = len(pairs)
@@ -340,7 +349,12 @@ async def quality_leaky(req: LeakyRequest):
                 if frame is None:
                     skipped += 1
                 else:
-                    hashes[os.path.basename(fp)] = _dhash(frame)
+                    # Key by path relative to the split root, not basename: a
+                    # recursive scan of train/images/ + train/labels/ can hold
+                    # two same-named files in different subfolders. Basename keys
+                    # collided (later overwrote earlier), under-counting leaks
+                    # and pointing the user at the wrong file (QUAL P1).
+                    hashes[os.path.relpath(fp, dirs[name])] = _dhash(frame)
                 done += 1
                 leaky_state["progress"] = done
             split_hashes[name] = hashes
@@ -348,13 +362,16 @@ async def quality_leaky(req: LeakyRequest):
                 break
         results = []
         names = list(split_hashes.keys())
+        # Hard cap on the per-pair sample list — the full match set can be huge,
+        # but the status payload is polled every second so it must stay small.
+        FILE_SAMPLE_CAP = 10
         for i in range(len(names)):
             for j in range(i+1, len(names)):
                 # Build a BKTree over split B's hashes once, then query each of
                 # split A's hashes within `threshold` — O(M log N) instead of the
                 # old O(MxN) all-pairs Hamming scan that froze on real splits
-                # (LEAKY scale P1). Keep a parallel (file, hash) list so query
-                # indices map back to filenames for the sample list.
+                # (LEAKY scale P1). Keep a parallel (rel_path, hash) list so query
+                # indices map back to the subfolder-qualified path for the sample.
                 b_items = list(split_hashes[names[j]].items())
                 b_tree = _BKTree().build([h for _, h in b_items])
                 dupes = 0
@@ -362,9 +379,16 @@ async def quality_leaky(req: LeakyRequest):
                 for fa, ha in split_hashes[names[i]].items():
                     for b_idx in b_tree.query(ha, threshold):
                         dupes += 1
-                        if len(files) < 10:
+                        if len(files) < FILE_SAMPLE_CAP:
                             files.append(f"{fa} ↔ {b_items[b_idx][0]}")
-                results.append({"pair": f"{names[i]} ↔ {names[j]}", "duplicates": dupes, "files": "; ".join(files)})
+                files_str = "; ".join(files)
+                # Tell the user the sample is partial instead of silently dropping
+                # the rest — "showing 10 of 137" so a capped list isn't mistaken
+                # for the full leak set (QUAL-09 parity with the other tools).
+                if dupes > len(files):
+                    files_str += f" … (showing {len(files)} of {dupes})"
+                results.append({"pair": f"{names[i]} ↔ {names[j]}", "duplicates": dupes,
+                                "files": files_str})
         leaky_state["results"] = results
         leaky_state["skipped"] = skipped
         msg = "Complete"

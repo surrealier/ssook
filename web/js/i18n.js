@@ -160,6 +160,7 @@ const I18n = {
     'settings.show_labels': { en: 'Show Labels',        ko: '라벨 표시' },
     'settings.show_conf':   { en: 'Show Confidence',    ko: '신뢰도 표시' },
     'settings.saved':       { en: 'Settings saved',     ko: '설정 저장됨' },
+    'settings.saving':      { en: 'Saving…',            ko: '저장 중…' },
     'settings.batch_size':  { en: 'Batch Size',         ko: '배치 크기' },
     'settings.class_table': { en: 'Per-class Settings', ko: '클래스별 설정' },
     'settings.enabled':     { en: 'Enabled',            ko: '활성화' },

@@ -676,36 +676,39 @@ Tabs.settings = {
         <th style="padding:4px 6px;">${t('settings.thickness')}</th>
       </tr></thead><tbody>${rows}</tbody></table></div>`;
   },
+  // Read one row's color+thickness into the backend's style shape (BGR triple).
+  _readClassStyle(clsId, enabled) {
+    const co = document.querySelector(`.cls-color[data-cls="${clsId}"]`);
+    const th = document.querySelector(`.cls-thick[data-cls="${clsId}"]`);
+    const hex = co?.value || '#00ff00';
+    const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+    return { class_id: clsId, enabled, color: [b, g, r], thickness: +(th?.value||0) };
+  },
+  // Single-row edits keep using the per-class endpoint (one cheap round trip).
   async _onClassChange(clsId) {
     const en = document.querySelector(`.cls-enabled[data-cls="${clsId}"]`);
     const co = document.querySelector(`.cls-color[data-cls="${clsId}"]`);
-    const th = document.querySelector(`.cls-thick[data-cls="${clsId}"]`);
     if (!en || !co) return;
-    const hex = co.value;
-    const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
     try {
-      await API.post('/api/config/class-style', {
-        class_id: clsId, enabled: en.checked,
-        color: [b, g, r], thickness: +(th?.value||0),
-      });
+      await API.post('/api/config/class-style', this._readClassStyle(clsId, en.checked));
     } catch(e) {}
   },
+  // "Select/Deselect All" touches every row, so batch the changes into ONE
+  // POST instead of N (the old loop cost N × ~100ms round trips).
   async _toggleAllClasses(enabled) {
     const checkboxes = document.querySelectorAll('.cls-enabled');
+    const styles = [];
     for (const cb of checkboxes) {
       cb.checked = enabled;
-      const clsId = +cb.dataset.cls;
-      const co = document.querySelector(`.cls-color[data-cls="${clsId}"]`);
-      const th = document.querySelector(`.cls-thick[data-cls="${clsId}"]`);
-      const hex = co?.value || '#00ff00';
-      const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
-      try {
-        await API.post('/api/config/class-style', {
-          class_id: clsId, enabled,
-          color: [b, g, r], thickness: +(th?.value||0),
-        });
-      } catch(e) {}
+      styles.push(this._readClassStyle(+cb.dataset.cls, enabled));
     }
+    if (!styles.length) return;
+    App.setStatus(t('settings.saving'));
+    try {
+      const res = await API.post('/api/config/class-styles', { styles });
+      if (res && res.error) App.setStatus(`Error: ${res.error}`);
+      else App.setStatus(t('settings.saved'));
+    } catch(e) { App.setStatus(`Error: ${e.message}`); }
   },
   async save() {
     try {

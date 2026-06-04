@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 import cv2
 
 from server import quality_routes
-from server.state import anomaly_state, leaky_state, sim_state
+from server.state import anomaly_state, dup_state, leaky_state, sim_state
 
 
 @pytest.fixture
@@ -266,6 +266,112 @@ def test_similarity_query_ranks_exact_copy_first(client, tmp_path):
     assert dists == sorted(dists)
     _reset(sim_state)
     sim_state.pop("index", None)
+
+
+# ── duplicate: same-basename files in different subdirs are distinguishable (P1) ──
+
+def test_duplicate_recursive_distinguishes_same_basename_via_relpath(client, tmp_path):
+    """Two images named a.png in different subfolders both duplicate a third.
+    Under a recursive scan their basenames collide, so the result rows must
+    carry rel_a/rel_b paths that uniquely identify which a.png is which —
+    otherwise the pair is un-actionable for the frontend."""
+    _reset(dup_state)
+    img_dir = tmp_path / "imgs"
+    sub1 = img_dir / "sub1"
+    sub2 = img_dir / "sub2"
+    sub1.mkdir(parents=True)
+    sub2.mkdir(parents=True)
+    # Identical bytes in two different subdirs, both named "a.png" → distance 0.
+    src = np.zeros((8, 8, 3), dtype=np.uint8)
+    src[0, ::2] = 255  # a row pattern so the dHash is non-trivial
+    cv2.imwrite(str(sub1 / "a.png"), src)
+    cv2.imwrite(str(sub2 / "a.png"), src)
+
+    resp = client.post("/api/quality/duplicate",
+                       json={"img_dir": str(img_dir), "threshold": 0, "recursive": True})
+    assert resp.json() == {"ok": True}
+    data = _wait_until_done(client, "/api/quality/duplicate/status")
+    assert data["running"] is False
+    assert len(data["results"]) >= 1
+    row = data["results"][0]
+    # Back-compat: basename keys still present.
+    assert row["image_a"] == "a.png" and row["image_b"] == "a.png"
+    # New rel-path keys distinguish the two same-named files by subfolder.
+    rels = {row["rel_a"], row["rel_b"]}
+    # normpath so the assertion is OS-separator agnostic.
+    assert os.path.normpath("sub1/a.png") in {os.path.normpath(r) for r in rels}
+    assert os.path.normpath("sub2/a.png") in {os.path.normpath(r) for r in rels}
+    assert row["rel_a"] != row["rel_b"]
+
+
+# ── leaky: rel path keys distinguish same-basename files across subdirs (P1) ──
+
+def test_leaky_recursive_uses_relpath_not_basename(client, tmp_path):
+    """A split that nests two same-named files under different subfolders must
+    not collapse them to one basename key. Both nested a.png in train leak to
+    the matching val copies, so the rel-path keying counts BOTH (a basename
+    dict would have kept only one) and the sample list shows the subfolders."""
+    _reset(leaky_state)
+    train_a = tmp_path / "train" / "dirA"
+    train_b = tmp_path / "train" / "dirB"
+    val_a = tmp_path / "val" / "dirA"
+    val_b = tmp_path / "val" / "dirB"
+    for d in (train_a, train_b, val_a, val_b):
+        d.mkdir(parents=True)
+    # Two DISTINCT images, each named a.png, under different subfolders.
+    _write_pattern_png(str(train_a / "a.png"), seed=7001)
+    _write_pattern_png(str(train_b / "a.png"), seed=7002)
+    # Exact copies on the val side → both leak across the split.
+    cv2.imwrite(str(val_a / "a.png"), cv2.imread(str(train_a / "a.png")))
+    cv2.imwrite(str(val_b / "a.png"), cv2.imread(str(train_b / "a.png")))
+
+    resp = client.post("/api/quality/leaky",
+                       json={"train_dir": str(tmp_path / "train"),
+                             "val_dir": str(tmp_path / "val"),
+                             "threshold": 0, "recursive": True})
+    assert resp.json() == {"ok": True}
+    data = _wait_until_done(client, "/api/quality/leaky/status")
+    assert data["running"] is False
+    rows = data["results"]
+    assert len(rows) == 1
+    # Both distinct a.png files are counted — a basename key would collapse to 1.
+    assert rows[0]["duplicates"] == 2
+    # The sample list carries subfolder-qualified paths, not bare "a.png".
+    files = rows[0]["files"]
+    assert os.path.join("dirA", "a.png") in files or "dirA/a.png" in files
+    assert os.path.join("dirB", "a.png") in files or "dirB/a.png" in files
+
+
+# ── leaky: capped sample list is annotated 'showing N of M' (QUAL-09) ──────────
+
+def test_leaky_sample_list_shows_count_when_capped(client, tmp_path):
+    """When a split-pair has more leaks than the 10-sample cap, the files string
+    must annotate 'showing 10 of <total>' instead of silently truncating."""
+    _reset(leaky_state)
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "val"
+    train_dir.mkdir()
+    val_dir.mkdir()
+    # 12 distinct images shared across both splits → 12 cross-split leaks > cap 10.
+    for k in range(12):
+        p = train_dir / f"img_{k}.png"
+        _write_pattern_png(str(p), seed=8000 + k)
+        cv2.imwrite(str(val_dir / f"img_{k}.png"), cv2.imread(str(p)))
+
+    resp = client.post("/api/quality/leaky",
+                       json={"train_dir": str(train_dir), "val_dir": str(val_dir),
+                             "threshold": 0, "recursive": False})
+    assert resp.json() == {"ok": True}
+    data = _wait_until_done(client, "/api/quality/leaky/status")
+    assert data["running"] is False
+    row = data["results"][0]
+    assert row["duplicates"] == 12
+    # Only 10 sampled pairs are listed, with an explicit "showing 10 of 12" note.
+    assert "showing 10 of 12" in row["files"]
+    sampled = [s for s in row["files"].split(" … ")[0].split("; ") if s]
+    assert len(sampled) == 10
+
+    _reset(leaky_state)
 
 
 def test_similarity_repeat_query_reuses_cache_no_rehash(client, tmp_path, monkeypatch):
