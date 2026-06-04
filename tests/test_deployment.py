@@ -296,3 +296,124 @@ class TestDeployRoutes:
         r = self._client().post("/api/deploy/run", json={
             "model_path": linear_onnx, "target": "onnxruntime_cpu", "workspace_gb": 0})
         assert "error" in r.json() and "workspace_gb" in r.json()["error"]
+
+
+# ── EP-isolated subprocess export routing (pure logic, mocked manager) ──────
+# These exercise the DECISION of when run_export dispatches to an EP venv vs
+# running in-process. No real worker is spawned and no backend (openvino /
+# coremltools) is imported — ep_manager is monkeypatched and the backend probe
+# is forced. Safe to run in the base/torch env.
+from core.deployment import runner as _runner
+
+
+class TestEpRouteDecision:
+    """_ep_route_for: which (target, env) combinations pick a subprocess EP."""
+
+    def _route(self, monkeypatch, target_name, *, importable, venv_available):
+        target = registry.get(target_name)
+        monkeypatch.setattr(_runner, "_backend_importable", lambda mod: importable)
+        # ep_manager.is_ep_available is consulted lazily inside _ep_route_for.
+        from core import ep_manager
+        monkeypatch.setattr(ep_manager, "is_ep_available", lambda key: venv_available)
+        return _runner._ep_route_for(target)
+
+    def test_openvino_routes_when_backend_missing_and_venv_present(self, monkeypatch):
+        assert self._route(monkeypatch, "openvino",
+                           importable=False, venv_available=True) == "openvino"
+
+    def test_coreml_routes_when_backend_missing_and_venv_present(self, monkeypatch):
+        assert self._route(monkeypatch, "coreml",
+                           importable=False, venv_available=True) == "coreml"
+
+    def test_no_route_when_backend_importable_in_process(self, monkeypatch):
+        # Backend already here -> keep the faster in-process export.
+        assert self._route(monkeypatch, "openvino",
+                           importable=True, venv_available=True) is None
+
+    def test_no_route_when_venv_absent(self, monkeypatch):
+        # Backend missing AND no venv -> in-process (yields today's clear
+        # "backend not installed" result).
+        assert self._route(monkeypatch, "openvino",
+                           importable=False, venv_available=False) is None
+
+    def test_in_process_targets_never_route(self, monkeypatch):
+        # ONNX-family / tensorrt / torchscript have no EP venv mapping; they
+        # must run in-process regardless of probe/venv state.
+        for name in ("onnxruntime_cpu", "onnxruntime_cuda", "onnxruntime_directml",
+                     "tensorrt", "torchscript"):
+            assert self._route(monkeypatch, name,
+                               importable=False, venv_available=True) is None
+
+    def test_route_survives_ep_manager_failure(self, monkeypatch):
+        # An ep_manager probe blowing up must never block the in-process path.
+        target = registry.get("openvino")
+        monkeypatch.setattr(_runner, "_backend_importable", lambda mod: False)
+        from core import ep_manager
+
+        def _boom(key):
+            raise RuntimeError("ep probe exploded")
+        monkeypatch.setattr(ep_manager, "is_ep_available", _boom)
+        assert _runner._ep_route_for(target) is None
+
+
+class TestRunExportDispatch:
+    """run_export wiring: dispatch to the mocked venv runner, fallback, and the
+    _in_process recursion guard. No subprocess is ever launched."""
+
+    def test_routes_to_venv_runner_and_returns_its_result(self, linear_onnx, monkeypatch):
+        # Force the openvino route, then assert run_export hands off to the
+        # subprocess helper and returns its payload verbatim (no in-process export).
+        monkeypatch.setattr(_runner, "_ep_route_for", lambda target: "openvino")
+        from core import ep_manager
+        calls = {}
+
+        def _fake_run(ep_key, config, on_progress=None):
+            calls["ep_key"] = ep_key
+            calls["config"] = config
+            return {"ok": True, "via": "subprocess", "target": config.get("target")}
+        monkeypatch.setattr(ep_manager, "run_export_in_venv", _fake_run)
+
+        result = _runner.run_export({
+            "model_path": linear_onnx, "target": "openvino",
+            "output_path": "/tmp/out.xml", "opts": {"precision": "fp32"},
+        })
+        assert result == {"ok": True, "via": "subprocess", "target": "openvino"}
+        assert calls["ep_key"] == "openvino"
+        # The routing flag must NOT leak into the forwarded config.
+        assert "_in_process" not in calls["config"]
+        assert calls["config"]["target"] == "openvino"
+
+    def test_in_process_flag_skips_routing(self, linear_onnx, monkeypatch):
+        # When _in_process is set (as the worker sets it), routing is bypassed
+        # entirely — _ep_route_for must not even be consulted.
+        def _should_not_run(target):
+            raise AssertionError("routing must be skipped when _in_process is set")
+        monkeypatch.setattr(_runner, "_ep_route_for", _should_not_run)
+        # onnxruntime_cpu runs a real (fast, in-process) export and succeeds.
+        out = os.path.join(os.path.dirname(linear_onnx), "viacpu.onnx")
+        result = _runner.run_export({
+            "model_path": linear_onnx, "target": "onnxruntime_cpu",
+            "output_path": out, "opts": {"precision": "fp32"}, "_in_process": True,
+        })
+        assert "error" not in result, result
+        assert os.path.isfile(out)
+
+    def test_dispatch_failure_falls_back_to_in_process(self, linear_onnx, monkeypatch):
+        # If the subprocess helper raises, run_export must fall through to the
+        # in-process attempt rather than hard-failing. Route a CPU export (which
+        # would normally never route) and make the helper explode.
+        monkeypatch.setattr(_runner, "_ep_route_for", lambda target: "openvino")
+        from core import ep_manager
+
+        def _boom(ep_key, config, on_progress=None):
+            raise RuntimeError("subprocess launch failed")
+        monkeypatch.setattr(ep_manager, "run_export_in_venv", _boom)
+
+        out = os.path.join(os.path.dirname(linear_onnx), "fallback.onnx")
+        result = _runner.run_export({
+            "model_path": linear_onnx, "target": "onnxruntime_cpu",
+            "output_path": out, "opts": {"precision": "fp32"},
+        })
+        # Fell back to the real in-process CPU export -> success.
+        assert "error" not in result, result
+        assert os.path.isfile(out)

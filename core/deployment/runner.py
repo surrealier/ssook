@@ -5,6 +5,7 @@ exactly like ``core.benchmark_runner`` and the optimization pipeline.
 """
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 from typing import Callable, Optional
@@ -13,6 +14,49 @@ from core.deployment.registry import registry
 from core.deployment.manifest import build_manifest, write_manifest
 
 log = logging.getLogger("ssook.deployment")
+
+# Export targets whose backend can't be co-installed with the base onnxruntime
+# (or needs OS/hardware the main env lacks) get their own EP venv. Map the
+# target's registry category to that venv key + the module the backend lives in.
+# Targets NOT in this map (onnxruntime CPU/CUDA/DirectML, tensorrt, torchscript)
+# always run in-process — exactly today's behavior.
+_CATEGORY_TO_EP: dict[str, dict[str, str]] = {
+    "openvino": {"ep_key": "openvino", "probe": "openvino"},
+    "coreml": {"ep_key": "coreml", "probe": "coremltools"},
+}
+
+
+def _backend_importable(module: str) -> bool:
+    """Is ``module`` importable in THIS process? (no actual import / heavy load)."""
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _ep_route_for(target) -> Optional[str]:
+    """Decide the EP venv to dispatch ``target`` to, or None for in-process.
+
+    Routes to a subprocess ONLY when ALL hold:
+      * the target's category has a dedicated EP venv (openvino/coreml), AND
+      * that EP venv is actually installed on this host, AND
+      * the backend module is NOT importable in the current process.
+    Otherwise returns None and the caller runs today's in-process path. The
+    backend-importable check means that if the user already has the backend in
+    the current env, we keep the (faster, no-subprocess) in-process export.
+    """
+    spec = _CATEGORY_TO_EP.get(getattr(target, "category", ""))
+    if spec is None:
+        return None
+    if _backend_importable(spec["probe"]):
+        return None
+    try:
+        from core import ep_manager
+        if ep_manager.is_ep_available(spec["ep_key"]):
+            return spec["ep_key"]
+    except Exception as e:  # ep_manager problems must never block in-process export
+        log.debug("EP availability probe failed for %s: %s", spec["ep_key"], e)
+    return None
 
 
 def onnx_actual_opset(artifact_path: str) -> Optional[int]:
@@ -87,11 +131,37 @@ def run_export(
     model_path, target, output_path, opts{opset,batch,input_size,dynamic,
     precision,calibration_dir,device,workspace_gb,simplify,class_names},
     validate (default True), write_manifest (default True), model_meta.
+
+    ``_in_process`` (default False): when truthy, the EP-venv routing below is
+    skipped and the export runs in THIS process unconditionally. Set by the EP
+    worker so an already-dispatched export can't recurse into another worker.
     """
     target_name = config.get("target", "")
     target = registry.get(target_name)
     if target is None:
         return {"error": f"Unknown export target '{target_name}'", "target": target_name}
+
+    # Optional EP-isolated route: if the target's backend (openvino/coreml) is
+    # missing in this process but a matching EP venv exists, run the export in
+    # that venv's subprocess. This happens BEFORE is_available() because that
+    # check would otherwise reject the target for the very backend the venv has.
+    # Never hard-fail here: any dispatch problem falls through to the in-process
+    # attempt below, which yields today's clear "backend not installed" result.
+    if not config.get("_in_process"):
+        ep_key = _ep_route_for(target)
+        if ep_key:
+            try:
+                from core import ep_manager
+                log.info("export route: target=%s -> EP venv '%s' subprocess",
+                         target_name, ep_key)
+                # The subprocess re-runs run_export in-process; forward the
+                # config minus the routing flag (the worker re-adds it).
+                sub_config = {k: v for k, v in config.items() if k != "_in_process"}
+                return ep_manager.run_export_in_venv(ep_key, sub_config, on_progress=on_progress)
+            except Exception as e:
+                log.warning("EP-venv export dispatch failed (%s); falling back to in-process: %s",
+                            ep_key, e)
+                # Fall through to the in-process path.
 
     available, reason = target.is_available()
     if not available:

@@ -835,3 +835,177 @@ class TestStaticCalibPreprocessing:
         quantize_static(src, out, calibration_dir=tmp_dir, max_images=3,
                         preprocess=PreprocessSpec(use_letterbox=True))
         assert called["n"] >= 1  # letterbox used for every calibration image
+
+
+# ============================================================
+# Post-optimization accuracy validation — agreement metric math (PURE LOGIC)
+# These import only numpy via core.quantizer's metric helpers; safe to RUN.
+# ============================================================
+class TestAgreementMetricsPureLogic:
+    """compute_agreement_metrics / _cosine_similarity operate on plain numpy
+    output lists — no onnxruntime, no cv2 — so the math is verifiable here."""
+
+    def test_identical_outputs_perfect_agreement(self):
+        from core.quantizer import compute_agreement_metrics
+        a = [np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)]
+        m = compute_agreement_metrics(a, [x.copy() for x in a])
+        assert m["cosine"] == pytest.approx(1.0, abs=1e-6)
+        assert m["max_abs_diff"] == pytest.approx(0.0, abs=1e-6)
+        assert m["top1_match"] is True
+
+    def test_divergent_outputs_low_cosine(self):
+        # Anti-correlated vectors -> cosine near -1, top-1 differs.
+        from core.quantizer import compute_agreement_metrics
+        a = [np.array([[1.0, 2.0, 3.0, 10.0]], dtype=np.float32)]
+        b = [np.array([[10.0, 3.0, 2.0, 1.0]], dtype=np.float32)]
+        m = compute_agreement_metrics(a, b)
+        assert m["cosine"] < 0.9
+        assert m["top1_match"] is False
+        assert m["max_abs_diff"] == pytest.approx(9.0, abs=1e-6)
+
+    def test_cosine_similarity_zero_vectors(self):
+        from core.quantizer import _cosine_similarity
+        z = np.zeros(4, dtype=np.float32)
+        # Both zero -> treated as agreeing (avoids 0/0 NaN poisoning the mean).
+        assert _cosine_similarity(z, z) == 1.0
+        # One zero, one non-zero -> fully divergent.
+        assert _cosine_similarity(z, np.array([1.0, 0, 0, 0])) == 0.0
+
+    def test_shape_mismatch_marks_inf_diff(self):
+        # A pruned/quantized model that changes output shape is a strong
+        # degradation signal: max_abs_diff must surface as inf, not silently 0.
+        from core.quantizer import compute_agreement_metrics
+        a = [np.array([[1.0, 2.0, 3.0]], dtype=np.float32)]
+        b = [np.array([[1.0, 2.0]], dtype=np.float32)]
+        m = compute_agreement_metrics(a, b)
+        assert m["max_abs_diff"] == float("inf")
+
+    def test_empty_outputs_fail_closed(self):
+        from core.quantizer import compute_agreement_metrics
+        m = compute_agreement_metrics([], [])
+        assert m["cosine"] == 0.0
+        assert m["top1_match"] is False
+
+    def test_cosine_to_agreement_remap_range(self):
+        # The route/validator remaps cosine [-1,1] -> agreement [0,1] as
+        # (cosine + 1) / 2. Verify the boundary mapping the validator relies on.
+        from core.quantizer import compute_agreement_metrics
+        a = [np.array([[1.0, 0.0]], dtype=np.float32)]
+        same = compute_agreement_metrics(a, [a[0].copy()])
+        agreement = (same["cosine"] + 1.0) / 2.0
+        assert agreement == pytest.approx(1.0, abs=1e-6)
+
+    def test_default_threshold_exposed(self):
+        from core.quantizer import DEFAULT_AGREEMENT_THRESHOLD
+        assert 0.0 < DEFAULT_AGREEMENT_THRESHOLD <= 1.0
+        assert DEFAULT_AGREEMENT_THRESHOLD == 0.9
+
+
+# ============================================================
+# Post-optimization accuracy validation — end-to-end (ONNX/ORT; DO NOT RUN here)
+# These build real ONNX models and run onnxruntime CPU; deferred to the central
+# memory-managed test pass per the memory-safe protocol.
+# ============================================================
+def _make_divergent_conv_model(path: str, hw: int = 8):
+    """Same I/O as _make_fp32_conv_model but with weights * -1 and a bias shift,
+    so running it on the same inputs yields very different outputs (a stand-in
+    for a 'wrecked' optimization). Reuses the square-input fixed-I/O shape so the
+    validator can feed both models identical tensors."""
+    import onnx
+    from onnx import helper, TensorProto, numpy_helper
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 3, hw, hw])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4, hw, hw])
+    # Strong negative weights -> outputs anti-correlated with the original.
+    W = numpy_helper.from_array((np.ones((4, 3, 3, 3)) * -5.0).astype(np.float32), "W")
+    B = numpy_helper.from_array((np.ones(4) * 7.0).astype(np.float32), "B")
+    conv = helper.make_node("Conv", ["X", "W", "B"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    relu = helper.make_node("Relu", ["c"], ["Y"])
+    g = helper.make_graph([conv, relu], "divergent_conv", [X], [Y], [W, B])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+    m.ir_version = 8
+    onnx.save(m, path)
+    return path
+
+
+class TestValidateOptimizationE2E:
+    """DO NOT RUN in the memory-safe pass — uses onnxruntime. The agreement math
+    these assert against is already covered by TestAgreementMetricsPureLogic."""
+
+    def test_identical_model_high_agreement(self, tmp_dir, import_cv2):
+        from core.quantizer import validate_optimization
+        _make_square_image_dir(tmp_dir, n=4)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "val_src.onnx"))
+        # An exact copy is a no-op "optimization" -> agreement ~1.0, not degraded.
+        import shutil as _sh
+        dst = os.path.join(tmp_dir, "val_copy.onnx")
+        _sh.copy2(src, dst)
+        result = validate_optimization(src, dst, sample_dir=tmp_dir, max_images=4)
+        assert result["validated"] is True
+        assert result["n_images"] == 4
+        assert result["agreement"] >= 0.99
+        assert result["degraded"] is False
+        # Original path is preserved for fallback.
+        assert result["original_path"] == src
+
+    def test_wrecked_model_flagged_degraded(self, tmp_dir, import_cv2):
+        from core.quantizer import validate_optimization
+        _make_square_image_dir(tmp_dir, n=4)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "val_src2.onnx"))
+        wrecked = _make_divergent_conv_model(os.path.join(tmp_dir, "val_wrecked.onnx"))
+        result = validate_optimization(src, wrecked, sample_dir=tmp_dir,
+                                       max_images=4, threshold=0.9)
+        assert result["validated"] is True
+        assert result["degraded"] is True
+        assert result["agreement"] < 0.9
+
+    def test_no_sample_images_fails_closed(self, tmp_dir, import_cv2):
+        from core.quantizer import validate_optimization
+        # Empty dir (no images) -> validated False, never a false "good".
+        empty = os.path.join(tmp_dir, "empty")
+        os.makedirs(empty, exist_ok=True)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "val_src3.onnx"))
+        result = validate_optimization(src, src, sample_dir=empty)
+        assert result["validated"] is False
+        assert result["n_images"] == 0
+
+    def test_result_keys_contract(self, tmp_dir, import_cv2):
+        from core.quantizer import validate_optimization
+        _make_square_image_dir(tmp_dir, n=2)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "val_src4.onnx"))
+        result = validate_optimization(src, src, sample_dir=tmp_dir, max_images=2)
+        for key in ("validated", "agreement", "threshold", "degraded",
+                    "n_images", "max_abs_diff", "top1_agreement", "original_path"):
+            assert key in result
+
+
+class TestPipelineValidationE2E:
+    """DO NOT RUN — pipeline + onnxruntime validation wiring."""
+
+    def test_validate_off_by_default(self, linear_model, tmp_dir):
+        # Default behaviour unchanged: no validation key unless requested.
+        pipe = OptimizationPipeline(registry)
+        pipe.add_step("weight_pruning", sparsity_ratio=0.1)
+        out = os.path.join(tmp_dir, "pipe_noval.onnx")
+        result = pipe.run(linear_model, out)
+        assert "validation" not in result
+
+    def test_validate_runs_when_requested(self, tmp_dir, import_cv2):
+        _make_square_image_dir(tmp_dir, n=3)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "pipe_val_src.onnx"))
+        pipe = OptimizationPipeline(registry)
+        pipe.add_step("dead_node_eliminator")  # near-lossless -> high agreement
+        out = os.path.join(tmp_dir, "pipe_val_out.onnx")
+        result = pipe.run(src, out, validate=True, sample_dir=tmp_dir,
+                          validate_max_images=3)
+        assert "validation" in result
+        assert result["validation"]["validated"] is True
+        assert result["validation"]["degraded"] is False
+
+    def test_validate_without_sample_dir_skips(self, tmp_dir, import_cv2):
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "pipe_val_src2.onnx"))
+        pipe = OptimizationPipeline(registry)
+        pipe.add_step("dead_node_eliminator")
+        out = os.path.join(tmp_dir, "pipe_val_out2.onnx")
+        # validate=True but no sample_dir -> the pipeline skips (no validation key).
+        result = pipe.run(src, out, validate=True, sample_dir="")
+        assert "validation" not in result

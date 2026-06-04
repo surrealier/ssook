@@ -1,5 +1,6 @@
 """ONNX Model Quantizer — Dynamic / Static INT8 / FP16 conversion."""
 import glob
+import logging
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -7,6 +8,14 @@ from typing import Optional
 import cv2
 import numpy as np
 import onnxruntime as ort
+
+_log = logging.getLogger(__name__)
+
+# Below this agreement an optimized model is assumed to have lost meaningful
+# accuracy and is flagged degraded so the caller can warn / discard. 0.9 is a
+# deliberately loose default: destructive INT8/pruning should clear it easily on
+# a behaving model, while a wrecked one (random-ish outputs) falls well under.
+DEFAULT_AGREEMENT_THRESHOLD = 0.9
 
 try:
     from onnxruntime.quantization import CalibrationDataReader as _CalibBase
@@ -319,4 +328,179 @@ def convert_fp16(model_path: str, output_path: str) -> dict:
         "quantized_size_mb": round(new_size / 1024 / 1024, 2),
         "compression_ratio": round(orig_size / max(new_size, 1), 2),
         "output_path": output_path,
+    }
+
+
+# ── Post-optimization accuracy validation ───────────────
+# Destructive optimizations (INT8 quant, pruning) can silently wreck a model:
+# the artifact still loads and runs, but its outputs diverge from the original.
+# Without ground-truth labels we can't measure true accuracy, so we measure
+# *agreement* — how closely the optimized model reproduces the original model's
+# own outputs on the same inputs. High agreement => the optimization preserved
+# behaviour; low agreement => it changed what the model does, regardless of
+# whether the original was "correct". This is a generic proxy that works for any
+# task (detection, classification, embedding) without GT.
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Cosine similarity of two flattened output tensors, in [-1, 1].
+
+    Zero-norm vectors (all-zero outputs) are treated as perfectly agreeing when
+    both are zero, else as fully divergent — avoids a 0/0 NaN that would poison
+    the mean.
+    """
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    # Differing element counts (e.g. a pruned model changed an output's size)
+    # can't be aligned for a dot product — that is itself full divergence.
+    if a.shape != b.shape:
+        return 0.0
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na == 0.0 or nb == 0.0:
+        return 1.0 if na == 0.0 and nb == 0.0 else 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def compute_agreement_metrics(orig_outputs: list, opt_outputs: list) -> dict:
+    """Compare one inference's outputs from the original vs optimized model.
+
+    Pure numpy — no onnxruntime — so the metric math is unit-testable on plain
+    arrays. Both inputs are lists of output tensors (the value `session.run`
+    returns). Returns per-sample stats:
+      - cosine: mean cosine similarity across the model's output tensors
+        (a generic numeric 'how aligned are the raw outputs' in [-1, 1]).
+      - max_abs_diff: largest absolute elementwise difference across outputs
+        (catches blow-ups even when cosine stays high).
+      - top1_match: True iff argmax of the first output agrees — meaningful for
+        classifiers, harmless (just one signal) otherwise.
+    """
+    if not orig_outputs or not opt_outputs:
+        return {"cosine": 0.0, "max_abs_diff": float("inf"), "top1_match": False}
+
+    n = min(len(orig_outputs), len(opt_outputs))
+    cosines: list[float] = []
+    max_abs = 0.0
+    for i in range(n):
+        a = np.asarray(orig_outputs[i], dtype=np.float64)
+        b = np.asarray(opt_outputs[i], dtype=np.float64)
+        cosines.append(_cosine_similarity(a, b))
+        if a.shape == b.shape and a.size:
+            max_abs = max(max_abs, float(np.max(np.abs(a - b))))
+        else:
+            # Shape divergence is itself a strong degradation signal.
+            max_abs = float("inf")
+
+    a0 = np.asarray(orig_outputs[0]).ravel()
+    b0 = np.asarray(opt_outputs[0]).ravel()
+    top1_match = bool(a0.size and b0.size and int(np.argmax(a0)) == int(np.argmax(b0)))
+
+    return {
+        "cosine": float(np.mean(cosines)) if cosines else 0.0,
+        "max_abs_diff": max_abs,
+        "top1_match": top1_match,
+    }
+
+
+def _calibration_image_paths(image_dir: str, max_images: int) -> list[str]:
+    """Collect up to `max_images` image paths, mirroring the calib reader."""
+    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+    paths: list[str] = []
+    for e in exts:
+        paths.extend(glob.glob(os.path.join(image_dir, e)))
+    return sorted(paths)[:max_images]
+
+
+def validate_optimization(original_path: str, optimized_path: str,
+                          sample_dir: str, max_images: int = 16,
+                          threshold: float = DEFAULT_AGREEMENT_THRESHOLD,
+                          preprocess: Optional[PreprocessSpec] = None,
+                          use_letterbox: Optional[bool] = None) -> dict:
+    """Run original + optimized ONNX on the SAME N images and score agreement.
+
+    Both models are run under onnxruntime CPU on identical preprocessed inputs
+    (reusing `_AutoCalibrationReader` so the feed matches the deployment/calib
+    pipeline). The per-image agreement is averaged into a single `agreement` in
+    [0, 1] (cosine remapped from [-1, 1] so a "% similar" reads naturally). When
+    `agreement < threshold` the result is marked `degraded` — the caller should
+    warn or discard rather than silently presenting the optimized model as good.
+    The original artifact is never touched, so its path stays available.
+
+    Returns: {validated, agreement, threshold, degraded, n_images,
+              max_abs_diff, top1_agreement, original_path}. On any failure this
+      returns {validated: False, error: ...} — validation must never block or
+      mask the optimization itself; the caller catches/reports.
+    """
+    image_paths = _calibration_image_paths(sample_dir, max_images)
+    if not image_paths:
+        return {"validated": False, "error": "No sample images found",
+                "n_images": 0, "threshold": threshold,
+                "original_path": original_path}
+
+    # Reuse the calibration reader to produce inputs that match how the model is
+    # actually fed; both sessions consume the exact same tensors.
+    reader = _AutoCalibrationReader(original_path, sample_dir, max_images,
+                                    use_letterbox=use_letterbox, spec=preprocess)
+
+    sess_opts = ort.SessionOptions()
+    orig_sess = ort.InferenceSession(original_path, sess_opts,
+                                     providers=["CPUExecutionProvider"])
+    opt_sess = ort.InferenceSession(optimized_path, sess_opts,
+                                    providers=["CPUExecutionProvider"])
+
+    agreements: list[float] = []
+    max_abs_diff = 0.0
+    top1_matches = 0
+    n_scored = 0
+
+    reader.rewind()
+    while True:
+        feed = reader.get_next()
+        if feed is None:
+            break
+        try:
+            orig_out = orig_sess.run(None, feed)
+            # The optimized model may expect a different input dtype (e.g. an
+            # fp16 graph keeps fp32 I/O, but a re-typed input would differ);
+            # feed by the optimized model's own input name to stay robust.
+            opt_feed = {opt_sess.get_inputs()[0].name: list(feed.values())[0]}
+            opt_out = opt_sess.run(None, opt_feed)
+        except Exception as run_err:  # noqa: BLE001 — per-image failure is non-fatal
+            _log.warning("validate_optimization: inference failed on a sample: %s", run_err)
+            continue
+
+        m = compute_agreement_metrics(orig_out, opt_out)
+        # Remap cosine [-1, 1] -> [0, 1] so 'agreement' reads as a similarity %.
+        agreements.append((m["cosine"] + 1.0) / 2.0)
+        if m["max_abs_diff"] != float("inf"):
+            max_abs_diff = max(max_abs_diff, m["max_abs_diff"])
+        else:
+            max_abs_diff = float("inf")
+        if m["top1_match"]:
+            top1_matches += 1
+        n_scored += 1
+
+    if n_scored == 0:
+        return {"validated": False, "error": "No samples could be scored",
+                "n_images": 0, "threshold": threshold,
+                "original_path": original_path}
+
+    agreement = float(np.mean(agreements))
+    degraded = agreement < threshold
+    if degraded:
+        _log.warning(
+            "validate_optimization: agreement %.4f < threshold %.4f over %d images "
+            "— optimized model may be degraded (%s)",
+            agreement, threshold, n_scored, optimized_path)
+    return {
+        "validated": True,
+        "agreement": round(agreement, 4),
+        "threshold": threshold,
+        "degraded": degraded,
+        "n_images": n_scored,
+        "max_abs_diff": (None if max_abs_diff == float("inf")
+                         else round(max_abs_diff, 6)),
+        "top1_agreement": round(top1_matches / n_scored, 4),
+        # Keep the untouched original available so the caller can fall back to it.
+        "original_path": original_path,
     }

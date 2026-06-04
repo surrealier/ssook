@@ -808,8 +808,66 @@ def _make_batch_tensor(tensor: np.ndarray, bs: int, model_info: ModelInfo) -> np
     return buf
 
 
+def _infer_downscale(frame: np.ndarray, infer_max_side: int) -> "tuple[np.ndarray, float, tuple]":
+    """Downscale a frame for inference when its longer side exceeds infer_max_side.
+
+    WHY: the viewer's stream_max_height only shrinks the OUTPUT jpeg AFTER full-res
+    inference, so 4K inference cost is unchanged. Running inference on a smaller
+    copy cuts preprocess+forward cost; detections are mapped back to the original
+    frame afterwards via `_rescale_detection_result`.
+
+    Returns (frame_for_inference, scale, orig_shape). `scale` is the single
+    isotropic factor applied to both axes (longer-side fit preserves aspect), so
+    original_coord = inferred_coord / scale. When the frame already fits (or
+    infer_max_side <= 0), returns the frame unchanged with scale=1.0.
+    """
+    orig_shape = frame.shape
+    if infer_max_side <= 0:
+        return frame, 1.0, orig_shape
+    h, w = orig_shape[:2]
+    longer = max(h, w)
+    if longer <= infer_max_side:
+        return frame, 1.0, orig_shape
+    scale = infer_max_side / longer
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    # INTER_AREA is the right filter for downsampling (avoids aliasing); the model
+    # sees a clean shrunk image rather than a subsampled one.
+    small = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return small, scale, orig_shape
+
+
+def _rescale_detection_result(result: DetectionResult, scale: float,
+                              orig_shape: tuple) -> DetectionResult:
+    """Map a DetectionResult produced on a downscaled frame back to original coords.
+
+    `scale` is the factor the frame was multiplied by before inference (see
+    `_infer_downscale`); original_coord = inferred_coord / scale. Returns a NEW
+    DetectionResult with rescaled+clipped boxes (does NOT mutate the input) so the
+    seq_ stride cache — which holds the pre-rescale result — is never double-scaled
+    on a subsequent skip frame. A no-op pass-through when scale==1.0 (the
+    default/today's path), so behavior is unchanged when infer_max_side is unset.
+    """
+    if scale == 1.0 or len(result.boxes) == 0:
+        return result
+    oh, ow = orig_shape[:2]
+    boxes = result.boxes / scale
+    boxes[:, 0] = np.clip(boxes[:, 0], 0, ow)
+    boxes[:, 1] = np.clip(boxes[:, 1], 0, oh)
+    boxes[:, 2] = np.clip(boxes[:, 2], 0, ow)
+    boxes[:, 3] = np.clip(boxes[:, 3], 0, oh)
+    return DetectionResult(
+        boxes=boxes.astype(np.float32),
+        scores=result.scores,
+        class_ids=result.class_ids,
+        infer_ms=result.infer_ms,
+        extra_attrs=result.extra_attrs,
+    )
+
+
 def run_inference(model_info: ModelInfo, frame: np.ndarray,
-                  conf: float, seq_state: "dict | None" = None) -> DetectionResult:
+                  conf: float, seq_state: "dict | None" = None,
+                  infer_max_side: int = 0) -> DetectionResult:
     """단일 프레임 추론.
 
     seq_state: optional per-stream sequential-state dict (frame buffer / stride
@@ -817,10 +875,22 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
     None, sequential state falls back to attrs on the shared ModelInfo singleton
     (legacy single-stream behavior). The viewer passes a per-session dict so two
     concurrent streams of the same seq model do not corrupt each other.
+
+    infer_max_side: optional inference-input downscale cap (longer-side pixels).
+    0/None (default) = today's behavior = inference at full frame resolution. When
+    >0 and the frame's longer side exceeds it, inference runs on a downscaled copy
+    and the resulting boxes are rescaled back to the original frame coords. The
+    caller's display frame is unaffected (it keeps using the original `frame`).
+    This is additive and OFF by default — existing callers see no change.
     """
     if model_info.session is None:
         return DetectionResult.empty()
 
+    # Optional inference-input downscale (additive, default off). Inference runs on
+    # the (possibly) smaller `frame`; orig_shape tracks the downscaled size so the
+    # postprocess letterbox-unscale lands in downscaled coords, then we map the
+    # boxes back to the true frame size below.
+    frame, infer_scale, true_shape = _infer_downscale(frame, infer_max_side)
     orig_shape = frame.shape
     bs = model_info.batch_size
     t0 = time.perf_counter()
@@ -915,6 +985,11 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
             result = postprocess_v5(single_out, conf, ratio, pad, orig_shape)
 
     result.infer_ms = infer_ms
+    # Map boxes from the downscaled inference frame back to the true frame coords.
+    # No-op when infer_max_side unset / frame already fit (infer_scale == 1.0).
+    if infer_scale != 1.0:
+        result = _rescale_detection_result(result, infer_scale, true_shape)
+        result.infer_ms = infer_ms
     return result
 
 

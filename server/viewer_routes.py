@@ -67,8 +67,12 @@ def _cleanup_stale_sessions():
 class VideoStartRequest(BaseModel):
     model_path: str
     video_path: str
-    stream_max_height: int = 0  # 0=원본, 720/480 등 지정 시 다운스케일
+    stream_max_height: int = 0  # 0=원본, 720/480 등 지정 시 OUTPUT jpeg 다운스케일
     tracker_type: str = "none"  # none / bytetrack / sort
+    # INFERENCE-input 다운스케일 상한(긴 변 px). 0=오늘과 동일(원본 해상도로 추론).
+    # >0이면 큰 프레임을 줄여 추론한 뒤 박스를 원본 좌표로 되돌린다(4K 추론 비용 절감).
+    # stream_max_height(출력 전용)와 독립. 검출 모델 경로에만 적용(아래 generate 참조).
+    infer_max_side: int = 0
 
 
 @router.post("/api/viewer/start")
@@ -113,6 +117,7 @@ async def viewer_start(req: VideoStartRequest):
                 "video_path": video_path,
                 "last_access": time.time(),
                 "stream_max_height": req.stream_max_height,
+                "infer_max_side": req.infer_max_side,
                 "tracker": tracker,
                 # Per-stream sequential state so two concurrent streams of the
                 # same seq model don't corrupt each other's buffer/counter via
@@ -146,6 +151,9 @@ async def viewer_stream(session_id: str):
         names = model.names or {}
         cfg = AppConfig()  # 루프 밖에서 한 번만 참조
         max_h = sess.get("stream_max_height", 0)
+        # INFERENCE-input 다운스케일 상한(긴 변 px). 0이면 오늘과 동일(원본 해상도 추론).
+        # 검출/seq 경로(run_inference)에만 적용 — 박스는 run_inference가 원본 좌표로 되돌린다.
+        infer_max_side = int(sess.get("infer_max_side", 0))
         # MJPEG hot-path에 매 프레임 config 접근을 피하려고 한 번만 읽는다.
         jpeg_quality = int(getattr(cfg, "stream_jpeg_quality", 75))
 
@@ -255,7 +263,11 @@ async def viewer_stream(session_id: str):
                         cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
                     _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
                 else:
-                    result = run_inference(model, frame, cfg.conf_threshold, seq_state=seq_state)
+                    # infer_max_side>0이면 다운스케일 복사본으로 추론하고 박스를 원본 좌표로
+                    # 되돌린다(default 0 = 원본 해상도 추론, 기존 동작 불변). display frame은
+                    # 원본 full-res 그대로 — 박스를 원본 위에 그린다.
+                    result = run_inference(model, frame, cfg.conf_threshold,
+                                           seq_state=seq_state, infer_max_side=infer_max_side)
                     sess["last_detections"] = len(result.boxes)
                     sess["last_infer_ms"] = round(result.infer_ms, 2)
                     sess["last_frame"] = frame.copy()
