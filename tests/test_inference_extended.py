@@ -6,8 +6,10 @@ import numpy as np
 import pytest
 from core.inference import (
     PoseResult, InstanceSegResult, SegmentationResult,
-    DetectionResult, postprocess_pose_v8, run_pose, run_instance_seg,
+    DetectionResult, postprocess_pose_v8, postprocess_pose_heatmap,
+    run_pose, run_instance_seg,
     run_pose_batch, run_instance_seg_batch,
+    _decode_maskrcnn_seg, _identify_maskrcnn_outputs,
     UnsupportedModelError,
 )
 
@@ -170,54 +172,123 @@ class TestPoseKeypointCount:
 
 
 class TestPoseUnsupported:
-    """P0: non-YOLO pose layouts raise instead of fabricating keypoints."""
+    """P0: postprocess_pose_v8 rejects layouts that are not YOLO-pose, and run_pose
+    rejects pose types it has no decoder for."""
 
-    def test_heatmap_shape_raises(self):
-        # HRNet/ViTPose-style heatmap (1,K,Hh,Ww): data=output[0] is rank 3 → reject
+    def test_v8_rejects_heatmap_shape(self):
+        # HRNet/ViTPose-style heatmap (1,K,Hh,Ww): data=output[0] is rank 3 →
+        # postprocess_pose_v8 (the YOLO-pose decoder) must still reject it.
         heatmap = np.zeros((1, 17, 64, 48), dtype=np.float32)
         with pytest.raises(UnsupportedModelError):
             postprocess_pose_v8(heatmap, conf=0.25, ratio=1.0, pad=(0, 0),
                                 orig_shape=(640, 640, 3))
 
-    def test_non_yolo_channel_count_raises(self):
+    def test_v8_rejects_non_yolo_channel_count(self):
         # 2D but channel count not 4+1+3K: 18-5=13, not divisible by 3 → reject
         bad = np.zeros((1, 18, 100), dtype=np.float32)
         with pytest.raises(UnsupportedModelError):
             postprocess_pose_v8(bad, conf=0.25, ratio=1.0, pad=(0, 0),
                                 orig_shape=(640, 640, 3))
 
-    def test_run_pose_rejects_hrnet_type(self):
-        mi = _FakeModelInfo("pose_hrnet",
+    def test_run_pose_rejects_unknown_pose_type(self):
+        # An advertised pose type with no decoder (e.g. a future/typo type) raises.
+        mi = _FakeModelInfo("pose_openpose",
                             outputs=[np.zeros((1, 17, 64, 48), dtype=np.float32)])
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
         with pytest.raises(UnsupportedModelError):
             run_pose(mi, frame, conf=0.25)
 
-    def test_run_pose_rejects_vitpose_type(self):
-        mi = _FakeModelInfo("pose_vitpose",
-                            outputs=[np.zeros((1, 17, 64, 48), dtype=np.float32)])
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+class TestPostprocessPoseHeatmap:
+    """P0/P1: HRNet/ViTPose heatmaps decode to keypoints; K from shape, not 17."""
+
+    def test_known_peak_decodes_to_expected_keypoint(self):
+        # (1, K=1, 64, 64) heatmap with a single sharp peak at cell (row=20,col=40).
+        hh = ww = 64
+        hm = np.zeros((1, 1, hh, ww), dtype=np.float32)
+        peak_r, peak_c = 20, 40
+        hm[0, 0, peak_r, peak_c] = 1.0
+        # input 256x256, no letterbox (ratio=1, pad=0), orig == input.
+        ih = iw = 256
+        r = postprocess_pose_heatmap(hm, ratio=1.0, pad=(0, 0),
+                                     input_size=(ih, iw), orig_shape=(ih, iw, 3))
+        assert r.keypoints.shape == (1, 1, 3)
+        kx, ky, kc = r.keypoints[0, 0]
+        # cell-centre map: x = (col + 0.5) * (iw/ww); the quarter-offset only fires
+        # when a neighbour is brighter — here neighbours are 0, so no offset.
+        expected_x = (peak_c + 0.5) * (iw / ww)
+        expected_y = (peak_r + 0.5) * (ih / hh)
+        assert abs(kx - expected_x) < 1e-3
+        assert abs(ky - expected_y) < 1e-3
+        assert abs(kc - 1.0) < 1e-6
+
+    def test_derives_keypoint_count_from_shape_not_17(self):
+        # 21-keypoint hand heatmap → keypoints shape (1, 21, 3), not 17.
+        hm = np.zeros((1, 21, 32, 32), dtype=np.float32)
+        # give each keypoint a distinct peak so argmax is well-defined
+        for k in range(21):
+            hm[0, k, k, k] = 1.0
+        r = postprocess_pose_heatmap(hm, ratio=1.0, pad=(0, 0),
+                                     input_size=(256, 256), orig_shape=(256, 256, 3))
+        assert r.keypoints.shape == (1, 21, 3)
+        # one pose (top-down), box derived from keypoint extent
+        assert r.boxes.shape == (1, 4)
+        assert r.scores.shape == (1,)
+
+    def test_quarter_offset_shifts_toward_brighter_neighbour(self):
+        # Peak at col=30 with a brighter right neighbour → x nudged +0.25 cell.
+        hh = ww = 64
+        hm = np.zeros((1, 1, hh, ww), dtype=np.float32)
+        hm[0, 0, 30, 30] = 1.0
+        hm[0, 0, 30, 31] = 0.9   # right neighbour brighter than left (0)
+        ih = iw = 256
+        r = postprocess_pose_heatmap(hm, ratio=1.0, pad=(0, 0),
+                                     input_size=(ih, iw), orig_shape=(ih, iw, 3))
+        kx = r.keypoints[0, 0, 0]
+        expected_x = (30 + 0.25 + 0.5) * (iw / ww)
+        assert abs(kx - expected_x) < 1e-3
+
+    def test_letterbox_unscale(self):
+        # ratio=0.5, pad=(10, 20): keypoint maps back through (x_in - pad)/ratio.
+        hh = ww = 64
+        hm = np.zeros((1, 1, hh, ww), dtype=np.float32)
+        hm[0, 0, 16, 16] = 1.0
+        ih = iw = 256
+        ratio, pad = 0.5, (10.0, 20.0)
+        r = postprocess_pose_heatmap(hm, ratio=ratio, pad=pad,
+                                     input_size=(ih, iw), orig_shape=(1000, 1000, 3))
+        kx, ky, _ = r.keypoints[0, 0]
+        x_in = (16 + 0.5) * (iw / ww)
+        y_in = (16 + 0.5) * (ih / hh)
+        assert abs(kx - (x_in - pad[0]) / ratio) < 1e-3
+        assert abs(ky - (y_in - pad[1]) / ratio) < 1e-3
+
+    def test_rejects_non_heatmap_rank(self):
+        # rank-2 input: not (N,K,Hh,Ww), batch strip does not apply → data stays
+        # rank 2, which is not a (K,Hh,Ww) heatmap grid → raise.
+        bad = np.zeros((1, 50), dtype=np.float32)
         with pytest.raises(UnsupportedModelError):
-            run_pose(mi, frame, conf=0.25)
+            postprocess_pose_heatmap(bad, ratio=1.0, pad=(0, 0),
+                                     input_size=(256, 256), orig_shape=(256, 256, 3))
 
 
 class TestInstanceSegUnsupported:
-    """P0: Mask R-CNN / non-YOLO-Seg layouts raise instead of silent empty."""
-
-    def test_maskrcnn_type_raises(self):
-        # Mask R-CNN emits separate boxes/labels/scores/masks; type guard fires
-        # before inference, so outputs are irrelevant here.
-        mi = _FakeModelInfo("instseg_maskrcnn",
-                            outputs=[np.zeros((1, 100, 4), dtype=np.float32),
-                                     np.zeros((1, 100), dtype=np.float32)])
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        with pytest.raises(UnsupportedModelError):
-            run_instance_seg(mi, frame, conf=0.25)
+    """P0: unsupported types / non-decodable layouts raise instead of silent empty."""
 
     def test_custom_type_raises(self):
         mi = _FakeModelInfo("instseg_custom",
                             outputs=[np.zeros((1, 116, 8400), dtype=np.float32),
                                      np.zeros((1, 32, 160, 160), dtype=np.float32)])
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with pytest.raises(UnsupportedModelError):
+            run_instance_seg(mi, frame, conf=0.25)
+
+    def test_maskrcnn_type_unidentifiable_layout_raises(self):
+        # Declared instseg_maskrcnn but outputs lack a spatial mask tensor →
+        # _identify_maskrcnn_outputs cannot find masks → raise.
+        mi = _FakeModelInfo("instseg_maskrcnn",
+                            outputs=[np.zeros((10, 4), dtype=np.float32),
+                                     np.zeros((10,), dtype=np.float32)])  # no masks
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
         with pytest.raises(UnsupportedModelError):
             run_instance_seg(mi, frame, conf=0.25)
@@ -239,6 +310,122 @@ class TestInstanceSegUnsupported:
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
         r = run_instance_seg(mi, frame, conf=0.25)
         assert len(r.boxes) == 0
+
+
+def _maskrcnn_outputs(n=3, hm=28, wm=28, order="bls m"):
+    """Synthetic torchvision Mask R-CNN outputs (no batch dim, per-image).
+
+    boxes (N,4) xyxy, labels (N,) int64, scores (N,) float32 descending,
+    masks (N,1,hm,wm) soft probs (each fully > 0.5 so they binarize to all-ones).
+    `order` controls the emit order to exercise shape-based identification.
+    """
+    boxes = np.array([[10 * i, 10 * i, 10 * i + 40, 10 * i + 50]
+                      for i in range(1, n + 1)], dtype=np.float32)
+    labels = np.arange(n, dtype=np.int64)
+    scores = np.linspace(0.9, 0.4, n).astype(np.float32)
+    masks = np.full((n, 1, hm, wm), 0.8, dtype=np.float32)
+    parts = {"b": boxes, "l": labels, "s": scores, "m": masks}
+    return [parts[c] for c in order.replace(" ", "")]
+
+
+class TestMaskRCNNDecode:
+    """P0: Mask R-CNN (boxes/labels/scores/masks) decodes to N instances."""
+
+    def test_decodes_n_instances_with_masks(self):
+        # conf below the lowest score keeps all instances.
+        out = _maskrcnn_outputs(n=3)
+        r = _decode_maskrcnn_seg(out, conf=0.1, ratio=1.0, pad=(0, 0),
+                                 input_size=(640, 640), orig_hw=(480, 640))
+        assert len(r.boxes) == 3
+        assert len(r.masks) == 3
+        assert r.class_ids.tolist() == [0, 1, 2]
+        # masks resize to the original image hw and binarize to 1 (probs 0.8>0.5).
+        for m in r.masks:
+            assert m.shape == (480, 640)
+            assert m.dtype == np.uint8
+            assert m.max() == 1
+
+    def test_score_threshold_drops_low_confidence(self):
+        # scores = [0.9, 0.65, 0.4]; conf=0.5 keeps the first two.
+        out = _maskrcnn_outputs(n=3)
+        r = _decode_maskrcnn_seg(out, conf=0.5, ratio=1.0, pad=(0, 0),
+                                 input_size=(640, 640), orig_hw=(480, 640))
+        assert len(r.boxes) == 2
+        assert len(r.masks) == 2
+
+    def test_all_below_threshold_returns_empty(self):
+        out = _maskrcnn_outputs(n=2)
+        r = _decode_maskrcnn_seg(out, conf=0.99, ratio=1.0, pad=(0, 0),
+                                 input_size=(640, 640), orig_hw=(480, 640))
+        assert len(r.boxes) == 0
+        assert r.masks == []
+
+    def test_output_order_independent(self):
+        # Same instances emitted in a different tensor order decode identically —
+        # identification is by rank/shape, not position.
+        a = _decode_maskrcnn_seg(_maskrcnn_outputs(n=2, order="b l s m"),
+                                 conf=0.1, ratio=1.0, pad=(0, 0),
+                                 input_size=(640, 640), orig_hw=(480, 640))
+        b = _decode_maskrcnn_seg(_maskrcnn_outputs(n=2, order="m s l b"),
+                                 conf=0.1, ratio=1.0, pad=(0, 0),
+                                 input_size=(640, 640), orig_hw=(480, 640))
+        assert np.allclose(a.boxes, b.boxes)
+        assert a.class_ids.tolist() == b.class_ids.tolist()
+
+    def test_3d_masks_without_channel_dim(self):
+        # masks (N,hm,wm) — no singleton channel — must decode too.
+        boxes = np.array([[10, 10, 50, 60]], dtype=np.float32)
+        labels = np.array([5], dtype=np.int64)
+        scores = np.array([0.9], dtype=np.float32)
+        masks = np.full((1, 28, 28), 0.8, dtype=np.float32)  # rank 3
+        r = _decode_maskrcnn_seg([boxes, labels, scores, masks],
+                                 conf=0.1, ratio=1.0, pad=(0, 0),
+                                 input_size=(640, 640), orig_hw=(480, 640))
+        assert len(r.masks) == 1
+        assert r.class_ids[0] == 5
+
+    def test_letterbox_box_unscale(self):
+        # ratio=0.5, pad=(20,30): a box maps back via (coord - pad)/ratio, clipped.
+        boxes = np.array([[40.0, 50.0, 120.0, 130.0]], dtype=np.float32)
+        labels = np.array([0], dtype=np.int64)
+        scores = np.array([0.9], dtype=np.float32)
+        masks = np.full((1, 1, 28, 28), 0.8, dtype=np.float32)
+        ratio, pad = 0.5, (20.0, 30.0)
+        ow, oh = 1000, 800
+        r = _decode_maskrcnn_seg([boxes, labels, scores, masks], conf=0.1,
+                                 ratio=ratio, pad=pad, input_size=(640, 640),
+                                 orig_hw=(oh, ow))
+        x1, y1, x2, y2 = r.boxes[0]
+        assert abs(x1 - (40.0 - pad[0]) / ratio) < 1e-3
+        assert abs(y1 - (50.0 - pad[1]) / ratio) < 1e-3
+        assert abs(x2 - (120.0 - pad[0]) / ratio) < 1e-3
+
+    def test_missing_labels_defaults_to_zero(self):
+        # Single-class export omits labels → every instance class_id 0.
+        boxes = np.array([[10, 10, 50, 60], [20, 20, 70, 80]], dtype=np.float32)
+        scores = np.array([0.9, 0.8], dtype=np.float32)
+        masks = np.full((2, 1, 28, 28), 0.8, dtype=np.float32)
+        r = _decode_maskrcnn_seg([boxes, scores, masks], conf=0.1, ratio=1.0,
+                                 pad=(0, 0), input_size=(640, 640),
+                                 orig_hw=(480, 640))
+        assert r.class_ids.tolist() == [0, 0]
+
+
+class TestIdentifyMaskRCNNOutputs:
+    """_identify_maskrcnn_outputs: shape-based locate; raise when unidentifiable."""
+
+    def test_identifies_all_four(self):
+        out = _maskrcnn_outputs(n=2)
+        boxes, labels, scores, masks = _identify_maskrcnn_outputs(out)
+        assert boxes.shape == (2, 4)
+        assert scores.ndim == 1
+        assert masks.ndim == 4
+
+    def test_raises_without_masks(self):
+        # boxes + scores only, no spatial tensor → cannot identify masks.
+        with pytest.raises(UnsupportedModelError):
+            _identify_maskrcnn_outputs([np.zeros((5, 4), dtype=np.float32),
+                                        np.zeros((5,), dtype=np.float32)])
 
 
 # ── Tracking: opt-in class-gating ───────────────────────
@@ -350,11 +537,29 @@ class TestRunPoseBatch:
             assert isinstance(r, PoseResult)
             assert len(r.boxes) == 1
 
-    def test_rejects_non_yolo_pose_type(self):
-        mi = _FakeModelInfo("pose_hrnet", session=_BatchEchoSession(_pose_output_builder()))
+    def test_rejects_unknown_pose_type(self):
+        # An advertised pose type with no decoder still raises in the batch path.
+        mi = _FakeModelInfo("pose_openpose", session=_BatchEchoSession(_pose_output_builder()))
         frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
         with pytest.raises(UnsupportedModelError):
             run_pose_batch(mi, frames, conf=0.25)
+
+    def test_heatmap_pose_type_decodes_per_frame(self):
+        # pose_hrnet / pose_vitpose are now decodable: a (batch_n, K, Hh, Ww)
+        # heatmap batch yields one PoseResult (one top-down pose) per frame.
+        def _heatmap_builder(batch_n):
+            hm = np.zeros((batch_n, 17, 64, 64), dtype=np.float32)
+            for b in range(batch_n):
+                for k in range(17):
+                    hm[b, k, k, k] = 1.0  # distinct peak per keypoint
+            return [hm]
+        mi = _FakeModelInfo("pose_hrnet", session=_BatchEchoSession(_heatmap_builder))
+        frames = [np.zeros((480, 640, 3), dtype=np.uint8) for _ in range(2)]
+        results = run_pose_batch(mi, frames, conf=0.25)
+        assert len(results) == 2
+        for r in results:
+            assert isinstance(r, PoseResult)
+            assert r.keypoints.shape == (1, 17, 3)
 
     def test_fixed_batch_pad_up_trims_to_n(self):
         # Model fixed batch=4 but only 2 frames → pad up to 4, trim back to 2.
@@ -405,12 +610,31 @@ class TestRunInstanceSegBatch:
             assert len(r.boxes) == 1
             assert len(r.masks) == 1
 
-    def test_rejects_non_yolo_type(self):
-        mi = _FakeModelInfo("instseg_maskrcnn",
+    def test_rejects_unknown_type(self):
+        # An unsupported instance-seg type (no decoder) still raises in batch path.
+        mi = _FakeModelInfo("instseg_custom",
                             session=_BatchEchoSession(_seg_output_builder()))
         frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
         with pytest.raises(UnsupportedModelError):
             run_instance_seg_batch(mi, frames, conf=0.25)
+
+    def test_maskrcnn_type_decodes_per_frame(self):
+        # instseg_maskrcnn routes through the per-frame single-image path.
+        def _mrcnn_builder(_batch_n):
+            # Per-image Mask R-CNN outputs (no batch dim), 2 instances.
+            boxes = np.array([[10, 10, 50, 60], [20, 20, 80, 90]], dtype=np.float32)
+            labels = np.array([0, 1], dtype=np.int64)
+            scores = np.array([0.9, 0.7], dtype=np.float32)
+            masks = np.full((2, 1, 28, 28), 0.8, dtype=np.float32)
+            return [boxes, labels, scores, masks]
+        mi = _FakeModelInfo("instseg_maskrcnn", session=_BatchEchoSession(_mrcnn_builder))
+        frames = [np.zeros((480, 640, 3), dtype=np.uint8) for _ in range(3)]
+        results = run_instance_seg_batch(mi, frames, conf=0.25)
+        assert len(results) == 3
+        for r in results:
+            assert isinstance(r, InstanceSegResult)
+            assert len(r.boxes) == 2
+            assert len(r.masks) == 2
 
     def test_fixed_batch_chunks(self):
         mi = _FakeModelInfo("instseg_yolo", batch_size=2,

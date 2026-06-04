@@ -1,4 +1,5 @@
 """/api/quality/* 라우터."""
+import logging
 import os
 
 import cv2
@@ -13,6 +14,8 @@ from server.state import anomaly_state, quality_state, dup_state, leaky_state, s
 from server.utils import imread, glob_images
 
 router = APIRouter()
+
+log = logging.getLogger("ssook.quality")
 
 
 # ── Result caps ─────────────────────────────────────────
@@ -59,6 +62,16 @@ class SimRequest(BaseModel):
     query_path: Optional[str] = ""
     top_k: int = 10
     recursive: bool = False
+
+
+class DeleteFilesRequest(BaseModel):
+    # The quality tools (duplicate/leaky) surface problem files but give the
+    # user no way to act on them. This is the explicit, conservative delete
+    # contract: an img_dir root plus the exact files to remove. No globs /
+    # wildcards — every entry is validated to resolve strictly inside the
+    # validated root before deletion (P1 missing-goal).
+    img_dir: str
+    files: list[str]
 
 # ── Quality: Anomaly Detector API ──────────────────────
 # NOTE: All *_state instances are imported from server.state — do NOT re-declare.
@@ -309,6 +322,64 @@ async def quality_duplicate(req: QualityDirRequest):
 @router.get("/api/quality/duplicate/status")
 async def duplicate_status():
     return dup_state.snapshot() if hasattr(dup_state, 'snapshot') else dict(dup_state)
+
+
+# ── Quality: Safe batch delete (act on duplicate/leaky findings) ───────
+# The duplicate detector emits rel_a/rel_b (Wave 6); the frontend offers
+# "keep one, delete the rest" per group and POSTs img_dir + the rel/abs
+# paths it wants gone. We only implement the safe delete of an EXPLICIT
+# list — the keep-one selection is the frontend's job.
+
+@router.post("/api/quality/delete-files")
+async def quality_delete_files(req: DeleteFilesRequest):
+    # safe_image_dir enforces exists + is-dir + traversal-normalized root.
+    root = safe_image_dir(req.img_dir)
+    # realpath resolves symlinks AND `..`, so commonpath compares the true
+    # on-disk location — a symlinked file inside the root that points outside
+    # is rejected, not followed (this is a destructive op; be conservative).
+    root_real = os.path.realpath(root)
+
+    deleted: list[str] = []
+    skipped: list[dict[str, str]] = []
+
+    for raw in req.files:
+        if not isinstance(raw, str) or not raw or "\x00" in raw:
+            skipped.append({"path": str(raw), "reason": "Invalid path"})
+            continue
+        # Accept either a path relative to img_dir (what the frontend sends,
+        # e.g. rel_a) or an absolute path. join() leaves an absolute `raw`
+        # untouched, so both forms funnel through the same containment check.
+        candidate = os.path.realpath(os.path.join(root_real, raw))
+
+        # Strict containment: the file must be INSIDE the root, never the root
+        # itself. commonpath raises ValueError across drives (Windows) — treat
+        # that as "outside". The `!= root_real` guard refuses deleting the dir.
+        try:
+            inside = os.path.commonpath([root_real, candidate]) == root_real
+        except ValueError:
+            inside = False
+        if not inside or candidate == root_real:
+            skipped.append({"path": raw, "reason": "Outside img_dir"})
+            continue
+
+        if not os.path.exists(candidate):
+            skipped.append({"path": raw, "reason": "Not found"})
+            continue
+        if not os.path.isfile(candidate):
+            # Never recurse into / remove a directory via this endpoint.
+            skipped.append({"path": raw, "reason": "Not a file"})
+            continue
+
+        try:
+            os.remove(candidate)
+        except OSError as e:
+            skipped.append({"path": raw, "reason": f"Delete failed: {e}"})
+            continue
+        # Log every deletion — this is a destructive, irreversible action.
+        log.info("delete-files: removed %s (root=%s)", candidate, root_real)
+        deleted.append(candidate)
+
+    return {"deleted": deleted, "skipped": skipped, "count": len(deleted)}
 
 
 # ── Quality: Leaky Split Detector API ──────────────────

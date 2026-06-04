@@ -1262,21 +1262,94 @@ def postprocess_pose_v8(output: np.ndarray, conf: float,
                       keypoints=kpts.astype(np.float32), infer_ms=0.0)
 
 
-def run_pose(model_info: ModelInfo, frame: np.ndarray, conf: float) -> PoseResult:
-    """Pose estimation inference. Only YOLO-pose is decodable.
+def postprocess_pose_heatmap(heatmaps: np.ndarray, ratio: float, pad: tuple,
+                             input_size: tuple, orig_shape: tuple) -> PoseResult:
+    """Top-down heatmap pose (HRNet / ViTPose): (N, K, Hh, Ww) → one PoseResult.
 
-    HRNet/ViTPose emit heatmaps that postprocess_pose_v8 cannot decode; reject
-    those types up front with a precise message rather than emitting garbage.
+    These models are *top-down*: they assume the whole input image is a single
+    cropped person and emit one heatmap per keypoint. We therefore return a
+    single pose. K (keypoint count) is derived from the heatmap channel dim — NOT
+    hardcoded to 17 — so 17-kpt COCO, 21-kpt hand, or animal exports decode.
+
+    Decoding per keypoint:
+      - argmax over the (Hh, Ww) heatmap gives the integer peak cell.
+      - A quarter-pixel offset toward the larger of the two neighbours in each
+        axis refines the location (the standard HRNet/DARK-lite sub-pixel trick);
+        this halves the systematic bias of plain argmax without needing the full
+        Gaussian-modulation pass.
+      - The peak value is the keypoint confidence.
+      - Coords are scaled from heatmap space → letterboxed input space → original
+        image coords (undo the letterbox ratio/pad applied during preprocess).
+
+    The bounding box is the min/max of the decoded keypoints (top-down models do
+    not regress a box themselves), with the pose score = mean keypoint conf.
+
+    Assumes the heatmap spatial grid maps linearly onto the *letterboxed input*
+    (the common HRNet/ViTPose ONNX export: feature stride = input / heatmap).
+    """
+    # Strip a leading batch dim if present: (N, K, Hh, Ww) → first instance.
+    data = heatmaps[0] if heatmaps.ndim == 4 else heatmaps
+    if data.ndim != 3:
+        raise UnsupportedModelError(
+            f"Heatmap pose output rank {heatmaps.ndim} is not (N, K, Hh, Ww); "
+            f"cannot decode as HRNet/ViTPose heatmaps."
+        )
+
+    n_kpts, hh, ww = data.shape
+    flat = data.reshape(n_kpts, -1)
+    peak_idx = flat.argmax(axis=1)            # (K,) flat index of the peak cell
+    peak_val = flat[np.arange(n_kpts), peak_idx]  # (K,) confidence
+    py = (peak_idx // ww).astype(np.float32)  # row (y) in heatmap space
+    px = (peak_idx % ww).astype(np.float32)   # col (x) in heatmap space
+
+    # Quarter-pixel sub-pixel refinement: nudge toward the brighter neighbour.
+    for k in range(n_kpts):
+        x, y = int(px[k]), int(py[k])
+        if 0 < x < ww - 1:
+            if data[k, y, x + 1] > data[k, y, x - 1]:
+                px[k] += 0.25
+            elif data[k, y, x + 1] < data[k, y, x - 1]:
+                px[k] -= 0.25
+        if 0 < y < hh - 1:
+            if data[k, y + 1, x] > data[k, y - 1, x]:
+                py[k] += 0.25
+            elif data[k, y + 1, x] < data[k, y - 1, x]:
+                py[k] -= 0.25
+
+    ih, iw = input_size
+    # heatmap grid → letterboxed input pixels (sample at cell centre via +0.5).
+    x_in = (px + 0.5) * (iw / ww)
+    y_in = (py + 0.5) * (ih / hh)
+
+    # letterboxed input → original image coords (undo ratio + pad).
+    pad_w, pad_h = pad
+    oh, ow = orig_shape[:2]
+    x_orig = np.clip((x_in - pad_w) / ratio, 0, ow)
+    y_orig = np.clip((y_in - pad_h) / ratio, 0, oh)
+
+    kpts = np.stack([x_orig, y_orig, peak_val.astype(np.float32)], axis=1)
+    kpts = kpts.reshape(1, n_kpts, 3).astype(np.float32)
+
+    # Top-down: derive the person box from the keypoint extent.
+    x1, x2 = float(x_orig.min()), float(x_orig.max())
+    y1, y2 = float(y_orig.min()), float(y_orig.max())
+    box = np.array([[x1, y1, x2, y2]], dtype=np.float32)
+    score = np.array([float(peak_val.mean())], dtype=np.float32)
+
+    return PoseResult(boxes=box, scores=score, keypoints=kpts, infer_ms=0.0)
+
+
+def run_pose(model_info: ModelInfo, frame: np.ndarray, conf: float) -> PoseResult:
+    """Pose estimation inference.
+
+    Dispatches on model_type: 'pose_yolo' uses the YOLO-pose regression head
+    (postprocess_pose_v8); 'pose_hrnet' / 'pose_vitpose' decode top-down keypoint
+    heatmaps (postprocess_pose_heatmap). Any other advertised type, or an output
+    layout that matches neither, raises UnsupportedModelError so the route can
+    report a precise reason instead of returning a misleading empty pose.
     """
     if model_info.session is None:
         return PoseResult.empty()
-
-    # TODO(later/L-effort): heatmap decoder for pose_hrnet / pose_vitpose.
-    if model_info.model_type != "pose_yolo":
-        raise UnsupportedModelError(
-            f"Pose estimation for model type '{model_info.model_type}' is not "
-            f"supported yet — only 'pose_yolo' (YOLO-pose) output is decodable."
-        )
 
     t0 = time.perf_counter()
     padded, ratio, pad = letterbox(frame, model_info.input_size)
@@ -1286,7 +1359,17 @@ def run_pose(model_info: ModelInfo, frame: np.ndarray, conf: float) -> PoseResul
         tensor = np.repeat(tensor, bs, axis=0)
     output = model_info.session.run(None, {model_info.input_name: tensor})
     infer_ms = (time.perf_counter() - t0) * 1000.0
-    result = postprocess_pose_v8(output[0][:1], conf, ratio, pad, frame.shape)
+
+    if model_info.model_type == "pose_yolo":
+        result = postprocess_pose_v8(output[0][:1], conf, ratio, pad, frame.shape)
+    elif model_info.model_type in ("pose_hrnet", "pose_vitpose"):
+        result = postprocess_pose_heatmap(
+            output[0][:1], ratio, pad, model_info.input_size, frame.shape)
+    else:
+        raise UnsupportedModelError(
+            f"Pose estimation for model type '{model_info.model_type}' is not "
+            f"supported — expected 'pose_yolo', 'pose_hrnet', or 'pose_vitpose'."
+        )
     result.infer_ms = infer_ms
     return result
 
@@ -1319,10 +1402,11 @@ def run_pose_batch(model_info: ModelInfo, frames: list, conf: float) -> "list[Po
     """
     if model_info.session is None or not frames:
         return [PoseResult.empty() for _ in frames]
-    if model_info.model_type != "pose_yolo":
+    is_heatmap = model_info.model_type in ("pose_hrnet", "pose_vitpose")
+    if model_info.model_type != "pose_yolo" and not is_heatmap:
         raise UnsupportedModelError(
             f"Pose estimation for model type '{model_info.model_type}' is not "
-            f"supported yet — only 'pose_yolo' (YOLO-pose) output is decodable."
+            f"supported — expected 'pose_yolo', 'pose_hrnet', or 'pose_vitpose'."
         )
 
     n = len(frames)
@@ -1350,7 +1434,11 @@ def run_pose_batch(model_info: ModelInfo, frames: list, conf: float) -> "list[Po
     results = []
     for i in range(n):
         ratio, pad = metas[i]
-        r = postprocess_pose_v8(output[0][i:i + 1], conf, ratio, pad, orig_shapes[i])
+        if is_heatmap:
+            r = postprocess_pose_heatmap(
+                output[0][i:i + 1], ratio, pad, model_info.input_size, orig_shapes[i])
+        else:
+            r = postprocess_pose_v8(output[0][i:i + 1], conf, ratio, pad, orig_shapes[i])
         r.infer_ms = infer_ms / n
         results.append(r)
     return results
@@ -1373,21 +1461,22 @@ class InstanceSegResult:
 
 def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
                      conf: float) -> InstanceSegResult:
-    """YOLO-Seg instance segmentation: returns per-instance masks.
+    """Instance segmentation: returns per-instance masks.
 
-    Only the YOLO-Seg output layout (det tensor + proto tensor) is decoded.
-    Other advertised types (Mask R-CNN, custom) raise UnsupportedModelError so
-    the caller can report a precise error instead of a misleading empty result.
+    Dispatches on model_type: 'instseg_yolo' decodes the YOLO-Seg layout (det
+    tensor + proto tensor); 'instseg_maskrcnn' decodes the torchvision /
+    detectron2 layout (separate boxes / labels / scores / masks tensors). Any
+    other type, or an output layout that matches neither expected set, raises
+    UnsupportedModelError so the caller can report a precise reason instead of a
+    misleading empty result.
     """
     if model_info.session is None:
         return InstanceSegResult.empty()
 
-    # TODO(later/L-effort): add a _run_maskrcnn_seg parser for the separate
-    # (boxes, labels, scores, masks) output set. Until then, fail loudly.
-    if model_info.model_type != "instseg_yolo":
+    if model_info.model_type not in ("instseg_yolo", "instseg_maskrcnn"):
         raise UnsupportedModelError(
             f"Instance segmentation for model type '{model_info.model_type}' is not "
-            f"supported yet — only 'instseg_yolo' (YOLO-Seg) output is decodable."
+            f"supported — expected 'instseg_yolo' or 'instseg_maskrcnn'."
         )
 
     t0 = time.perf_counter()
@@ -1399,6 +1488,12 @@ def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
         tensor = np.repeat(tensor, bs, axis=0)
     output = model_info.session.run(None, {model_info.input_name: tensor})
     infer_ms = (time.perf_counter() - t0) * 1000.0
+
+    if model_info.model_type == "instseg_maskrcnn":
+        result = _decode_maskrcnn_seg(output, conf, ratio, pad,
+                                      model_info.input_size, (h_orig, w_orig))
+        result.infer_ms = infer_ms
+        return result
 
     # YOLO-Seg requires a 3D det tensor + 4D proto tensor. A different layout
     # (e.g. Mask R-CNN's separate boxes/labels/scores/masks) means this model
@@ -1414,6 +1509,97 @@ def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
                              ratio, pad, model_info.input_size, (h_orig, w_orig))
     result.infer_ms = infer_ms
     return result
+
+
+def _identify_maskrcnn_outputs(output: list) -> "tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]":
+    """Locate Mask R-CNN's (boxes, labels, scores, masks) among raw ORT outputs.
+
+    torchvision/detectron2 ONNX exports emit four named tensors per image with no
+    batch dim: boxes (N,4), labels (N,), scores (N,), masks (N,1,Hm,Wm) or
+    (N,Hm,Wm). The order/names vary by export, so we identify by rank/shape:
+      - masks: the rank-3 or rank-4 tensor (the only spatial output).
+      - boxes: the rank-2 tensor whose last dim == 4.
+      - scores: a rank-1 float tensor.
+      - labels: a rank-1 integer tensor.
+    Raises UnsupportedModelError if the set cannot be identified — the model was
+    mislabeled as instseg_maskrcnn.
+    """
+    boxes = labels = scores = masks = None
+    for o in output:
+        if o.ndim >= 3:
+            masks = o
+        elif o.ndim == 2 and o.shape[-1] == 4:
+            boxes = o
+        elif o.ndim == 1:
+            # int dtype → class labels; float dtype → confidence scores.
+            if np.issubdtype(o.dtype, np.integer):
+                labels = o
+            else:
+                scores = o
+
+    if boxes is None or scores is None or masks is None:
+        raise UnsupportedModelError(
+            "Model output does not match the Mask R-CNN layout (expected separate "
+            "boxes (N,4), scores (N,), and masks (N,1,H,W) tensors). This model "
+            "cannot be decoded as 'instseg_maskrcnn'."
+        )
+    if labels is None:
+        # Some single-class exports omit labels — default every instance to 0.
+        labels = np.zeros(len(scores), dtype=np.int32)
+    return boxes, labels, scores, masks
+
+
+def _decode_maskrcnn_seg(output: list, conf: float, ratio: float, pad: tuple,
+                         input_size: tuple, orig_hw: tuple) -> InstanceSegResult:
+    """Decode torchvision/detectron2 Mask R-CNN outputs → InstanceSegResult.
+
+    Assumes the model ran on the letterboxed input, so boxes/masks are in
+    letterboxed-input pixel space; we undo the letterbox (pad + ratio) to map
+    back to original-image coords. Boxes are absolute xyxy. Masks are per-instance
+    soft probabilities (N,1,Hm,Wm) or (N,Hm,Wm); we resize each to the input,
+    strip the letterbox padding, scale to the original image, and threshold at
+    0.5 to a binary uint8 mask — matching _decode_yolo_seg's mask contract.
+    """
+    boxes, labels, scores, masks = _identify_maskrcnn_outputs(output)
+    h_orig, w_orig = orig_hw
+    ih, iw = input_size
+    pad_w, pad_h = pad
+
+    keep = scores > conf
+    if not keep.any():
+        return InstanceSegResult.empty()
+
+    boxes_k = boxes[keep]
+    scores_k = scores[keep].astype(np.float32)
+    labels_k = labels[keep].astype(np.int32)
+    masks_k = masks[keep]
+    # Collapse a singleton channel dim: (M,1,Hm,Wm) → (M,Hm,Wm).
+    if masks_k.ndim == 4:
+        masks_k = masks_k[:, 0]
+
+    # Boxes: letterboxed-input xyxy → original coords.
+    x1 = np.clip((boxes_k[:, 0] - pad_w) / ratio, 0, w_orig)
+    y1 = np.clip((boxes_k[:, 1] - pad_h) / ratio, 0, h_orig)
+    x2 = np.clip((boxes_k[:, 2] - pad_w) / ratio, 0, w_orig)
+    y2 = np.clip((boxes_k[:, 3] - pad_h) / ratio, 0, h_orig)
+    boxes_out = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
+
+    pad_h_i, pad_w_i = int(round(pad_h)), int(round(pad_w))
+    masks_out = []
+    for m in masks_k:
+        # Resize mask to the letterboxed input, strip pad, scale to original.
+        m_full = cv2.resize(m.astype(np.float32), (iw, ih),
+                            interpolation=cv2.INTER_LINEAR)
+        unpadded = m_full[pad_h_i:ih - pad_h_i if pad_h_i else ih,
+                          pad_w_i:iw - pad_w_i if pad_w_i else iw]
+        inst_mask = cv2.resize(unpadded, (w_orig, h_orig),
+                               interpolation=cv2.INTER_LINEAR)
+        masks_out.append((inst_mask > 0.5).astype(np.uint8))
+
+    return InstanceSegResult(
+        boxes=boxes_out, scores=scores_k, class_ids=labels_k,
+        masks=masks_out, infer_ms=0.0,
+    )
 
 
 def _decode_yolo_seg(det: np.ndarray, protos: np.ndarray, conf: float,
@@ -1494,11 +1680,17 @@ def run_instance_seg_batch(model_info: ModelInfo, frames: list,
     """
     if model_info.session is None or not frames:
         return [InstanceSegResult.empty() for _ in frames]
-    if model_info.model_type != "instseg_yolo":
+    if model_info.model_type not in ("instseg_yolo", "instseg_maskrcnn"):
         raise UnsupportedModelError(
             f"Instance segmentation for model type '{model_info.model_type}' is not "
-            f"supported yet — only 'instseg_yolo' (YOLO-Seg) output is decodable."
+            f"supported — expected 'instseg_yolo' or 'instseg_maskrcnn'."
         )
+
+    # Mask R-CNN emits a variable instance count per image and is not reliably
+    # batchable through one forward, so decode it frame-by-frame via the
+    # single-image path (which already handles the maskrcnn layout).
+    if model_info.model_type == "instseg_maskrcnn":
+        return [run_instance_seg(model_info, f, conf) for f in frames]
 
     n = len(frames)
     bs = model_info.batch_size

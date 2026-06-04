@@ -374,6 +374,122 @@ def test_leaky_sample_list_shows_count_when_capped(client, tmp_path):
     _reset(leaky_state)
 
 
+# ── delete-files: safe batch delete of explicit paths (P1 missing-goal) ────────
+
+def test_delete_files_removes_file_inside_root(client, tmp_path):
+    """A file given by path relative to img_dir, and one given by absolute path,
+    both resolve inside the validated root and are deleted; the response lists
+    them and counts them."""
+    img_dir = tmp_path / "imgs"
+    sub = img_dir / "sub"
+    sub.mkdir(parents=True)
+    rel_target = img_dir / "a.png"
+    abs_target = sub / "b.png"
+    rel_target.write_bytes(b"x")
+    abs_target.write_bytes(b"y")
+
+    resp = client.post("/api/quality/delete-files",
+                       json={"img_dir": str(img_dir),
+                             "files": ["a.png", str(abs_target)]})
+    body = resp.json()
+    assert body["count"] == 2
+    assert body["skipped"] == []
+    assert not rel_target.exists()
+    assert not abs_target.exists()
+    # Returned deleted paths are the resolved absolute locations.
+    assert any(os.path.normpath(p) == os.path.normpath(str(rel_target)) for p in body["deleted"])
+    assert any(os.path.normpath(p) == os.path.normpath(str(abs_target)) for p in body["deleted"])
+
+
+def test_delete_files_refuses_traversal_escape(client, tmp_path):
+    """A `../` relative path that resolves outside the root must be skipped with
+    a reason, and the outside file must survive."""
+    img_dir = tmp_path / "imgs"
+    img_dir.mkdir()
+    outside = tmp_path / "secret.png"
+    outside.write_bytes(b"keep me")
+
+    resp = client.post("/api/quality/delete-files",
+                       json={"img_dir": str(img_dir),
+                             "files": ["../secret.png"]})
+    body = resp.json()
+    assert body["count"] == 0
+    assert outside.exists()  # untouched
+    assert len(body["skipped"]) == 1
+    assert body["skipped"][0]["reason"] == "Outside img_dir"
+
+
+def test_delete_files_refuses_absolute_path_outside_root(client, tmp_path):
+    """An absolute path that points outside the validated root must be skipped,
+    not deleted."""
+    img_dir = tmp_path / "imgs"
+    img_dir.mkdir()
+    outside_dir = tmp_path / "other"
+    outside_dir.mkdir()
+    outside = outside_dir / "f.png"
+    outside.write_bytes(b"keep me")
+
+    resp = client.post("/api/quality/delete-files",
+                       json={"img_dir": str(img_dir),
+                             "files": [str(outside)]})
+    body = resp.json()
+    assert body["count"] == 0
+    assert outside.exists()
+    assert body["skipped"][0]["reason"] == "Outside img_dir"
+
+
+def test_delete_files_skips_missing_file_with_reason(client, tmp_path):
+    """A path inside the root that does not exist is skipped with a 'Not found'
+    reason rather than erroring the whole request."""
+    img_dir = tmp_path / "imgs"
+    img_dir.mkdir()
+    present = img_dir / "here.png"
+    present.write_bytes(b"x")
+
+    resp = client.post("/api/quality/delete-files",
+                       json={"img_dir": str(img_dir),
+                             "files": ["here.png", "ghost.png"]})
+    body = resp.json()
+    assert body["count"] == 1
+    assert not present.exists()
+    assert len(body["skipped"]) == 1
+    assert body["skipped"][0]["path"] == "ghost.png"
+    assert body["skipped"][0]["reason"] == "Not found"
+
+
+def test_delete_files_never_removes_the_root_dir(client, tmp_path):
+    """The endpoint must never delete the img_dir itself, whether referenced as
+    "" (empty), "." , or its own absolute path."""
+    img_dir = tmp_path / "imgs"
+    img_dir.mkdir()
+
+    resp = client.post("/api/quality/delete-files",
+                       json={"img_dir": str(img_dir),
+                             "files": [".", str(img_dir)]})
+    body = resp.json()
+    assert body["count"] == 0
+    assert img_dir.exists() and img_dir.is_dir()
+    # Both the "." (resolves to root) and the absolute-root entries are refused.
+    reasons = {s["reason"] for s in body["skipped"]}
+    assert reasons <= {"Outside img_dir", "Not a file"}
+    assert len(body["skipped"]) == 2
+
+
+def test_delete_files_skips_subdirectory_not_a_file(client, tmp_path):
+    """A path inside the root that is a directory (not a file) must be skipped
+    with 'Not a file' — the endpoint never recurses into / removes dirs."""
+    img_dir = tmp_path / "imgs"
+    sub = img_dir / "sub"
+    sub.mkdir(parents=True)
+
+    resp = client.post("/api/quality/delete-files",
+                       json={"img_dir": str(img_dir), "files": ["sub"]})
+    body = resp.json()
+    assert body["count"] == 0
+    assert sub.exists() and sub.is_dir()
+    assert body["skipped"][0]["reason"] == "Not a file"
+
+
 def test_similarity_repeat_query_reuses_cache_no_rehash(client, tmp_path, monkeypatch):
     """A second query against the same folder must reuse the cached (hash, tree)
     index and decode ZERO corpus images — only the new query image is read."""

@@ -16,8 +16,14 @@ from collections import OrderedDict
 from core.model_loader import load_model as _load_model
 from core.inference import run_inference, letterbox, preprocess, _padded_to_tensor, run_segmentation
 from server.errors import route_errors
-from server.path_safety import safe_image_file, safe_image_dir, safe_model_file, safe_path, UnsafePathError
-from server.state import clip_state, embedder_state, seg_state, quant_state, all_states, executor
+from server.path_safety import (
+    safe_image_file, safe_image_dir, safe_model_file, safe_video_file,
+    safe_path, UnsafePathError,
+)
+from server.state import (
+    clip_state, embedder_state, seg_state, quant_state,
+    TaskState, all_states, executor,
+)
 from server.utils import imread, encode_jpeg, glob_images, overlay_segmentation, generate_palette
 
 router = APIRouter()
@@ -856,6 +862,175 @@ async def api_tracking_update(req: TrackerUpdateRequest):
             for t in tracks
         ],
     }
+
+
+# ── Tracking: full-sequence runner (background job) ────
+# The interactive /api/tracking/update endpoint above processes ONE typed frame
+# at a time against a shared LRU tracker — it can't demonstrate tracking over a
+# sequence. This job runs a whole folder of frames (or a video) through a
+# per-JOB tracker (created fresh in the worker so concurrent runs never share a
+# tracker) and reports stable IDs + trajectories.
+tracking_state = TaskState()
+all_states["tracking"] = tracking_state
+
+# Bound the snapshot the status poller serializes: keep per-frame track rows
+# (small) for every processed frame but only a handful of full overlay images
+# (heavy base64 JPEGs). Evenly spaced previews give the UI a filmstrip without
+# ballooning memory on a long sequence.
+_TRACK_MAX_FRAMES = 1000
+_TRACK_OVERLAY_PREVIEWS = 12
+# Prune dead tracks every N frames so the tracker's list can't grow unbounded
+# on very long sequences (update() prunes per frame too, but this is the
+# explicit P2 memory bound from the backlog).
+_TRACK_PRUNE_EVERY = 200
+
+
+class TrackSequenceRequest(BaseModel):
+    model_path: str
+    model_type: Optional[str] = None
+    # Provide EITHER image_dir (a folder of frames in sorted order) OR
+    # video_path. image_dir takes precedence when both are set.
+    image_dir: str = ""
+    video_path: str = ""
+    tracker: str = "bytetrack"     # "sort" | "bytetrack"
+    conf: float = 0.25
+    # Cap frames so an enormous folder/video can't run unbounded. Clamped to
+    # _TRACK_MAX_FRAMES regardless of what the client requests.
+    max_frames: int = 300
+
+
+def _track_frame_source(image_dir: str, video_path: str, max_frames: int):
+    """Yield (frame_idx, frame) from a frame folder or a video, lazily.
+
+    Folder frames are read in sorted (glob_images) order. Video frames are
+    decoded one at a time so memory stays flat regardless of sequence length.
+    """
+    if image_dir:
+        files = glob_images(image_dir)[:max_frames]
+        for idx, fp in enumerate(files):
+            frame = imread(fp)
+            if frame is None:
+                continue
+            yield idx, frame
+        return
+    cap = cv2.VideoCapture(video_path)
+    try:
+        idx = 0
+        while idx < max_frames:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            yield idx, frame
+            idx += 1
+    finally:
+        cap.release()
+
+
+@router.post("/api/tracking/run-sequence")
+async def api_tracking_run_sequence(req: TrackSequenceRequest):
+    """Track a folder of frames (or a video) end-to-end as a background job."""
+    # Validate paths synchronously at the boundary before submitting the worker.
+    try:
+        model_path = safe_model_file(req.model_path)
+        image_dir = safe_image_dir(req.image_dir) if req.image_dir else ""
+        video_path = safe_video_file(req.video_path) if req.video_path else ""
+    except UnsafePathError as e:
+        return {"error": str(e), "code": f"PATH_{e.code}"}
+    if not image_dir and not video_path:
+        return {"error": "image_dir or video_path required"}
+    if req.tracker not in ("sort", "bytetrack"):
+        return {"error": f"Unknown tracker '{req.tracker}' (expected sort|bytetrack)"}
+
+    max_frames = max(1, min(req.max_frames, _TRACK_MAX_FRAMES))
+    # Atomic start guard — a second POST while running returns the error.
+    if not tracking_state.try_start(
+            progress=0, total=max_frames, msg="Starting...",
+            results={}, frames=[], previews=[], summary={}):
+        return {"error": "Tracking already running"}
+
+    @route_errors(state=tracking_state, scope="tracking")
+    def _run():
+        from core.tracking import create_tracker, draw_track_overlay, prune_dead_tracks
+        # Per-JOB tracker: created fresh inside the worker so two concurrent
+        # run-sequence jobs (or this job + the interactive /update tracker) never
+        # mutate a shared tracker.
+        tracker = create_tracker(req.tracker)
+        mi = _load_model(model_path, model_type=req.model_type) if req.model_type \
+            else _load_model(model_path)
+        names = getattr(mi, "names", {}) or {}
+
+        # Pick frame indices that should get a heavy overlay preview up front so
+        # they're spaced evenly across the sequence (filmstrip, not first-N).
+        preview_at = set(
+            int(i * (max_frames - 1) / max(_TRACK_OVERLAY_PREVIEWS - 1, 1))
+            for i in range(_TRACK_OVERLAY_PREVIEWS)
+        ) if max_frames > 1 else {0}
+
+        frame_rows: list[dict] = []
+        previews: list[dict] = []
+        unique_ids: set[int] = set()
+        processed = 0
+        for frame_idx, frame in _track_frame_source(image_dir, video_path, max_frames):
+            # Cooperative stop: re-check running each frame so force-stop and a
+            # second-tab stop break the loop promptly.
+            if not tracking_state.get("running", True):
+                tracking_state.update(msg="Stopped by user")
+                break
+            result = run_inference(mi, frame, req.conf)
+            boxes = np.asarray(result.boxes, dtype=np.float32) \
+                if len(result.boxes) else np.empty((0, 4), np.float32)
+            scores = np.asarray(result.scores, dtype=np.float32) \
+                if len(result.scores) else np.empty((0,), np.float32)
+            class_ids = np.asarray(result.class_ids, dtype=np.int64) \
+                if len(result.class_ids) else np.empty((0,), np.int64)
+            tracks = tracker.update(boxes, scores, class_ids)
+            for t in tracks:
+                unique_ids.add(int(t.id))
+            frame_rows.append({
+                "frame_idx": frame_idx,
+                "tracks": [
+                    {"id": int(t.id), "box": [round(float(v), 1) for v in t.box],
+                     "class_id": int(t.class_id), "score": round(float(t.score), 3)}
+                    for t in tracks
+                ],
+            })
+            if frame_idx in preview_at:
+                vis = draw_track_overlay(frame, tracks, names=names)
+                previews.append({"frame_idx": frame_idx, "image": encode_jpeg(vis)})
+            processed += 1
+            # Bound tracker memory on long runs (P2): explicit periodic prune.
+            if processed % _TRACK_PRUNE_EVERY == 0:
+                prune_dead_tracks(tracker)
+            # Publish progress + a fresh shallow list (snapshot() is shallow, so
+            # handing the poller a new list avoids racing in-place mutation).
+            tracking_state.update(progress=processed,
+                                  msg=f"Tracking frame {processed}/{max_frames}...",
+                                  frames=list(frame_rows))
+
+        summary = {
+            "num_frames": processed,
+            "num_unique_ids": len(unique_ids),
+            "tracker": req.tracker,
+            "source": "image_dir" if image_dir else "video",
+        }
+        stopped = not tracking_state.get("running", True)
+        tracking_state.update(
+            running=False,
+            msg="Stopped" if stopped else "Complete",
+            frames=list(frame_rows),
+            previews=previews,
+            summary=summary,
+            results={"summary": summary, "frames": list(frame_rows),
+                     "previews": previews})
+
+    executor.submit(_run)
+    return {"ok": True}
+
+
+@router.get("/api/tracking/sequence-status")
+async def api_tracking_sequence_status():
+    return tracking_state.snapshot() if hasattr(tracking_state, "snapshot") \
+        else dict(tracking_state)
 
 
 # ── HuggingFace Hub API ────────────────────────────────

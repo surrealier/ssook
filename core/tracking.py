@@ -239,3 +239,60 @@ def create_tracker(tracker_type: str = "bytetrack", **kwargs):
     if tracker_type == "sort":
         return SORTTracker(**kwargs)
     return ByteTracker(**kwargs)
+
+
+def prune_dead_tracks(tracker, max_age: int | None = None) -> int:
+    """Drop tracks unseen for longer than `max_age` from a tracker's list.
+
+    WHY: over a long sequence (a video tab feeding thousands of frames) the
+    tracker's `tracks` list only grows — `update()` already removes tracks past
+    `max_age` each frame, but a caller that wants to bound memory MORE
+    aggressively (e.g. between batches, or with a tighter age) can call this. It
+    is a no-op safety net that returns how many were removed so a job can log
+    pruning. Trajectories are already capped at 60 points inside `update()`, so
+    pruning the dead Track objects is the remaining unbounded growth source.
+    """
+    if max_age is None:
+        max_age = tracker.max_age
+    before = len(tracker.tracks)
+    tracker.tracks = [t for t in tracker.tracks if t.time_since_update <= max_age]
+    return before - len(tracker.tracks)
+
+
+# Distinct BGR colors keyed by track id so the same object keeps one color
+# across frames (id % len). Kept module-level so the overlay drawer is cheap.
+_TRACK_COLORS = [
+    (56, 56, 255), (151, 157, 255), (31, 112, 255), (29, 178, 255),
+    (49, 210, 207), (10, 249, 72), (23, 204, 146), (134, 219, 61),
+    (52, 147, 26), (187, 212, 0), (168, 153, 44), (255, 194, 0),
+    (147, 69, 52), (255, 115, 100), (236, 24, 0), (255, 56, 132),
+    (133, 0, 82), (255, 56, 203), (200, 149, 255), (199, 55, 255),
+]
+
+
+def draw_track_overlay(frame: np.ndarray, tracks: list,
+                       names: "dict | None" = None,
+                       draw_trajectory: bool = True) -> np.ndarray:
+    """Draw track boxes + IDs + trajectories onto a COPY of `frame`.
+
+    cv2 is imported lazily so importing core.tracking (pure numpy) stays
+    cv2-free for the logic tests. Each track is colored by its id so an object
+    keeps one color across frames; the trajectory is the polyline of recent
+    center points kept on the Track.
+    """
+    import cv2
+
+    vis = frame.copy()
+    names = names or {}
+    for t in tracks:
+        color = _TRACK_COLORS[int(t.id) % len(_TRACK_COLORS)]
+        x1, y1, x2, y2 = (int(v) for v in t.box)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+        cls_name = names.get(int(t.class_id), str(int(t.class_id)))
+        label = f"#{int(t.id)} {cls_name}"
+        cv2.putText(vis, label, (x1, max(y1 - 4, 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+        if draw_trajectory and len(t.trajectory) > 1:
+            pts = np.asarray(t.trajectory, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(vis, [pts], isClosed=False, color=color, thickness=2)
+    return vis

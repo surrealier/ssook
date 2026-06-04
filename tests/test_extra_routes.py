@@ -363,3 +363,198 @@ def test_segmentation_concurrent_start_guard(seg_dataset):
         assert r.json() == {"error": "Segmentation evaluation already running"}
     finally:
         seg_state.update(running=False)
+
+
+# ── Tracking: per-job tracker logic (pure numpy, cv2-free) ──────────────────
+# These exercise core.tracking directly — no model load, no cv2 — so they run
+# in the ONNX-runtime-only / memory-constrained env.
+class TestTrackerSequenceLogic:
+    def _moving_box(self, x, y, w=20, h=20):
+        return np.array([x, y, x + w, y + h], dtype=np.float32)
+
+    def test_stable_ids_across_frames(self):
+        """Two objects translating smoothly keep their IDs across many frames
+        (the whole point the standalone tab couldn't show)."""
+        from core.tracking import create_tracker
+        tracker = create_tracker("sort", min_hits=1)
+        ids_a, ids_b = set(), set()
+        for f in range(10):
+            boxes = np.stack([
+                self._moving_box(10 + f * 5, 10),   # object A drifts right
+                self._moving_box(200 - f * 5, 200),  # object B drifts left
+            ])
+            scores = np.array([0.9, 0.9], dtype=np.float32)
+            cids = np.array([0, 0], dtype=np.int64)
+            tracks = tracker.update(boxes, scores, cids)
+            # After warmup, both detections should map to exactly two tracks.
+            if f >= 1:
+                assert len(tracks) == 2, f"frame {f}: {len(tracks)} tracks"
+                by_center = sorted(tracks, key=lambda t: t.box[0])
+                ids_b.add(by_center[0].id)   # leftward object has smaller x late
+                ids_a.add(by_center[-1].id)
+        # Each object kept a single stable ID for the whole run.
+        assert len(ids_a) == 1
+        assert len(ids_b) == 1
+        assert ids_a != ids_b
+
+    def test_bytetrack_stable_ids(self):
+        from core.tracking import create_tracker
+        tracker = create_tracker("bytetrack", min_hits=1)
+        seen = set()
+        for f in range(8):
+            boxes = np.stack([self._moving_box(10 + f * 4, 50)])
+            tracks = tracker.update(boxes, np.array([0.9], np.float32),
+                                    np.array([1], np.int64))
+            for t in tracks:
+                seen.add(t.id)
+        assert len(seen) == 1  # one object → one persistent id
+
+    def test_dead_tracks_pruned_when_object_leaves(self):
+        """When detections stop, the track ages out within max_age and the
+        tracker's internal list shrinks back to empty (no unbounded growth)."""
+        from core.tracking import create_tracker
+        tracker = create_tracker("sort", max_age=3, min_hits=1)
+        for f in range(4):
+            tracker.update(np.stack([self._moving_box(10 + f, 10)]),
+                           np.array([0.9], np.float32), np.array([0], np.int64))
+        assert len(tracker.tracks) == 1
+        # Feed empty detections for > max_age frames → the track dies.
+        empty = np.empty((0, 4), np.float32)
+        for _ in range(5):
+            tracker.update(empty, np.empty((0,), np.float32),
+                           np.empty((0,), np.int64))
+        assert len(tracker.tracks) == 0
+
+    def test_prune_dead_tracks_helper(self):
+        """prune_dead_tracks drops tracks whose time_since_update exceeds the
+        age and returns how many were removed."""
+        from core.tracking import create_tracker, prune_dead_tracks
+        tracker = create_tracker("sort", max_age=30, min_hits=1)
+        tracker.update(np.stack([self._moving_box(10, 10)]),
+                       np.array([0.9], np.float32), np.array([0], np.int64))
+        assert len(tracker.tracks) == 1
+        # Force the single track to look stale, then prune with a tight age.
+        tracker.tracks[0].time_since_update = 10
+        removed = prune_dead_tracks(tracker, max_age=5)
+        assert removed == 1
+        assert len(tracker.tracks) == 0
+
+    def test_trajectory_capped(self):
+        """Trajectories are capped at 60 points so a long run can't grow a
+        track's point list unbounded."""
+        from core.tracking import create_tracker
+        tracker = create_tracker("sort", min_hits=1)
+        for f in range(120):
+            tracker.update(np.stack([self._moving_box(10, 10)]),
+                           np.array([0.9], np.float32), np.array([0], np.int64))
+        assert tracker.tracks, "track should survive a stationary object"
+        assert all(len(t.trajectory) <= 60 for t in tracker.tracks)
+
+
+# ── Tracking: full-sequence runner route (needs cv2 — DON'T run in the
+#    memory-constrained env; runs centrally). Mocks model load + inference so
+#    no real .onnx weights are required. ─────────────────────────────────────
+@pytest.fixture
+def track_sequence_dataset(tmp_path, monkeypatch):
+    """A folder of 5 frames + a fake detector that reports one steadily-moving
+    box per frame, so the tracker yields a single stable ID."""
+    img_dir = tmp_path / "frames"
+    img_dir.mkdir()
+    model = tmp_path / "det.onnx"
+    model.write_bytes(b"x")
+    for i in range(5):
+        (img_dir / f"f{i:03d}.jpg").write_bytes(b"x")
+
+    # imread returns a real small BGR frame so draw_track_overlay/encode_jpeg
+    # have something to draw on. A per-call counter advances the box.
+    counter = {"i": 0}
+
+    def _imread(_fp):
+        return np.zeros((64, 64, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(er, "imread", _imread)
+
+    class _FakeMI:
+        names = {0: "person"}
+
+    monkeypatch.setattr(er, "_load_model", lambda *a, **k: _FakeMI())
+
+    class _Det:
+        def __init__(self, x):
+            self.boxes = np.array([[x, 10, x + 20, 30]], dtype=np.float32)
+            self.scores = np.array([0.9], dtype=np.float32)
+            self.class_ids = np.array([0], dtype=np.int64)
+            self.infer_ms = 1.0
+
+    def _fake_infer(_mi, _frame, _conf):
+        i = counter["i"]
+        counter["i"] += 1
+        return _Det(10 + i * 5)
+
+    monkeypatch.setattr(er, "run_inference", _fake_infer)
+    return {"img_dir": str(img_dir), "model": str(model)}
+
+
+def test_tracking_run_sequence_produces_tracks_and_previews(track_sequence_dataset):
+    """The job returns per-frame tracks, a bounded set of overlay previews, and
+    a summary with the unique-ID count."""
+    from server.state import all_states
+    tracking_state = all_states["tracking"]
+    tracking_state.update(running=False)
+    r = client.post("/api/tracking/run-sequence", json={
+        "model_path": track_sequence_dataset["model"],
+        "image_dir": track_sequence_dataset["img_dir"],
+        "tracker": "sort",
+        "conf": 0.25,
+        "max_frames": 5,
+    })
+    assert r.status_code == 200, r.text
+    assert r.json().get("ok") is True
+    data = _wait_until_done("/api/tracking/sequence-status")
+
+    assert data["summary"]["num_frames"] == 5
+    # One steadily-moving object → exactly one unique track id.
+    assert data["summary"]["num_unique_ids"] == 1
+    assert len(data["frames"]) == 5
+    assert all("frame_idx" in row and "tracks" in row for row in data["frames"])
+    # Previews are bounded and carry base64 JPEG overlays.
+    assert 1 <= len(data["previews"]) <= 12
+    assert data["previews"][0]["image"]
+
+
+def test_tracking_run_sequence_rejects_bad_tracker(track_sequence_dataset):
+    from server.state import all_states
+    all_states["tracking"].update(running=False)
+    r = client.post("/api/tracking/run-sequence", json={
+        "model_path": track_sequence_dataset["model"],
+        "image_dir": track_sequence_dataset["img_dir"],
+        "tracker": "nonsense",
+    })
+    assert "Unknown tracker" in r.json().get("error", "")
+
+
+def test_tracking_run_sequence_requires_a_source(track_sequence_dataset):
+    from server.state import all_states
+    all_states["tracking"].update(running=False)
+    r = client.post("/api/tracking/run-sequence", json={
+        "model_path": track_sequence_dataset["model"],
+        "tracker": "sort",
+    })
+    assert "required" in r.json().get("error", "")
+
+
+def test_tracking_run_sequence_concurrent_start_guard(track_sequence_dataset):
+    """A second POST while running returns the already-running error."""
+    from server.state import all_states
+    tracking_state = all_states["tracking"]
+    tracking_state.update(running=False)
+    assert tracking_state.try_start(progress=0) is True
+    try:
+        r = client.post("/api/tracking/run-sequence", json={
+            "model_path": track_sequence_dataset["model"],
+            "image_dir": track_sequence_dataset["img_dir"],
+            "tracker": "sort",
+        })
+        assert r.json() == {"error": "Tracking already running"}
+    finally:
+        tracking_state.update(running=False)
