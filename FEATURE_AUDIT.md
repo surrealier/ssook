@@ -1101,7 +1101,7 @@ dHash 16×16(256bit) 쿼리 → Top-K(1-100). 출력: rank/image/distance.
 > 본 감사(2026-05-27) 이후, 전 모듈을 대상으로 한 다중 에이전트 개선 프로그램을 수행했다.
 > 모듈별 심층 재분석(Wave 0, 32개 모듈 → 186 findings: P0 25 / P1 99 / P2 62)으로 현재 코드
 > 기준 백로그를 만들고, **파일 소유권 단위 병렬 wave**로 구현·검증(`torch271` 전체 pytest,
-> baseline 304 → **495 passed**)·커밋했다. 검증은 단일 프로세스로 중앙집중(동시 torch 로드로 인한
+> baseline 304 → **568 passed**)·커밋했다. 검증은 단일 프로세스로 중앙집중(동시 torch 로드로 인한
 > 메모리 스파이크 방지).
 >
 > 분석 시점에 이미 해결돼 있던 항목(stale): 경로검증 `safe_*` 전 라우터, 상태격리 `TaskState`,
@@ -1118,11 +1118,15 @@ dHash 16×16(256bit) 쿼리 → Top-K(1-100). 출력: rank/image/distance.
 - **Wave 5 — UI 노출·viewer 동시성** (`7b141cc`): pose/iseg 디렉토리 결과 갤러리, augmentation 라벨 미리보기, model-compare 점진 렌더, duplicate 썸네일; viewer 시퀀셜/프레임버퍼 상태를 세션별 `seq_state`로 분리(동시 스트림 오염 해소, `run_inference(seq_state=)` additive).
 - **Wave 6**: Select-All 배치 class-style 적용, duplicate/leaky relpath 반환(폴더 간 동명 파일 식별).
 
-**의도적으로 보류 (신규 백엔드/대형 기능 — 별도 작업 권장)**
+- **Wave 7 — 보류했던 대형 기능 (1)** (`7c0c32e`): duplicate/leaky **안전 삭제** 엔드포인트(`/api/quality/delete-files`, root 내부 strict 검증, keep-one 기반), pose **HRNet/ViTPose** heatmap 디코더 + instance-seg **Mask R-CNN** 파서(정식 구현, 타입 디스패치), tracking **시퀀스/비디오 러너**(job별 독립 tracker, dead-track 정리).
+- **Wave 8 — 보류했던 대형 기능 (2)** (`1754b1a`): viewer **추론 입력 다운스케일**(`infer_max_side`, additive·박스 역스케일), 양자화/최적화 후 **정확도 검증 + degraded/롤백 신호**(`do_validate`), **EP-격리 서브프로세스 export**(OpenVINO/CoreML → 전용 venv, in-process fallback).
+- **Wave 9 — UI 노출 + P2** (`6d0945b`): tracking 시퀀스 UI, duplicate keep-one/삭제 + 재귀 썸네일, calibration 검증결과 표시(degraded 경고), HRNet/ViTPose/Mask R-CNN 모델타입 옵션, viewer 다운스케일 컨트롤, embedding-viewer 팔레트 확장 + 대형 N 서브샘플, anomaly/quality 임계값 안내문.
 
-- duplicate/leaky **keep-one/삭제 액션** (파괴적 — 전용 삭제 엔드포인트 + 확인 UX 필요).
-- tracking 독립 탭 **시퀀스 추적 데모**(영상 시퀀스 러너 백엔드 필요).
-- calibration **양자화 후 정확도 검증/롤백**(평가 파이프라인 연계 L).
-- pose **HRNet/ViTPose**, instance-seg **Mask R-CNN** 정식 파서(현재는 미지원 시 명확히 실패).
-- viewer **고해상도 read/infer/encode 파이프라인 분리 + 입력 다운스케일**(L).
-- EP-격리 서브프로세스 export(OpenVINO/CoreML 전용 venv 라우팅, L).
+> **결과**: 2026-05-27 감사가 P0로 지목한 항목과 이전에 "보류"로 분류했던 대형 기능까지 **전부 구현 완료**.
+> 누적 11 커밋, 회귀 0(568 passed). 메모리 스파이크는 "에이전트는 가벼운 검증만, 무거운 pytest는 중앙 단일 프로세스" 프로토콜로 해결.
+
+**남은 항목 (소규모 P2 / 선택)**
+
+- albumentations 기반 추가 증강(Shear/Cutout/MixUp/HSV) — `core/augmentation.py`가 자연스러운 확장 지점.
+- dHash 크기 옵션(8 vs 16) 통일, embedding-viewer L2-norm 토글 등 세부 UX 토글.
+- 토픽 docs(`docs/*.md`)의 신규 기능 반영(개념 문서라 현재도 정확성 유지).
