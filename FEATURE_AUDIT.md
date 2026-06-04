@@ -1093,3 +1093,36 @@ dHash 16×16(256bit) 쿼리 → Top-K(1-100). 출력: rank/image/distance.
 - 분석 범위: 30개 탭 (사이드바 등록 23 + 미등록 7)
 - 방법: 섹션별 병렬 sub-agent 7개 (Explore subagent_type) — 각 에이전트가 프론트엔드 + 라우터 + core + 문서를 모두 읽고 [1]-[4] 4-section 템플릿 적용 → 본 문서에서 정합
 - 우선순위는 "기능적 정확성 > 동시성·상태 > 스케일/병목 > UX > 보안 > 의존성" 순으로 부여됨
+
+---
+
+## 12. 대규모 개선 프로그램 결과 (2026-06, `feat/training-deployment`)
+
+> 본 감사(2026-05-27) 이후, 전 모듈을 대상으로 한 다중 에이전트 개선 프로그램을 수행했다.
+> 모듈별 심층 재분석(Wave 0, 32개 모듈 → 186 findings: P0 25 / P1 99 / P2 62)으로 현재 코드
+> 기준 백로그를 만들고, **파일 소유권 단위 병렬 wave**로 구현·검증(`torch271` 전체 pytest,
+> baseline 304 → **495 passed**)·커밋했다. 검증은 단일 프로세스로 중앙집중(동시 torch 로드로 인한
+> 메모리 스파이크 방지).
+>
+> 분석 시점에 이미 해결돼 있던 항목(stale): 경로검증 `safe_*` 전 라우터, 상태격리 `TaskState`,
+> error-analyzer class_id 매칭, remapper auto_reindex, merger/duplicate 1차 BKTree,
+> benchmark 고정배치 FPS, 사이드바 39탭 전부 등록.
+
+**해결 완료 (wave별)**
+
+- **MLOps** (`0a1dfe7`): 분류 자동 split, timm early-stopping, 학습 run 관리(목록/삭제/배포).
+- **Wave 1 — 백엔드 P0** (`6ebe0f7`): converter 경로 traversal, VLM endpoint SSRF, settings 커스텀모델·`fs/*` 경로 검증, embedder 미검증 경로; error-analyzer score-sort, splitter webp/tif, sampler/remapper 재귀 basename 덮어쓰기, anomaly 라인오류 중단, leaky 재귀, instance-seg/pose 미지원타입 가짜출력 차단, diagnose external-data 크래시, benchmark CSV 라벨; 다수 라우터 `try_start` 원자적 가드, event-loop 오프로드, tracking class-gating.
+- **Wave 2 — 스케일·UX·고급** (`c49b08e`): leaky/similarity/merger BKTree, inspector DOM-XSS escaping, segmentation 지표/오버레이 렌더, quality 임계값 UI, 취소버튼·파라미터 전송 복구, inspector EP 실제 프로브, quantizer fp16 I/O(fp32 유지)+static calib 명시.
+- **Wave 3 — 프론트 tabs.js·eval·profiler·vlm** (`890293a`): viewer 에러 i18n+FPS, analysis conf 컨트롤, splitter seed/overwrite, explorer 썸네일; eval GT부재 경고+macro/micro, profiler 고정배치 throughput 정정+EP fallback 경고, vlm 결과 영속화+transformers 캐시.
+- **Wave 4 — 배치·augmentation** (`93ddbdc`): pose/instance-seg/clip/embedder 배치·디렉토리 추론(`run_pose_batch`/`run_instance_seg_batch`/`encode_images`), CLIP float32 overflow→NaN 수정, `core/augmentation.py` 라벨 동시 변환, settings 배치 class-style 엔드포인트, diagnose 차트 병렬 생성.
+- **Wave 5 — UI 노출·viewer 동시성** (`7b141cc`): pose/iseg 디렉토리 결과 갤러리, augmentation 라벨 미리보기, model-compare 점진 렌더, duplicate 썸네일; viewer 시퀀셜/프레임버퍼 상태를 세션별 `seq_state`로 분리(동시 스트림 오염 해소, `run_inference(seq_state=)` additive).
+- **Wave 6**: Select-All 배치 class-style 적용, duplicate/leaky relpath 반환(폴더 간 동명 파일 식별).
+
+**의도적으로 보류 (신규 백엔드/대형 기능 — 별도 작업 권장)**
+
+- duplicate/leaky **keep-one/삭제 액션** (파괴적 — 전용 삭제 엔드포인트 + 확인 UX 필요).
+- tracking 독립 탭 **시퀀스 추적 데모**(영상 시퀀스 러너 백엔드 필요).
+- calibration **양자화 후 정확도 검증/롤백**(평가 파이프라인 연계 L).
+- pose **HRNet/ViTPose**, instance-seg **Mask R-CNN** 정식 파서(현재는 미지원 시 명확히 실패).
+- viewer **고해상도 read/infer/encode 파이프라인 분리 + 입력 다운스케일**(L).
+- EP-격리 서브프로세스 export(OpenVINO/CoreML 전용 venv 라우팅, L).
