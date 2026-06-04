@@ -710,6 +710,18 @@ const I18n = {
     'aug.angle':            { en: 'Rotation angle (°)',    ko: '회전 각도 (°)' },
     'aug.alpha':            { en: 'Contrast (alpha)',      ko: '대비 (alpha)' },
     'aug.beta':             { en: 'Brightness (beta)',     ko: '밝기 (beta)' },
+    // Wave 4 — directory mode for pose / instance-seg
+    'spec.use_directory':   { en: 'Use directory (batch)', ko: '디렉토리 사용 (일괄)' },
+    'spec.max_images':      { en: 'Max images',            ko: '최대 이미지 수' },
+    'spec.processed':       { en: '{n} processed',         ko: '{n}개 처리됨' },
+    'spec.no_results':      { en: 'No results',            ko: '결과 없음' },
+    // Wave 4 — augmentation label co-transform
+    'aug.label_dir_hint':   { en: 'Optional. With a YOLO label dir (or sibling .txt), boxes are transformed alongside the image.', ko: '선택 사항. YOLO 라벨 디렉토리(또는 동일 위치의 .txt)가 있으면 박스가 이미지와 함께 변환됩니다.' },
+    'aug.labels_transformed': { en: 'Labels co-transformed', ko: '라벨 함께 변환됨' },
+    'aug.num_boxes':        { en: '{n} boxes',             ko: '박스 {n}개' },
+    'aug.preview_only_short': { en: 'Image-only preview (no labels co-transformed)', ko: '이미지 전용 미리보기 (라벨 미변환)' },
+    // Wave 4 — duplicate thumbnails
+    'dup.preview':          { en: 'Preview',               ko: '미리보기' },
   },
 
   t(key, params) {

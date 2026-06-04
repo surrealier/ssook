@@ -133,6 +133,45 @@ def preprocess_darknet(frame: np.ndarray, input_size: tuple) -> np.ndarray:
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
+# Sequential models carry per-stream mutable state (frame ring buffer, stride
+# counter, async-preprocess future, last result). Historically this lived as
+# attrs on the process-wide singleton ModelInfo, so two concurrent viewer
+# streams of the same model corrupted each other's buffer/counter/last-result.
+# The viewer now passes a per-session dict (seq_state) into run_inference; these
+# accessors read/write that dict when present and fall back to the model attrs
+# otherwise, so every non-viewer caller (eval/analysis/benchmark) is unchanged.
+
+
+def _seq_get(seq_state: "dict | None", model_info: ModelInfo, key: str, default):
+    """Read a sequential-state value from the per-session dict or model attr."""
+    if seq_state is not None:
+        return seq_state.get(key, default)
+    return getattr(model_info, key, default)
+
+
+def _seq_set(seq_state: "dict | None", model_info: ModelInfo, key: str, value) -> None:
+    """Write a sequential-state value to the per-session dict or model attr."""
+    if seq_state is not None:
+        seq_state[key] = value
+    else:
+        setattr(model_info, key, value)
+
+
+def reset_seq_state(seq_state: "dict | None") -> None:
+    """Reset a per-session sequential-state dict in place (start/seek/step hook).
+
+    Mirrors the manual buffer clears the viewer previously did on the model
+    singleton, but targets the isolated per-session store. Leaves the async
+    thread pool intact — it is reused across the session and torn down on stop.
+    """
+    if seq_state is None:
+        return
+    seq_state["_frame_buffer"] = []
+    seq_state["_seq_tensor_buf"] = []
+    seq_state["_seq_frame_counter"] = 0
+    seq_state["_seq_last_result"] = None
+    seq_state["_seq_async_future"] = None
+
 
 def _preprocess_single_frame(frame: np.ndarray, input_size: tuple,
                              imagenet_norm: bool, use_letterbox: bool):
@@ -196,24 +235,28 @@ def preprocess_sequential(frames: list, input_size: tuple,
 
 def preprocess_sequential_cached(model_info, frame: np.ndarray, input_size: tuple,
                                  imagenet_norm: bool = False,
-                                 use_letterbox: bool = False) -> "tuple[np.ndarray, float, tuple] | None":
+                                 use_letterbox: bool = False,
+                                 seq_state: "dict | None" = None) -> "tuple[np.ndarray, float, tuple] | None":
     """3프레임 → (1, 9, H, W) tensor. 캐싱 + stride=2 + 비동기 전처리.
 
     Stride=2: [0,1,2] → [2,3,4] → [4,5,6] (매 2프레임마다 추론)
     홀수 프레임에서는 None 반환 → 호출자가 이전 결과 재사용.
     비동기: 추론 완료 후 다음 프레임 전처리를 백그라운드에서 시작.
 
+    seq_state: per-stream state dict. None → fall back to model_info attrs
+    (single-stream behavior, used by eval/benchmark callers).
+
     Returns: (tensor, ratio, pad) or None (skip this frame)
     """
     h, w = input_size
-    tbuf = getattr(model_info, '_seq_tensor_buf', None)
+    tbuf = _seq_get(seq_state, model_info, '_seq_tensor_buf', None)
     if tbuf is None:
         tbuf = []
-        model_info._seq_tensor_buf = tbuf
-    counter = getattr(model_info, '_seq_frame_counter', 0)
+        _seq_set(seq_state, model_info, '_seq_tensor_buf', tbuf)
+    counter = _seq_get(seq_state, model_info, '_seq_frame_counter', 0)
 
     # 비동기 전처리 결과 수거
-    fut = getattr(model_info, '_seq_async_future', None)
+    fut = _seq_get(seq_state, model_info, '_seq_async_future', None)
     if fut is not None:
         try:
             async_chw, async_ratio, async_pad = fut.result(timeout=0.1)
@@ -222,7 +265,7 @@ def preprocess_sequential_cached(model_info, frame: np.ndarray, input_size: tupl
                 tbuf.pop(0)
         except Exception:
             pass
-        model_info._seq_async_future = None
+        _seq_set(seq_state, model_info, '_seq_async_future', None)
 
     # 현재 프레임 전처리
     chw, ratio, pad = _preprocess_single_frame(frame, input_size, imagenet_norm, use_letterbox)
@@ -230,7 +273,7 @@ def preprocess_sequential_cached(model_info, frame: np.ndarray, input_size: tupl
     if len(tbuf) > 3:
         tbuf.pop(0)
     counter += 1
-    model_info._seq_frame_counter = counter
+    _seq_set(seq_state, model_info, '_seq_frame_counter', counter)
 
     # 버퍼가 3개 미만이면 skip
     if len(tbuf) < 3:
@@ -249,15 +292,17 @@ def preprocess_sequential_cached(model_info, frame: np.ndarray, input_size: tupl
 
 
 def _start_async_preprocess(model_info, frame: np.ndarray, input_size: tuple,
-                            imagenet_norm: bool, use_letterbox: bool):
+                            imagenet_norm: bool, use_letterbox: bool,
+                            seq_state: "dict | None" = None):
     """다음 프레임 전처리를 백그라운드 스레드에서 시작."""
     from concurrent.futures import ThreadPoolExecutor
-    pool = getattr(model_info, '_seq_thread_pool', None)
+    pool = _seq_get(seq_state, model_info, '_seq_thread_pool', None)
     if pool is None:
         pool = ThreadPoolExecutor(max_workers=1)
-        model_info._seq_thread_pool = pool
-    model_info._seq_async_future = pool.submit(
+        _seq_set(seq_state, model_info, '_seq_thread_pool', pool)
+    fut = pool.submit(
         _preprocess_single_frame, frame.copy(), input_size, imagenet_norm, use_letterbox)
+    _seq_set(seq_state, model_info, '_seq_async_future', fut)
 
 
 
@@ -764,7 +809,15 @@ def _make_batch_tensor(tensor: np.ndarray, bs: int, model_info: ModelInfo) -> np
 
 
 def run_inference(model_info: ModelInfo, frame: np.ndarray,
-                  conf: float) -> DetectionResult:
+                  conf: float, seq_state: "dict | None" = None) -> DetectionResult:
+    """단일 프레임 추론.
+
+    seq_state: optional per-stream sequential-state dict (frame buffer / stride
+    counter / async future / last result). Only consumed by seq_ models; when
+    None, sequential state falls back to attrs on the shared ModelInfo singleton
+    (legacy single-stream behavior). The viewer passes a per-session dict so two
+    concurrent streams of the same seq model do not corrupt each other.
+    """
     if model_info.session is None:
         return DetectionResult.empty()
 
@@ -826,11 +879,12 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
         imagenet_norm = model_info.model_type in ("seq_rfdetr", "seq_dinov3")
         use_letterbox = model_info.model_type == "seq_yolo"
         prep_result = preprocess_sequential_cached(
-            model_info, frame, model_info.input_size, imagenet_norm, use_letterbox)
+            model_info, frame, model_info.input_size, imagenet_norm, use_letterbox,
+            seq_state=seq_state)
         if prep_result is None:
             # Stride skip — 이전 결과 재사용
             infer_ms = 0.0
-            cached = getattr(model_info, '_seq_last_result', None)
+            cached = _seq_get(seq_state, model_info, '_seq_last_result', None)
             result = cached if cached is not None else DetectionResult.empty()
         else:
             tensor, ratio, pad = prep_result
@@ -844,9 +898,10 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
                 result = postprocess_dinov3_seq(output, conf, model_info.input_size, orig_shape)
             else:
                 result = DetectionResult.empty()
-            model_info._seq_last_result = result
+            _seq_set(seq_state, model_info, '_seq_last_result', result)
             # 비동기: 다음 프레임 전처리 시작 (현재 프레임을 미리 처리)
-            _start_async_preprocess(model_info, frame, model_info.input_size, imagenet_norm, use_letterbox)
+            _start_async_preprocess(model_info, frame, model_info.input_size, imagenet_norm, use_letterbox,
+                                    seq_state=seq_state)
     else:
         padded, ratio, pad = letterbox(frame, model_info.input_size)
         tensor = _padded_to_tensor(padded, model_info.input_size)

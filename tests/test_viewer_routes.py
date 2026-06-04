@@ -112,3 +112,118 @@ def test_viewer_start_refuses_embedding(monkeypatch):
     resp = _start(monkeypatch, "embedding")
     assert resp.get("error") == "vlm_unsupported"
     assert "session_id" not in resp
+
+
+# ── P1/concurrency: per-stream sequential state isolation ───────────────
+# These import core.inference, which imports cv2 at module load. Under the
+# memory-safe protocol they are written but DEFERRED to the central run.
+# _preprocess_single_frame is monkeypatched so no real cv2 op executes.
+class _StubSeqModel:
+    """Minimal seq_ ModelInfo stand-in: only the attrs run_inference touches."""
+
+    def __init__(self):
+        self.model_type = "seq_yolo"
+        self.input_size = (32, 32)
+        self.names = {0: "person"}
+
+
+def _drive_seq(model, seq_state, n_frames: int, label: str) -> dict:
+    """Push n_frames through preprocess_sequential_cached with a per-stream
+    seq_state. Returns the counters/tensors recorded so callers can assert
+    two streams advance independently. Each frame's chw carries a stream tag
+    so a cross-stream buffer leak is detectable.
+    """
+    import numpy as _np
+    from core import inference
+
+    produced = []  # frame indices where a tensor (not a stride-skip) was emitted
+    for i in range(n_frames):
+        frame = _np.zeros((8, 8, 3), dtype=_np.uint8)
+        out = inference.preprocess_sequential_cached(
+            model, frame, model.input_size, seq_state=seq_state)
+        if out is not None:
+            produced.append(i)
+    return {
+        "produced": produced,
+        "counter": seq_state["_seq_frame_counter"],
+        "buf_len": len(seq_state["_seq_tensor_buf"]),
+    }
+
+
+def test_seq_state_two_sessions_advance_independently(monkeypatch):
+    """Two sessions of the SAME seq model, each with its own seq_state, must
+    keep independent stride counters/buffers — the bug was a shared counter on
+    the ModelInfo singleton causing one stream's parity to skip the other's.
+    """
+    from core import inference
+
+    # Avoid cv2: produce a deterministic (3,H,W) tensor tagged with a counter.
+    calls = {"n": 0}
+
+    def fake_single(frame, input_size, imagenet_norm, use_letterbox):
+        import numpy as _np
+        calls["n"] += 1
+        h, w = input_size
+        return _np.full((3, h, w), float(calls["n"]), dtype=_np.float32), 1.0, (0.0, 0.0)
+
+    monkeypatch.setattr(inference, "_preprocess_single_frame", fake_single)
+
+    model = _StubSeqModel()
+    inference.reset_seq_state(state_a := {})
+    inference.reset_seq_state(state_b := {})
+
+    res_a = _drive_seq(model, state_a, 7, "A")
+    res_b = _drive_seq(model, state_b, 7, "B")
+
+    # Each session counts only its OWN 7 frames (not 14 shared).
+    assert res_a["counter"] == 7
+    assert res_b["counter"] == 7
+    # Same input cadence → same emit pattern, proving no parity collision.
+    assert res_a["produced"] == res_b["produced"]
+    # Buffers are distinct objects (no aliasing through the model singleton).
+    assert state_a["_seq_tensor_buf"] is not state_b["_seq_tensor_buf"]
+
+
+def test_seq_state_falls_back_to_model_attrs_when_none(monkeypatch):
+    """seq_state=None must use the ModelInfo attrs (legacy single-stream path),
+    leaving non-viewer callers (eval/benchmark) unchanged.
+    """
+    from core import inference
+
+    def fake_single(frame, input_size, imagenet_norm, use_letterbox):
+        import numpy as _np
+        h, w = input_size
+        return _np.zeros((3, h, w), dtype=_np.float32), 1.0, (0.0, 0.0)
+
+    monkeypatch.setattr(inference, "_preprocess_single_frame", fake_single)
+
+    model = _StubSeqModel()
+    import numpy as _np
+    for _ in range(4):
+        inference.preprocess_sequential_cached(
+            model, _np.zeros((8, 8, 3), dtype=_np.uint8), model.input_size)
+
+    # State landed on the model attrs, not on any dict.
+    assert getattr(model, "_seq_frame_counter") == 4
+    assert len(getattr(model, "_seq_tensor_buf")) == 3
+
+
+def test_reset_seq_state_clears_per_session_dict():
+    """reset_seq_state on a populated dict rewinds counter/buffers (seek/step)."""
+    from core import inference
+
+    state = {
+        "_seq_frame_counter": 9,
+        "_seq_tensor_buf": [1, 2, 3],
+        "_seq_last_result": object(),
+        "_seq_async_future": object(),
+        "_frame_buffer": [object()],
+    }
+    inference.reset_seq_state(state)
+    assert state["_seq_frame_counter"] == 0
+    assert state["_seq_tensor_buf"] == []
+    assert state["_seq_last_result"] is None
+    assert state["_seq_async_future"] is None
+    assert state["_frame_buffer"] == []
+    # None is a no-op (used when a non-seq model has no seq_state).
+    inference.reset_seq_state(None)

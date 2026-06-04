@@ -136,6 +136,9 @@ Tabs['model-compare'] = {
     if (!a||!b||!imgDir) { App.setStatus(t('cmp.select_both')); return; }
     document.getElementById('cmp-stop').disabled = false;
     document.getElementById('cmp-prog').style.width = '0%';
+    // Reset prior run state so incremental polling auto-shows the first new result.
+    this._results = null; this._idx = 0;
+    const sl = document.getElementById('cmp-slider'); if (sl) { sl.max = 0; sl.value = 0; sl.disabled = true; }
     try {
       const r = await API.post('/api/analysis/model-compare', {
         model_a: a, model_b: b,
@@ -155,11 +158,21 @@ Tabs['model-compare'] = {
       const _p = document.getElementById('cmp-prog'); if (_p) _p.style.width = pct+'%';
       const _pt = document.getElementById('cmp-prog-text'); if (_pt) _pt.textContent = pct+'%';
       document.getElementById('cmp-status').textContent = s.msg||'';
+      // Render whatever results are present each poll so the user can scrub completed
+      // pairs while the run continues (the backend appends per-image; images load lazily).
+      if (s.results && s.results.length) {
+        const prevLen = this._results ? this._results.length : 0;
+        this._results = s.results;
+        const sl = document.getElementById('cmp-slider');
+        if (sl) { sl.max = s.results.length - 1; sl.disabled = false; }
+        // Show the first result as soon as it lands; don't yank the slider from the
+        // position the user is inspecting once more arrive.
+        if (prevLen === 0) { this._idx = 0; this._showAt(0); }
+      }
       if (!s.running) {
         this._polling = false;
         document.getElementById('cmp-stop').disabled = true;
         if (_p) _p.style.width = '100%'; if (_pt) _pt.textContent = '100%';
-        if (s.results) { this._results = s.results; this._idx = 0; const sl = document.getElementById('cmp-slider'); sl.max = s.results.length-1; sl.disabled = false; this._showAt(0); }
         App.setStatus(t('cmp.complete'));
       } else setTimeout(()=>this._poll(), 500);
     } catch(e) { setTimeout(()=>this._poll(), 1000); }
@@ -1249,17 +1262,40 @@ Tabs.duplicate = {
         <div style="margin-top:0.5rem;"><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="dup-prog" style="width:0%;height:100%;"></div><span id="dup-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
           <span class="text-secondary" id="dup-msg" style="margin-top:0.25rem;display:block;">${t('ready')}</span></div>
       </div>
-      <div class="card" style="padding:1.5rem;"><div class="table-container"><table><thead><tr><th>Group</th><th>Image A</th><th>Image B</th><th>Distance</th></tr></thead>
-        <tbody id="dup-results"><tr><td colspan="4" class="text-secondary" style="text-align:center;padding:2rem;">—</td></tr></tbody></table></div></div></div>`;
+      <p class="text-secondary" style="font-size:11px;margin-top:0.5rem;">${t('merger.dhash_desc')}</p>
+      <div class="card" style="padding:1.5rem;"><div class="table-container"><table><thead><tr><th>Group</th><th>${t('dup.preview')}</th><th>Image A</th><th>Image B</th><th>Distance</th></tr></thead>
+        <tbody id="dup-results"><tr><td colspan="5" class="text-secondary" style="text-align:center;padding:2rem;">—</td></tr></tbody></table></div></div></div>`;
   },
+  // Stash the scanned dir + whether the scan was recursive so thumbnails can rebuild
+  // absolute paths from the basenames the backend returns (only safe when non-recursive,
+  // since recursive scans can have same-named files in different subfolders).
+  _imgDir: '', _recursive: false,
   async run() {
     const img_dir = document.getElementById('dup-img')?.value || G.imgDir;
     if (!img_dir) { App.setStatus(t('eval.select_images')); return; }
+    this._imgDir = img_dir;
+    this._recursive = !!document.getElementById('dup-recursive')?.checked;
     try {
-      const r = await API.post('/api/quality/duplicate', { img_dir, threshold: +document.getElementById('dup-thr').value, recursive: document.getElementById('dup-recursive')?.checked });
+      const r = await API.post('/api/quality/duplicate', { img_dir, threshold: +document.getElementById('dup-thr').value, recursive: this._recursive });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  },
+  // Lazy thumbnail of one duplicate via the existing explorer-preview endpoint
+  // (img_dir + basename). Returns an <img> placeholder whose src is filled on load.
+  _thumbCell(name) {
+    // Recursive scans return ambiguous basenames; only build paths for flat scans.
+    if (this._recursive || !this._imgDir) return '<span class="text-muted">—</span>';
+    const sep = /[\\/]$/.test(this._imgDir) ? '' : '/';
+    const imgPath = this._imgDir + sep + name;
+    const id = 'dup-thumb-' + (this._thumbSeq = (this._thumbSeq || 0) + 1);
+    // Fetch the base64 preview without GT boxes (no label_dir) and inject on arrival.
+    API.post('/api/data/explorer/preview', { img_path: imgPath }).then(d => {
+      const el = document.getElementById(id);
+      if (el && d && d.image) el.innerHTML = `<img src="data:image/jpeg;base64,${d.image}" style="max-width:64px;max-height:64px;border-radius:4px;" title="${escHtml(name)}">`;
+      else if (el) el.innerHTML = '<span class="text-muted">—</span>';
+    }).catch(() => {});
+    return `<span id="${id}"><span class="text-muted">…</span></span>`;
   },
   async _poll() {
     try {
@@ -1270,8 +1306,8 @@ Tabs.duplicate = {
       const m = document.getElementById('dup-msg'); if (m) m.textContent = s.msg || '';
       if (!s.running && s.results) {
         document.getElementById('dup-results').innerHTML = s.results.length
-          ? s.results.map(r => `<tr><td>${r.group}</td><td>${escHtml(r.image_a)}</td><td>${escHtml(r.image_b)}</td><td>${r.distance}</td></tr>`).join('')
-          : '<tr><td colspan="4" class="text-secondary" style="text-align:center;">' + t('dup.none') + '</td></tr>';
+          ? s.results.map(r => `<tr><td>${r.group}</td><td style="display:flex;gap:4px;">${this._thumbCell(r.image_a)}${this._thumbCell(r.image_b)}</td><td>${escHtml(r.image_a)}</td><td>${escHtml(r.image_b)}</td><td>${r.distance}</td></tr>`).join('')
+          : '<tr><td colspan="5" class="text-secondary" style="text-align:center;">' + t('dup.none') + '</td></tr>';
         App.setStatus((s.msg || '') + truncationNote(s, s.results.length));
       } else if (s.running) setTimeout(() => this._poll(), 500);
     } catch(e) {}
@@ -1390,6 +1426,8 @@ Tabs.augmentation = {
         <div class="card" style="padding:1.5rem;">
           <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('aug.title')}</h3>
           ${imgDirInput('aug-img')}
+          ${lblDirInput('aug-lbl')}
+          <p class="text-secondary" style="margin-top:0.25rem;font-size:11px;">${t('aug.label_dir_hint')}</p>
           <div class="form-group" style="margin-top:0.75rem;">
             <label class="form-label">${t('aug.type')}</label>
             <select class="form-input input-normal" id="aug-type" onchange="Tabs.augmentation._syncParams()">
@@ -1430,8 +1468,11 @@ Tabs.augmentation = {
     const num = (id, def) => { const v = parseFloat(document.getElementById(id)?.value); return isNaN(v) ? def : v; };
     try {
       // Send angle/alpha/beta so Rotate/Brightness are user-tunable (were hardcoded).
+      // label_dir enables YOLO box co-transform; backend draws boxes on both previews
+      // and returns labels/label_text/num_boxes with preview_only=false.
       const r = await API.post('/api/batch/augmentation', {
         img_dir,
+        label_dir: document.getElementById('aug-lbl')?.value || G.lblDir || '',
         aug_type: document.getElementById('aug-type').value,
         angle: num('aug-angle', 15),
         alpha: num('aug-alpha', 1.3),
@@ -1439,7 +1480,18 @@ Tabs.augmentation = {
       });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       document.getElementById('aug-orig').innerHTML = `<div style="text-align:center;"><img src="data:image/jpeg;base64,${r.original}" style="max-width:100%;max-height:300px;"><div class="text-secondary" style="margin-top:0.25rem;">${escHtml(r.file)}</div></div>`;
-      document.getElementById('aug-result').innerHTML = `<img src="data:image/jpeg;base64,${r.augmented}" style="max-width:100%;max-height:300px;">`;
+      // When labels were co-transformed (preview_only=false), show the box count and the
+      // transformed YOLO label text (monospace, escaped). Otherwise note image-only preview.
+      let resultHtml = `<img src="data:image/jpeg;base64,${r.augmented}" style="max-width:100%;max-height:300px;">`;
+      if (r.preview_only === false) {
+        resultHtml += `<div class="text-secondary" style="margin-top:0.5rem;font-size:12px;">${t('aug.labels_transformed')} · ${t('aug.num_boxes', {n: r.num_boxes || 0})}</div>`;
+        if (r.label_text) {
+          resultHtml += `<pre style="margin-top:0.5rem;max-height:140px;overflow:auto;background:var(--surface-02,#1e1e1e);padding:0.5rem;border-radius:6px;font-size:11px;white-space:pre;">${escHtml(r.label_text)}</pre>`;
+        }
+      } else {
+        resultHtml += `<div class="text-secondary" style="margin-top:0.5rem;font-size:12px;">${t('aug.preview_only_short')}</div>`;
+      }
+      document.getElementById('aug-result').innerHTML = resultHtml;
       App.setStatus(t('aug.ready'));
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   }
@@ -1450,18 +1502,25 @@ Tabs.augmentation = {
 Tabs['pose'] = {
   title: true,
   render() {
-    // SPEC-04: backend is single-image; expose a single-image picker (not a dir) so the
-    // selected file is actually what gets inferred (was silently using dir's first image).
+    // Single-image picker by default; an opt-in "directory mode" posts image_dir
+    // (+max_images) to the same /api/infer/pose endpoint and renders the per-image
+    // gallery (Wave-4 batch shape: results[]={file,image,num_persons,infer_ms,...}).
     return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('pose.title')}</h3>
         ${modelInput('pose-model')}
-        <div class="form-group" style="margin-top:0.75rem;">
+        <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.75rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="pose-use-dir" onchange="Tabs.pose._syncMode()"> ${t('spec.use_directory')}</label>
+        <div class="form-group" style="margin-top:0.75rem;" id="pose-img-group">
           <label class="form-label" for="pose-img">${t('cmt.test_image')}</label>
           <div style="display:flex;gap:0.5rem;">
             <input type="text" class="form-input input-normal" style="flex:1;" id="pose-img">
             <button class="btn btn-secondary btn-sm" onclick="pickFile('pose-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
           </div>
+        </div>
+        <div id="pose-dir-group" style="margin-top:0.75rem;display:none;">
+          ${imgDirInput('pose-img-dir')}
+          <div class="form-group" style="margin-top:0.75rem;max-width:200px;"><label class="form-label" for="pose-max-images">${t('spec.max_images')}</label>
+            <input type="number" class="form-input input-normal" id="pose-max-images" value="200" min="1" max="2000"></div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:0.75rem;">
           <div class="form-group"><label class="form-label">${t('pose.model_type')}</label>
@@ -1482,21 +1541,28 @@ Tabs['pose'] = {
       </div>
     </div>`;
   },
+  // Toggle between the single-image picker and the directory inputs.
+  _syncMode() {
+    const dir = document.getElementById('pose-use-dir')?.checked;
+    const imgGroup = document.getElementById('pose-img-group');
+    const dirGroup = document.getElementById('pose-dir-group');
+    if (imgGroup) imgGroup.style.display = dir ? 'none' : 'block';
+    if (dirGroup) dirGroup.style.display = dir ? 'block' : 'none';
+  },
   async run() {
     const model_path = document.getElementById('pose-model')?.value || G.model;
-    const image_path = document.getElementById('pose-img')?.value;
     if (!model_path) { App.setStatus(t('select_model')); return; }
-    if (!image_path) { App.setStatus(t('eval.select_images')); return; }
+    const useDir = document.getElementById('pose-use-dir')?.checked;
     // Keypoint visibility threshold (sent to backend AND used for the visible-count below).
     const kptConf = parseFloat(document.getElementById('pose-kpt-conf').value) || 0.5;
+    const conf = parseFloat(document.getElementById('pose-conf').value) || 0.25;
+    const model_type = document.getElementById('pose-model-type').value;
+    if (useDir) { this._runDir(model_path, model_type, conf, kptConf); return; }
+    const image_path = document.getElementById('pose-img')?.value;
+    if (!image_path) { App.setStatus(t('eval.select_images')); return; }
     App.setStatus(t('pose.running'));
     try {
-      const r = await API.post('/api/infer/pose', {
-        model_path, image_path,
-        conf: parseFloat(document.getElementById('pose-conf').value) || 0.25,
-        kpt_conf: kptConf,
-        model_type: document.getElementById('pose-model-type').value,
-      });
+      const r = await API.post('/api/infer/pose', { model_path, image_path, conf, kpt_conf: kptConf, model_type });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       let html = `<div style="text-align:center;"><img src="data:image/jpeg;base64,${r.image}" style="max-width:100%;max-height:500px;border-radius:8px;"></div>`;
       html += `<div style="margin-top:1rem;" class="text-secondary">${t('pose.persons')}: ${r.num_persons} | ${t('pose.infer_ms')}: ${r.infer_ms}ms</div>`;
@@ -1511,6 +1577,34 @@ Tabs['pose'] = {
       document.getElementById('pose-result').innerHTML = html;
       App.setStatus(t('pose.done'));
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  },
+  // Directory mode: post image_dir + max_images, render the per-image gallery
+  // (Wave-4 batch shape: {results:[{file,image,num_persons,infer_ms}], count, skipped, total_persons}).
+  async _runDir(model_path, model_type, conf, kptConf) {
+    const image_dir = document.getElementById('pose-img-dir')?.value || G.imgDir;
+    if (!image_dir) { App.setStatus(t('eval.select_images')); return; }
+    const max_images = +(document.getElementById('pose-max-images')?.value || 200);
+    App.setStatus(t('pose.running'));
+    try {
+      const r = await API.post('/api/infer/pose', { model_path, image_dir, max_images, conf, kpt_conf: kptConf, model_type });
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      const results = r.results || [];
+      let html = `<div class="text-secondary" style="margin-bottom:0.75rem;">${t('spec.processed', {n: r.count})} · ${t('pose.persons')}: ${r.total_persons}`
+        + (r.skipped ? ` · ${t('spec.skipped', {n: r.skipped})}` : '') + '</div>';
+      if (!results.length) {
+        html += `<span class="text-muted">${t('spec.no_results')}</span>`;
+      } else {
+        html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0.75rem;">';
+        for (const d of results) {
+          html += `<div style="text-align:center;"><img src="data:image/jpeg;base64,${d.image}" style="max-width:100%;border-radius:6px;">`
+            + `<div style="font-size:11px;margin-top:2px;">${escHtml(d.file)}</div>`
+            + `<div class="text-secondary" style="font-size:11px;">${t('pose.persons')}: ${d.num_persons} · ${d.infer_ms}ms</div></div>`;
+        }
+        html += '</div>';
+      }
+      document.getElementById('pose-result').innerHTML = html;
+      App.setStatus(t('pose.done'));
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   }
 };
 
@@ -1518,16 +1612,24 @@ Tabs['pose'] = {
 Tabs['instance-seg'] = {
   title: true,
   render() {
+    // Single-image by default; opt-in directory mode posts image_dir (+max_images)
+    // and renders the Wave-4 batch gallery (results[]={file,image,num_instances,infer_ms}).
     return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('instseg.title')}</h3>
         ${modelInput('iseg-model')}
-        <div class="form-group" style="margin-top:0.75rem;">
+        <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.75rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="iseg-use-dir" onchange="Tabs['instance-seg']._syncMode()"> ${t('spec.use_directory')}</label>
+        <div class="form-group" style="margin-top:0.75rem;" id="iseg-img-group">
           <label class="form-label" for="iseg-img">${t('cmt.test_image')}</label>
           <div style="display:flex;gap:0.5rem;">
             <input type="text" class="form-input input-normal" style="flex:1;" id="iseg-img">
             <button class="btn btn-secondary btn-sm" onclick="pickFile('iseg-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
           </div>
+        </div>
+        <div id="iseg-dir-group" style="margin-top:0.75rem;display:none;">
+          ${imgDirInput('iseg-img-dir')}
+          <div class="form-group" style="margin-top:0.75rem;max-width:200px;"><label class="form-label" for="iseg-max-images">${t('spec.max_images')}</label>
+            <input type="number" class="form-input input-normal" id="iseg-max-images" value="200" min="1" max="2000"></div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:0.75rem;">
           <div class="form-group"><label class="form-label">${t('instseg.model_type')}</label>
@@ -1545,21 +1647,55 @@ Tabs['instance-seg'] = {
       </div>
     </div>`;
   },
+  _syncMode() {
+    const dir = document.getElementById('iseg-use-dir')?.checked;
+    const imgGroup = document.getElementById('iseg-img-group');
+    const dirGroup = document.getElementById('iseg-dir-group');
+    if (imgGroup) imgGroup.style.display = dir ? 'none' : 'block';
+    if (dirGroup) dirGroup.style.display = dir ? 'block' : 'none';
+  },
   async run() {
     const model_path = document.getElementById('iseg-model')?.value || G.model;
-    const image_path = document.getElementById('iseg-img')?.value;
     if (!model_path) { App.setStatus(t('select_model')); return; }
+    const useDir = document.getElementById('iseg-use-dir')?.checked;
+    const conf = parseFloat(document.getElementById('iseg-conf').value) || 0.25;
+    const model_type = document.getElementById('iseg-model-type').value;
+    if (useDir) { this._runDir(model_path, model_type, conf); return; }
+    const image_path = document.getElementById('iseg-img')?.value;
     if (!image_path) { App.setStatus(t('eval.select_images')); return; }
     App.setStatus(t('instseg.running'));
     try {
-      const r = await API.post('/api/infer/instance-seg', {
-        model_path, image_path,
-        conf: parseFloat(document.getElementById('iseg-conf').value) || 0.25,
-        model_type: document.getElementById('iseg-model-type').value,
-      });
+      const r = await API.post('/api/infer/instance-seg', { model_path, image_path, conf, model_type });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       let html = `<div style="text-align:center;"><img src="data:image/jpeg;base64,${r.image}" style="max-width:100%;max-height:500px;border-radius:8px;"></div>`;
       html += `<div style="margin-top:1rem;" class="text-secondary">${t('instseg.instances')}: ${r.num_instances} | ${t('instseg.infer_ms')}: ${r.infer_ms}ms</div>`;
+      document.getElementById('iseg-result').innerHTML = html;
+      App.setStatus(t('instseg.done'));
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  },
+  // Directory mode: Wave-4 batch shape {results:[{file,image,num_instances,infer_ms}], count, skipped, total_instances}.
+  async _runDir(model_path, model_type, conf) {
+    const image_dir = document.getElementById('iseg-img-dir')?.value || G.imgDir;
+    if (!image_dir) { App.setStatus(t('eval.select_images')); return; }
+    const max_images = +(document.getElementById('iseg-max-images')?.value || 200);
+    App.setStatus(t('instseg.running'));
+    try {
+      const r = await API.post('/api/infer/instance-seg', { model_path, image_dir, max_images, conf, model_type });
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      const results = r.results || [];
+      let html = `<div class="text-secondary" style="margin-bottom:0.75rem;">${t('spec.processed', {n: r.count})} · ${t('instseg.instances')}: ${r.total_instances}`
+        + (r.skipped ? ` · ${t('spec.skipped', {n: r.skipped})}` : '') + '</div>';
+      if (!results.length) {
+        html += `<span class="text-muted">${t('spec.no_results')}</span>`;
+      } else {
+        html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0.75rem;">';
+        for (const d of results) {
+          html += `<div style="text-align:center;"><img src="data:image/jpeg;base64,${d.image}" style="max-width:100%;border-radius:6px;">`
+            + `<div style="font-size:11px;margin-top:2px;">${escHtml(d.file)}</div>`
+            + `<div class="text-secondary" style="font-size:11px;">${t('instseg.instances')}: ${d.num_instances} · ${d.infer_ms}ms</div></div>`;
+        }
+        html += '</div>';
+      }
       document.getElementById('iseg-result').innerHTML = html;
       App.setStatus(t('instseg.done'));
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }

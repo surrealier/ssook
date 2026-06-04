@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from core.app_config import AppConfig
-from core.inference import run_inference, run_classification, run_segmentation
+from core.inference import run_inference, run_classification, run_segmentation, reset_seq_state
 from server.model_manager import ensure_model
 from server.path_safety import safe_model_file, safe_video_file, UnsafePathError
 from server.state import executor
@@ -36,18 +36,16 @@ def _release_session(sess: dict) -> None:
         sess["cap"].release()
     except Exception:
         pass
-    # _start_async_preprocess가 model_info에 부착한 전처리 스레드풀 누수 방지.
-    model = sess.get("model")
-    pool = getattr(model, "_seq_thread_pool", None) if model is not None else None
+    # seq 전처리 스레드풀은 이제 per-session seq_state에 산다(공유 model 싱글톤이 아님).
+    # 누수 방지를 위해 세션 종료 시 닫는다.
+    seq_state = sess.get("seq_state")
+    pool = seq_state.get("_seq_thread_pool") if seq_state else None
     if pool is not None:
         try:
             pool.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
-        try:
-            model._seq_thread_pool = None
-        except Exception:
-            pass
+        seq_state["_seq_thread_pool"] = None
     sess["last_frame"] = None
     sess["last_result"] = None
 
@@ -116,12 +114,14 @@ async def viewer_start(req: VideoStartRequest):
                 "last_access": time.time(),
                 "stream_max_height": req.stream_max_height,
                 "tracker": tracker,
+                # Per-stream sequential state so two concurrent streams of the
+                # same seq model don't corrupt each other's buffer/counter via
+                # the shared ModelInfo singleton. Threaded into run_inference.
+                "seq_state": {},
             }
-            total = _video_sessions[sid]["total"]
-        model._frame_buffer = []
-        model._seq_tensor_buf = []
-        model._seq_frame_counter = 0
-        model._seq_last_result = None
+            sess = _video_sessions[sid]
+            total = sess["total"]
+        reset_seq_state(sess["seq_state"])
         return {"session_id": sid, "fps": fps, "total_frames": total}
     except Exception as e:
         return {"error": str(e)}
@@ -142,6 +142,7 @@ async def viewer_stream(session_id: str):
         # playing을 재확인한다(while 조건). cap/model 등 불변 핸들도 local로 고정.
         cap = sess["cap"]
         model = sess["model"]
+        seq_state = sess["seq_state"]  # per-stream sequential buffers (isolated)
         names = model.names or {}
         cfg = AppConfig()  # 루프 밖에서 한 번만 참조
         max_h = sess.get("stream_max_height", 0)
@@ -155,10 +156,7 @@ async def viewer_stream(session_id: str):
                 if seek_to is not None:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, seek_to)
                     sess["seek_to"] = None
-                    model._frame_buffer = []
-                    model._seq_tensor_buf = []
-                    model._seq_frame_counter = 0
-                    model._seq_last_result = None
+                    reset_seq_state(seq_state)
                     # 불연속 점프 후 이전 track ID/궤적이 streak으로 남지 않도록 리셋(VIEWER-03).
                     tracker = sess.get("tracker")
                     if tracker:
@@ -170,6 +168,9 @@ async def viewer_stream(session_id: str):
                     cur = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                     cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, cur + step))
                     sess["step_request"] = None
+                    # 불연속 점프는 seq 프레임 버퍼도 무효화 — 이전 위치 프레임이
+                    # 섞이면 stride 시퀀스가 깨진다.
+                    reset_seq_state(seq_state)
                     tracker = sess.get("tracker")
                     if tracker:
                         tracker.reset()
@@ -254,7 +255,7 @@ async def viewer_stream(session_id: str):
                         cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
                     _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
                 else:
-                    result = run_inference(model, frame, cfg.conf_threshold)
+                    result = run_inference(model, frame, cfg.conf_threshold, seq_state=seq_state)
                     sess["last_detections"] = len(result.boxes)
                     sess["last_infer_ms"] = round(result.infer_ms, 2)
                     sess["last_frame"] = frame.copy()
