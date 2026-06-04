@@ -32,6 +32,10 @@ Tabs.viewer = {
                 <option value="sort">SORT</option>
               </select>
             </div>
+            <div style="display:flex;gap:0.25rem;align-items:center;margin-top:0.4rem;">
+              <label class="form-label" style="font-size:10px;margin:0;white-space:nowrap;">${t('viewer.infer_max_side')}</label>
+              <input type="number" min="0" step="1" class="form-input input-normal" id="v-infer-max-side" placeholder="0" style="flex:1;height:26px;font-size:10px;min-width:0;padding:0 6px;">
+            </div>
           </div>
           <div class="card-flat" style="padding:0.75rem;">
             <div class="text-label" style="margin-bottom:0.5rem;">${t('settings.model')}</div>
@@ -464,9 +468,13 @@ Tabs.viewer = {
   async _startStream() {
     try {
       const conf = this._getConf();
+      // 0/blank = off; longer-side cap for the INFERENCE input only (independent of
+      // stream_max_height, which caps the displayed output).
+      const inferMaxSide = Math.max(0, parseInt(document.getElementById('v-infer-max-side')?.value, 10) || 0);
       const r = await API.post('/api/viewer/start', {
         model_path: G.model, video_path: G.videoPath, conf,
-        tracker_type: document.getElementById('v-tracker-type')?.value || 'none'
+        tracker_type: document.getElementById('v-tracker-type')?.value || 'none',
+        infer_max_side: inferMaxSide
       });
       if (r.error) { App.setStatus(this._viewerErrorText(r.error), r.error); return; }
       this._streamSessionId = r.session_id;

@@ -423,6 +423,57 @@ async def conf_optimizer_status():
 
 
 # ── 4. Embedding Viewer API ────────────────────────────
+
+# t-SNE is O(N^2); above this many points the projection dominates wall time and
+# memory. We deterministically subsample down to this cap before reduction so the
+# viewer stays responsive on large datasets. UMAP/PCA scale better but we apply
+# the same cap uniformly so the "plotted vs total" reporting is consistent.
+_EMBEDDING_PLOT_CAP = 5000
+
+
+def _subsample_indices(n: int, cap: int, *, seed: int = 0) -> list[int]:
+    """Pick at most `cap` row indices out of `n`, deterministically.
+
+    Returns sorted indices so the original label ordering is preserved in the
+    plot legend. Seeded RNG makes the same dataset always yield the same subset
+    (reproducible visualizations across runs). When n <= cap, returns all rows.
+    """
+    if n <= cap:
+        return list(range(n))
+    rng = np.random.default_rng(seed)
+    chosen = rng.choice(n, size=cap, replace=False)
+    return sorted(int(i) for i in chosen)
+
+
+def _qualitative_colors(n: int) -> list[tuple[float, float, float, float]]:
+    """Return `n` visually distinct RGBA colors.
+
+    matplotlib's tab10/tab20 only carry 10/20 fixed colors, so datasets with many
+    classes wrap and become indistinguishable. We use tab20 directly for <=20
+    classes (well-tuned, high-contrast) and otherwise walk an HSV ring with evenly
+    spaced hues so any class count stays separable.
+    """
+    import colorsys
+
+    if n <= 0:
+        return []
+    if n <= 20:
+        import matplotlib.pyplot as plt
+
+        cmap = plt.cm.get_cmap("tab20", n)
+        return [tuple(cmap(i)) for i in range(n)]
+    # Many classes: evenly spaced hues. Vary saturation/value slightly per index
+    # so adjacent hues that read similarly still differ in tone.
+    colors: list[tuple[float, float, float, float]] = []
+    for i in range(n):
+        hue = (i / n) % 1.0
+        sat = 0.65 if i % 2 == 0 else 0.9
+        val = 0.95 if i % 3 else 0.7
+        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+        colors.append((r, g, b, 1.0))
+    return colors
+
+
 class EmbeddingViewerRequest(BaseModel):
     model_path: str
     img_dir: str
@@ -489,6 +540,18 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
             return
 
         X = np.array(embeddings)
+        total = len(X)
+
+        # Bound the O(N^2) t-SNE (and keep UMAP/PCA snappy) by deterministically
+        # subsampling large datasets before the projection. Seeded -> same subset
+        # every run for the same dataset.
+        keep = _subsample_indices(total, _EMBEDDING_PLOT_CAP, seed=0)
+        subsampled = len(keep) < total
+        if subsampled:
+            X = X[keep]
+            labels = [labels[i] for i in keep]
+        plotted = len(X)
+
         embedding_state["msg"] = f"Running {req.method.upper()}..."
 
         try:
@@ -497,11 +560,13 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
                 coords = PCA(n_components=2).fit_transform(X)
             elif req.method == "umap":
                 import umap
-                n = min(15, len(X) - 1)
+                # n_neighbors must stay < n_samples; clamp to >=1 for tiny N.
+                n = max(1, min(15, plotted - 1))
                 coords = umap.UMAP(n_components=2, n_neighbors=n).fit_transform(X)
             else:
                 from sklearn.manifold import TSNE
-                perp = min(30, len(X) - 1)
+                # perplexity must stay < n_samples; clamp to >=1 for tiny N.
+                perp = max(1, min(30, plotted - 1))
                 coords = TSNE(n_components=2, perplexity=perp).fit_transform(X)
         except Exception as e:
             embedding_state.update(running=False, msg=f"Reduction error: {e}")
@@ -513,13 +578,17 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(figsize=(10, 8))
         unique_labels = sorted(set(labels))
-        cmap = plt.cm.get_cmap('tab10', max(len(unique_labels), 1))
+        colors = _qualitative_colors(len(unique_labels))
         for idx, lbl in enumerate(unique_labels):
             mask = [l == lbl for l in labels]
             pts = coords[mask]
-            ax.scatter(pts[:, 0], pts[:, 1], c=[cmap(idx)], label=lbl, s=20, alpha=0.7)
-        ax.legend(fontsize=8, markerscale=2)
-        ax.set_title(f"Embedding Visualization ({req.method.upper()})")
+            ax.scatter(pts[:, 0], pts[:, 1], c=[colors[idx]], label=lbl, s=20, alpha=0.7)
+        # Many classes overflow a single legend column; cap columns to stay readable.
+        ax.legend(fontsize=8, markerscale=2, ncol=max(1, len(unique_labels) // 25 + 1))
+        title = f"Embedding Visualization ({req.method.upper()})"
+        if subsampled:
+            title += f" — {plotted}/{total} sampled"
+        ax.set_title(title)
         fig.tight_layout()
 
         import io
@@ -529,7 +598,20 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
         buf.seek(0)
         # base64를 state에 직접 보관 — 고정 전역 temp 경로가 동시 run 간 충돌하던 것을 제거.
         embedding_state["image"] = base64.b64encode(buf.read()).decode()
-        embedding_state.update(running=False, msg="Complete")
+        # plotted/total/subsampled let the UI surface "showing N of M (sampled)".
+        note = (
+            f"Plotted {plotted} of {total} points (subsampled to cap {_EMBEDDING_PLOT_CAP})"
+            if subsampled
+            else f"Plotted all {plotted} points"
+        )
+        embedding_state.update(
+            running=False,
+            msg="Complete",
+            plotted=plotted,
+            total=total,
+            subsampled=subsampled,
+            note=note,
+        )
 
     executor.submit(_run)
     return {"ok": True}

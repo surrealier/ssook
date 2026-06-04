@@ -1139,6 +1139,7 @@ Tabs.anomaly = {
     return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('anomaly.title')}</h3>
+        <p class="text-secondary" style="font-size:11px;margin-bottom:0.75rem;">${t('anomaly.domain_hint')}</p>
         ${imgDirInput('anom-img')} ${lblDirInput('anom-lbl')}
         <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="anom-recursive"> ${t('common.recursive')}</label>
         <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.anomaly.run()">${t('run')}</button>
@@ -1182,6 +1183,7 @@ Tabs.quality = {
     return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('quality.title')}</h3>
+        <p class="text-secondary" style="font-size:11px;margin-bottom:0.75rem;">${t('quality.domain_hint')}</p>
         ${imgDirInput('qual-img')}
         <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="qual-recursive"> ${t('common.recursive')}</label>
         <details style="margin-top:0.75rem;">
@@ -1263,36 +1265,35 @@ Tabs.duplicate = {
           <span class="text-secondary" id="dup-msg" style="margin-top:0.25rem;display:block;">${t('ready')}</span></div>
       </div>
       <p class="text-secondary" style="font-size:11px;margin-top:0.5rem;">${t('merger.dhash_desc')}</p>
-      <div class="card" style="padding:1.5rem;"><div class="table-container"><table><thead><tr><th>Group</th><th>${t('dup.preview')}</th><th>Image A</th><th>Image B</th><th>Distance</th></tr></thead>
-        <tbody id="dup-results"><tr><td colspan="5" class="text-secondary" style="text-align:center;padding:2rem;">—</td></tr></tbody></table></div></div></div>`;
+      <div class="card" style="padding:1.5rem;"><div class="table-container"><table><thead><tr><th>Group</th><th>${t('dup.preview')}</th><th>Image A</th><th>Image B</th><th>Distance</th><th>${t('dup.actions')}</th></tr></thead>
+        <tbody id="dup-results"><tr><td colspan="6" class="text-secondary" style="text-align:center;padding:2rem;">—</td></tr></tbody></table></div></div></div>`;
   },
-  // Stash the scanned dir + whether the scan was recursive so thumbnails can rebuild
-  // absolute paths from the basenames the backend returns (only safe when non-recursive,
-  // since recursive scans can have same-named files in different subfolders).
-  _imgDir: '', _recursive: false,
+  // Stash the scanned dir so deletes/thumbnails can resolve files. rel_a/rel_b
+  // (Wave 6) uniquely identify a file under the img_dir root for BOTH flat and
+  // recursive scans, so we always prefer them over the ambiguous basename.
+  _imgDir: '',
   async run() {
     const img_dir = document.getElementById('dup-img')?.value || G.imgDir;
     if (!img_dir) { App.setStatus(t('eval.select_images')); return; }
     this._imgDir = img_dir;
-    this._recursive = !!document.getElementById('dup-recursive')?.checked;
     try {
-      const r = await API.post('/api/quality/duplicate', { img_dir, threshold: +document.getElementById('dup-thr').value, recursive: this._recursive });
+      const r = await API.post('/api/quality/duplicate', { img_dir, threshold: +document.getElementById('dup-thr').value, recursive: !!document.getElementById('dup-recursive')?.checked });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
-  // Lazy thumbnail of one duplicate via the existing explorer-preview endpoint
-  // (img_dir + basename). Returns an <img> placeholder whose src is filled on load.
-  _thumbCell(name) {
-    // Recursive scans return ambiguous basenames; only build paths for flat scans.
-    if (this._recursive || !this._imgDir) return '<span class="text-muted">—</span>';
+  // Lazy thumbnail via the explorer-preview endpoint. Resolve from the rel path
+  // (subfolder-qualified) so recursive scans render too (the old code bailed to
+  // '—' for recursive); fall back to the basename when no rel is present.
+  _thumbCell(rel, name) {
+    if (!this._imgDir) return '<span class="text-muted">—</span>';
     const sep = /[\\/]$/.test(this._imgDir) ? '' : '/';
-    const imgPath = this._imgDir + sep + name;
+    const imgPath = this._imgDir + sep + (rel || name);
     const id = 'dup-thumb-' + (this._thumbSeq = (this._thumbSeq || 0) + 1);
     // Fetch the base64 preview without GT boxes (no label_dir) and inject on arrival.
     API.post('/api/data/explorer/preview', { img_path: imgPath }).then(d => {
       const el = document.getElementById(id);
-      if (el && d && d.image) el.innerHTML = `<img src="data:image/jpeg;base64,${d.image}" style="max-width:64px;max-height:64px;border-radius:4px;" title="${escHtml(name)}">`;
+      if (el && d && d.image) el.innerHTML = `<img src="data:image/jpeg;base64,${d.image}" style="max-width:64px;max-height:64px;border-radius:4px;" title="${escHtml(rel || name)}">`;
       else if (el) el.innerHTML = '<span class="text-muted">—</span>';
     }).catch(() => {});
     return `<span id="${id}"><span class="text-muted">…</span></span>`;
@@ -1305,12 +1306,74 @@ Tabs.duplicate = {
       const pt = document.getElementById('dup-prog-text'); if (pt) pt.textContent = pct + '%';
       const m = document.getElementById('dup-msg'); if (m) m.textContent = s.msg || '';
       if (!s.running && s.results) {
-        document.getElementById('dup-results').innerHTML = s.results.length
-          ? s.results.map(r => `<tr><td>${r.group}</td><td style="display:flex;gap:4px;">${this._thumbCell(r.image_a)}${this._thumbCell(r.image_b)}</td><td>${escHtml(r.image_a)}</td><td>${escHtml(r.image_b)}</td><td>${r.distance}</td></tr>`).join('')
-          : '<tr><td colspan="5" class="text-secondary" style="text-align:center;">' + t('dup.none') + '</td></tr>';
+        this._results = s.results;
+        this._render(s.results);
         App.setStatus((s.msg || '') + truncationNote(s, s.results.length));
       } else if (s.running) setTimeout(() => this._poll(), 500);
     } catch(e) {}
+  },
+  _results: [],
+  // Render rows with per-row delete + a per-group "keep first, delete rest" button
+  // on the first row of each group. Delete sends the Wave-6 rel paths to
+  // /api/quality/delete-files (which validates strict containment in img_dir).
+  _render(results) {
+    const tbody = document.getElementById('dup-results');
+    if (!tbody) return;
+    if (!results.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="text-secondary" style="text-align:center;">' + t('dup.none') + '</td></tr>';
+      return;
+    }
+    // Track the first row index per group so only it shows the group action.
+    const seenGroups = new Set();
+    tbody.innerHTML = results.map((r, i) => {
+      const relA = r.rel_a || r.image_a;
+      const relB = r.rel_b || r.image_b;
+      let groupBtn = '';
+      if (!seenGroups.has(r.group)) {
+        seenGroups.add(r.group);
+        groupBtn = `<button class="btn btn-secondary btn-sm" style="margin-bottom:4px;display:block;" onclick="Tabs.duplicate._deleteGroup(${r.group})">${t('dup.keep_first')}</button>`;
+      }
+      // Per-row deletes target the B file (A is treated as the kept reference).
+      const rowBtn = `<button class="btn btn-danger btn-sm" onclick="Tabs.duplicate._deleteRow('${encodeURIComponent(relB)}')">${t('dup.delete')}</button>`;
+      return `<tr><td>${r.group}</td>`
+        + `<td style="display:flex;gap:4px;">${this._thumbCell(r.rel_a, r.image_a)}${this._thumbCell(r.rel_b, r.image_b)}</td>`
+        + `<td>${escHtml(r.image_a)}</td><td>${escHtml(r.image_b)}</td><td>${r.distance}</td>`
+        + `<td>${groupBtn}${rowBtn}</td></tr>`;
+    }).join('');
+  },
+  async _deleteRow(encRel) {
+    const rel = decodeURIComponent(encRel);
+    if (!confirm(t('dup.confirm_one'))) return;
+    await this._delete([rel]);
+  },
+  // "Keep first, delete rest" for a group: collect every distinct rel in the
+  // group (from both rel_a and rel_b across its pairs), keep the first-seen, and
+  // delete the remainder. Insertion order of distinct rels defines "first".
+  async _deleteGroup(group) {
+    const rels = [];
+    const seen = new Set();
+    for (const r of (this._results || [])) {
+      if (r.group !== group) continue;
+      for (const rel of [r.rel_a || r.image_a, r.rel_b || r.image_b]) {
+        if (rel && !seen.has(rel)) { seen.add(rel); rels.push(rel); }
+      }
+    }
+    const toDelete = rels.slice(1);  // keep the first
+    if (!toDelete.length) { App.setStatus(t('dup.no_files')); return; }
+    if (!confirm(t('dup.confirm_group', { n: toDelete.length }))) return;
+    await this._delete(toDelete);
+  },
+  async _delete(files) {
+    if (!this._imgDir) { App.setStatus(t('eval.select_images')); return; }
+    try {
+      const r = await API.post('/api/quality/delete-files', { img_dir: this._imgDir, files });
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      let msg = t('dup.deleted', { n: r.count || 0 });
+      if (r.skipped && r.skipped.length) msg += ' · ' + t('dup.delete_failed', { n: r.skipped.length });
+      App.setStatus(msg);
+      // Re-scan so the table reflects what's left on disk.
+      this.run();
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   }
 };
 
@@ -1706,36 +1769,172 @@ Tabs['instance-seg'] = {
 Tabs['tracking'] = {
   title: true,
   _trackerId: null,
+  _seqPolling: false,
   render() {
     return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('tracking.title')}</h3>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;">
+        <div class="form-group">
+          <label class="form-label" for="track-mode">${t('tracking.source')}</label>
+          <select class="form-input input-normal" id="track-mode" style="width:auto;" onchange="Tabs.tracking._syncMode()">
+            <option value="sequence">${t('tracking.sequence')}</option>
+            <option value="interactive">${t('tracking.interactive')}</option>
+          </select>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:0.75rem;">
           <div class="form-group"><label class="form-label">${t('tracking.tracker_type')}</label>
             <select class="form-input input-normal" id="track-type">
               <option value="bytetrack">ByteTrack</option>
               <option value="sort">SORT</option>
             </select></div>
+          <div class="form-group"><label class="form-label" for="track-conf">${t('settings.conf')}</label>
+            <input type="number" class="form-input input-normal" id="track-conf" value="0.25" min="0.01" max="0.99" step="0.05"></div>
         </div>
-        <p class="text-secondary" style="margin-top:0.75rem;font-size:12px;">${t('tracking.desc')}</p>
         ${modelInput('track-model')}
-        <div class="form-group" style="margin-top:0.75rem;">
-          <label class="form-label" for="track-img">${t('cmt.test_image')}</label>
-          <div style="display:flex;gap:0.5rem;">
-            <input type="text" class="form-input input-normal" style="flex:1;" id="track-img">
-            <button class="btn btn-secondary btn-sm" onclick="pickFile('track-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
+
+        <!-- Sequence mode: a frame folder OR a video, run end-to-end as a background job. -->
+        <div id="track-seq-group" style="margin-top:0.75rem;">
+          <p class="text-secondary" style="margin-bottom:0.75rem;font-size:12px;">${t('tracking.seq_desc')}</p>
+          <div class="form-group">
+            <label class="form-label" for="track-seq-source">${t('tracking.source')}</label>
+            <select class="form-input input-normal" id="track-seq-source" style="width:auto;" onchange="Tabs.tracking._syncSeqSource()">
+              <option value="dir">${t('tracking.source_dir')}</option>
+              <option value="video">${t('tracking.source_video')}</option>
+            </select>
           </div>
+          <div id="track-seq-dir-group" style="margin-top:0.75rem;">
+            ${imgDirInput('track-seq-dir')}
+          </div>
+          <div id="track-seq-video-group" style="margin-top:0.75rem;display:none;">
+            <div class="form-group">
+              <label class="form-label" for="track-seq-video">${t('tracking.video_path')}</label>
+              <div style="display:flex;gap:0.5rem;">
+                <input type="text" class="form-input input-normal" style="flex:1;" id="track-seq-video">
+                <button class="btn btn-secondary btn-sm" onclick="pickFile('track-seq-video','Videos (*.mp4 *.avi *.mov *.mkv)')">${t('browse')}</button>
+              </div>
+            </div>
+          </div>
+          <div class="form-group" style="margin-top:0.75rem;max-width:200px;">
+            <label class="form-label" for="track-seq-max">${t('tracking.max_frames')}</label>
+            <input type="number" class="form-input input-normal" id="track-seq-max" value="300" min="1" max="1000">
+          </div>
+          <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+            <button class="btn btn-primary" onclick="Tabs.tracking.runSequence()">${t('tracking.run_seq')}</button>
+            <button class="btn btn-danger btn-sm" id="track-seq-stop" disabled onclick="API.post('/api/force-stop/tracking',{});Tabs.tracking._seqPolling=false">${t('stop')}</button>
+          </div>
+          <div style="margin-top:0.5rem;"><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="track-seq-prog" style="width:0%;height:100%;"></div><span id="track-seq-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
+            <span class="text-secondary" id="track-seq-msg" style="margin-top:0.25rem;display:block;">${t('ready')}</span></div>
         </div>
-        <div style="display:flex;gap:0.5rem;margin-top:1rem;">
-          <button class="btn btn-primary" onclick="Tabs.tracking.create()">${t('tracking.create')}</button>
-          <button class="btn btn-secondary" onclick="Tabs.tracking.update()">${t('tracking.step')}</button>
-          <button class="btn btn-secondary" onclick="Tabs.tracking.reset()">${t('tracking.reset')}</button>
+
+        <!-- Interactive mode: step one image at a time against a shared tracker. -->
+        <div id="track-interactive-group" style="margin-top:0.75rem;display:none;">
+          <p class="text-secondary" style="margin-bottom:0.75rem;font-size:12px;">${t('tracking.desc')}</p>
+          <div class="form-group">
+            <label class="form-label" for="track-img">${t('cmt.test_image')}</label>
+            <div style="display:flex;gap:0.5rem;">
+              <input type="text" class="form-input input-normal" style="flex:1;" id="track-img">
+              <button class="btn btn-secondary btn-sm" onclick="pickFile('track-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
+            </div>
+          </div>
+          <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+            <button class="btn btn-primary" onclick="Tabs.tracking.create()">${t('tracking.create')}</button>
+            <button class="btn btn-secondary" onclick="Tabs.tracking.update()">${t('tracking.step')}</button>
+            <button class="btn btn-secondary" onclick="Tabs.tracking.reset()">${t('tracking.reset')}</button>
+          </div>
         </div>
       </div>
       <div class="card" style="padding:1.5rem;" id="track-result">
-        <span class="text-secondary">${t('tracking.hint')}</span>
+        <span class="text-secondary">${t('tracking.seq_hint')}</span>
       </div>
     </div>`;
+  },
+  // Toggle between the sequence job UI and the interactive single-frame UI.
+  _syncMode() {
+    const mode = document.getElementById('track-mode')?.value || 'sequence';
+    const seq = document.getElementById('track-seq-group');
+    const inter = document.getElementById('track-interactive-group');
+    if (seq) seq.style.display = mode === 'sequence' ? 'block' : 'none';
+    if (inter) inter.style.display = mode === 'interactive' ? 'block' : 'none';
+    const res = document.getElementById('track-result');
+    if (res) res.innerHTML = `<span class="text-secondary">${mode === 'sequence' ? t('tracking.seq_hint') : t('tracking.hint')}</span>`;
+  },
+  // Sequence mode reads EITHER a frame folder OR a video path.
+  _syncSeqSource() {
+    const src = document.getElementById('track-seq-source')?.value || 'dir';
+    const dir = document.getElementById('track-seq-dir-group');
+    const vid = document.getElementById('track-seq-video-group');
+    if (dir) dir.style.display = src === 'dir' ? 'block' : 'none';
+    if (vid) vid.style.display = src === 'video' ? 'block' : 'none';
+  },
+  // Full-sequence runner: POST /api/tracking/run-sequence, then poll
+  // /api/tracking/sequence-status for {progress, frames, previews, summary}.
+  async runSequence() {
+    const model_path = document.getElementById('track-model')?.value || G.model;
+    if (!model_path) { App.setStatus(t('select_model')); return; }
+    const useVideo = document.getElementById('track-seq-source')?.value === 'video';
+    const body = {
+      model_path,
+      tracker: document.getElementById('track-type').value,
+      conf: parseFloat(document.getElementById('track-conf')?.value) || 0.25,
+      max_frames: +(document.getElementById('track-seq-max')?.value || 300),
+    };
+    if (useVideo) body.video_path = document.getElementById('track-seq-video')?.value || '';
+    else body.image_dir = document.getElementById('track-seq-dir')?.value || G.imgDir;
+    if (!body.image_dir && !body.video_path) { App.setStatus(t('tracking.need_source')); return; }
+    const stopBtn = document.getElementById('track-seq-stop'); if (stopBtn) stopBtn.disabled = false;
+    const prog = document.getElementById('track-seq-prog'); if (prog) prog.style.width = '0%';
+    try {
+      const r = await API.post('/api/tracking/run-sequence', body);
+      if (r.error) { App.setStatus('Error: ' + r.error); if (stopBtn) stopBtn.disabled = true; return; }
+      App.setStatus(t('tracking.seq_started'));
+      this._seqPolling = true; this._pollSequence();
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); if (stopBtn) stopBtn.disabled = true; }
+  },
+  async _pollSequence() {
+    if (!this._seqPolling) return;
+    try {
+      const s = await API.get('/api/tracking/sequence-status');
+      const pct = s.total > 0 ? Math.round(s.progress / s.total * 100) : 0;
+      const p = document.getElementById('track-seq-prog'); if (p) p.style.width = pct + '%';
+      const pt = document.getElementById('track-seq-prog-text'); if (pt) pt.textContent = pct + '%';
+      const m = document.getElementById('track-seq-msg'); if (m) m.textContent = s.msg || '';
+      if (s.running) { setTimeout(() => this._pollSequence(), 600); return; }
+      this._seqPolling = false;
+      const stopBtn = document.getElementById('track-seq-stop'); if (stopBtn) stopBtn.disabled = true;
+      this._renderSequence(s);
+      const stopped = (s.msg || '').toLowerCase().indexOf('stop') !== -1;
+      App.setStatus(stopped ? t('tracking.seq_stopped') : t('tracking.seq_done'));
+    } catch(e) { setTimeout(() => this._pollSequence(), 1000); }
+  },
+  // Render the summary (unique IDs, frames) + an evenly-spaced overlay filmstrip.
+  _renderSequence(s) {
+    const el = document.getElementById('track-result');
+    if (!el) return;
+    const summary = s.summary || {};
+    const previews = s.previews || [];
+    let html = `<div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1rem;">
+      <div style="text-align:center;padding:0.75rem 1.25rem;background:var(--bg-02);border-radius:8px;">
+        <div style="font-size:1.5rem;font-weight:700;">${summary.num_unique_ids != null ? summary.num_unique_ids : '—'}</div>
+        <div class="text-secondary" style="font-size:12px;">${t('tracking.unique_ids')}</div></div>
+      <div style="text-align:center;padding:0.75rem 1.25rem;background:var(--bg-02);border-radius:8px;">
+        <div style="font-size:1.5rem;font-weight:700;">${summary.num_frames != null ? summary.num_frames : '—'}</div>
+        <div class="text-secondary" style="font-size:12px;">${t('tracking.frames')}</div></div>
+      <div style="text-align:center;padding:0.75rem 1.25rem;background:var(--bg-02);border-radius:8px;">
+        <div style="font-size:1.5rem;font-weight:700;text-transform:uppercase;">${escHtml(summary.tracker || '—')}</div>
+        <div class="text-secondary" style="font-size:12px;">${t('tracking.tracker_type')}</div></div>
+    </div>`;
+    if (previews.length) {
+      html += `<h4 style="margin:0.5rem 0;">${t('tracking.previews')}</h4>`;
+      html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0.75rem;">';
+      for (const pv of previews) {
+        html += `<div style="text-align:center;"><img src="data:image/jpeg;base64,${pv.image}" style="max-width:100%;border-radius:6px;">`
+          + `<div class="text-secondary" style="font-size:11px;margin-top:2px;">${t('tracking.frames')} #${escHtml(pv.frame_idx)}</div></div>`;
+      }
+      html += '</div>';
+    } else {
+      html += `<span class="text-muted">${t('spec.no_results')}</span>`;
+    }
+    el.innerHTML = html;
   },
   async create() {
     try {
@@ -2070,6 +2269,15 @@ Tabs['calibration'] = {
           <div class="form-group" style="max-width:200px;"><label class="form-label">${t('calib.weight_type')}</label>
             <select class="form-input input-normal" id="calib-dyn-wt"><option value="uint8" selected>UINT8</option><option value="int8">INT8</option></select></div>
         </div>
+        <!-- Optional post-optimization accuracy validation (Wave 8). With a sample dir
+             the backend compares original vs optimized predictions and reports agreement. -->
+        <details style="margin-top:0.75rem;">
+          <summary style="cursor:pointer;color:var(--text-04);">${t('opt.validation')}</summary>
+          <div style="margin-top:0.5rem;">
+            ${imgDirInput('calib-val-dir')}
+            <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="calib-do-validate"> ${t('opt.do_validate')}</label>
+          </div>
+        </details>
         <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs['calibration'].run()">${t('calib.run')}</button>
       </div>
       <div><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="calib-prog" style="width:0%;height:100%;"></div><span id="calib-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
@@ -2220,13 +2428,44 @@ Tabs['calibration'] = {
   },
   // ── New optimization methods ──
   _pipeSteps: [],
+  // Read the optional validation inputs (Wave 8). sample_dir + do_validate map
+  // directly to OptimizeRequest fields; only sent when a sample dir is present
+  // so we never block an optimization on validation the user didn't ask for.
+  _validationBody() {
+    const sampleDir = document.getElementById('calib-val-dir')?.value || '';
+    if (!sampleDir) return {};
+    return { sample_dir: sampleDir, do_validate: !!document.getElementById('calib-do-validate')?.checked };
+  },
   async _runOpt(method, params) {
     const path = document.getElementById('calib-model')?.value || G.model;
     if (!path) { App.setStatus(t('select_model')); return; }
-    const r = await API.post('/api/optimize/run', { model_path: path, method, params });
+    const r = await API.post('/api/optimize/run', { model_path: path, method, params, ...this._validationBody() });
     if (r.error) { App.setStatus('Error: ' + r.error); return; }
     App.setStatus(`Running ${method}...`);
     this._pollOptimize();
+  },
+  // Render results.validation {validated, agreement, degraded, threshold, n_images,
+  // max_abs_diff, top1_agreement}. Prominent warning style when degraded===true.
+  _validationHtml(v) {
+    if (!v || v.validated === false) {
+      const why = v && v.error ? ` (${escHtml(v.error)})` : '';
+      return `<div style="margin-top:1rem;padding:0.75rem;background:var(--bg-02);border-radius:8px;font-size:12px;color:var(--text-03);">${t('opt.not_validated')}${why}</div>`;
+    }
+    const pct = (x) => (x != null ? (Number(x) * 100).toFixed(1) + '%' : '—');
+    const degraded = v.degraded === true;
+    const border = degraded ? '#ef4444' : '#22c55e';
+    const bg = degraded ? 'rgba(239,68,68,0.10)' : 'rgba(34,197,94,0.10)';
+    const banner = degraded ? t('opt.degraded_warn') : t('opt.validation_ok');
+    let html = `<div style="margin-top:1rem;padding:0.9rem;background:${bg};border-radius:8px;border-left:4px solid ${border};">
+      <div style="font-weight:700;color:${border};margin-bottom:0.5rem;">${escHtml(banner)}</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:0.75rem;font-size:12px;">
+        <div><span class="text-secondary">${t('opt.agreement')}</span><br><strong>${pct(v.agreement)}</strong></div>`;
+    if (v.top1_agreement != null) html += `<div><span class="text-secondary">${t('opt.top1_agreement')}</span><br><strong>${pct(v.top1_agreement)}</strong></div>`;
+    html += `<div><span class="text-secondary">${t('opt.threshold')}</span><br><strong>${pct(v.threshold)}</strong></div>`;
+    if (v.n_images != null) html += `<div><span class="text-secondary">${t('opt.n_images')}</span><br><strong>${escHtml(v.n_images)}</strong></div>`;
+    if (v.max_abs_diff != null) html += `<div><span class="text-secondary">${t('opt.max_abs_diff')}</span><br><strong>${escHtml(v.max_abs_diff)}</strong></div>`;
+    html += '</div></div>';
+    return html;
   },
   _pollOptimize() {
     if (this._timer) clearInterval(this._timer);
@@ -2265,6 +2504,8 @@ Tabs['calibration'] = {
             }
           }
           html += '</div>';
+          // Accuracy validation block (Wave 8) — warn prominently when degraded.
+          if (res.validation) html += this._validationHtml(res.validation);
           if (res.output_path || (res.steps && res.steps.length)) {
             const outPath = res.output_path || '';
             html += `<button class="btn btn-secondary" style="margin-top:1rem;" onclick="Tabs['calibration']._openInBenchmark('${outPath.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}')">${t('calib.compare_bench')}</button>`;
@@ -2306,7 +2547,7 @@ Tabs['calibration'] = {
     const path = document.getElementById('calib-model')?.value || G.model;
     if (!path) { App.setStatus(t('select_model')); return; }
     if (!this._pipeSteps.length) { App.setStatus('Add at least one step'); return; }
-    const r = await API.post('/api/optimize/run', { model_path: path, pipeline: this._pipeSteps });
+    const r = await API.post('/api/optimize/run', { model_path: path, pipeline: this._pipeSteps, ...this._validationBody() });
     if (r.error) { App.setStatus('Error: ' + r.error); return; }
     App.setStatus('Running pipeline...');
     this._pollOptimize();

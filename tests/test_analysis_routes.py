@@ -324,3 +324,82 @@ class TestPathSafetyEnvelopes:
         })
         assert r.status_code == 400
         assert r.json()["code"] == "PATH_BAD_EXT"
+
+
+# ── Embedding viewer P2: subsample + palette helpers ──────────
+# These exercise the pure-logic helpers only (no matplotlib/sklearn/torch/cv2
+# for the subsample tests and the >20-class palette path), so they run in the
+# memory-safe lane. The <=20 palette path is covered by a guarded test that
+# imports matplotlib lazily.
+class TestEmbeddingSubsample:
+    def test_returns_all_when_under_cap(self):
+        idx = ar._subsample_indices(10, cap=100)
+        assert idx == list(range(10))
+
+    def test_returns_all_when_equal_to_cap(self):
+        idx = ar._subsample_indices(50, cap=50)
+        assert idx == list(range(50))
+
+    def test_caps_when_over(self):
+        idx = ar._subsample_indices(1000, cap=100)
+        assert len(idx) == 100
+        # Subset of valid row indices, no duplicates.
+        assert len(set(idx)) == 100
+        assert all(0 <= i < 1000 for i in idx)
+
+    def test_indices_are_sorted(self):
+        """Sorted output preserves original label ordering in the legend."""
+        idx = ar._subsample_indices(1000, cap=100)
+        assert idx == sorted(idx)
+
+    def test_deterministic_for_same_seed(self):
+        """Same dataset -> same subset every run (reproducible viz)."""
+        a = ar._subsample_indices(1000, cap=100, seed=0)
+        b = ar._subsample_indices(1000, cap=100, seed=0)
+        assert a == b
+
+    def test_different_seed_differs(self):
+        a = ar._subsample_indices(1000, cap=100, seed=0)
+        b = ar._subsample_indices(1000, cap=100, seed=1)
+        assert a != b
+
+    def test_zero_rows(self):
+        assert ar._subsample_indices(0, cap=100) == []
+
+
+class TestQualitativeColors:
+    def test_zero_classes_empty(self):
+        assert ar._qualitative_colors(0) == []
+
+    def test_many_classes_all_distinct(self):
+        """>20 classes must still yield N distinct RGBA colors (HSV ring path).
+
+        This is the regression for the old tab10 (10-color) palette that wrapped
+        and made classes indistinguishable. The HSV branch is matplotlib-free.
+        """
+        n = 37
+        colors = ar._qualitative_colors(n)
+        assert len(colors) == n
+        # Every color is a 4-tuple in [0,1].
+        for c in colors:
+            assert len(c) == 4
+            assert all(0.0 <= v <= 1.0 for v in c)
+        # All distinct.
+        assert len(set(colors)) == n
+
+    def test_many_classes_large_count_distinct(self):
+        n = 100
+        colors = ar._qualitative_colors(n)
+        assert len(colors) == n
+        assert len(set(colors)) == n
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("matplotlib") is None,
+    reason="matplotlib not installed in this env",
+)
+def test_qualitative_colors_small_count_uses_matplotlib():
+    """<=20 classes path returns N distinct colors via tab20."""
+    colors = ar._qualitative_colors(12)
+    assert len(colors) == 12
+    assert len(set(colors)) == 12
