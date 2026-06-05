@@ -20,6 +20,25 @@
 
 ---
 
+## Demo
+
+<div align="center">
+  <img src="docs/screenshots/demo.gif" width="800" alt="ssook demo GIF" />
+</div>
+
+## Screenshots
+
+<div align="center">
+  <img src="docs/screenshots/demo_01_viewer.png" width="49%" alt="ssook viewer with sample inference frame" />
+  <img src="docs/screenshots/demo_02_evaluation.png" width="49%" alt="ssook evaluation workflow" />
+  <img src="docs/screenshots/demo_04_model_compare.png" width="49%" alt="ssook model comparison workflow" />
+  <img src="docs/screenshots/demo_05_dataset_explorer.png" width="49%" alt="ssook dataset explorer preview" />
+  <img src="docs/screenshots/demo_06_vlm.png" width="49%" alt="ssook VLM workflow" />
+  <img src="docs/screenshots/demo_07_settings.png" width="49%" alt="ssook settings and model configuration" />
+</div>
+
+---
+
 ## Do You Need…?
 
 | | Feature | What it does |
