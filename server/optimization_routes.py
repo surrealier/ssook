@@ -4,7 +4,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Optional
 
-from server.path_safety import safe_model_file, safe_path, UnsafePathError
+from server.path_safety import safe_model_file, safe_image_dir, safe_path, UnsafePathError
 from server.state import TaskState, all_states, executor
 
 router = APIRouter()
@@ -36,6 +36,15 @@ class OptimizeRequest(BaseModel):
     params: dict = {}
     # Pipeline mode
     pipeline: list[dict] = []  # [{"optimizer": "name", "params": {...}}, ...]
+    # Optional post-optimization accuracy validation (additive; off by default).
+    # When a sample_dir is provided, validation runs unless explicitly disabled
+    # via do_validate=False. With no sample_dir it is always skipped — never block
+    # the optimization itself on validation. (Named do_validate, not "validate",
+    # to avoid shadowing pydantic BaseModel.validate.)
+    sample_dir: str = ""
+    do_validate: Optional[bool] = None  # None -> auto (on iff sample_dir present)
+    validate_max_images: int = 16
+    validate_threshold: Optional[float] = None  # None -> core default (0.9)
 
 
 @router.get("/api/optimize/methods")
@@ -62,8 +71,17 @@ async def run_optimize(req: OptimizeRequest):
             suffix = req.method or "optimized"
             out = f"{base}_{suffix}{ext}"
         out = _safe_output(out)
+        # Resolve the optional validation sample dir up front so a traversal is
+        # rejected before the job starts, not mid-run.
+        sample_dir = safe_image_dir(req.sample_dir) if req.sample_dir else ""
     except UnsafePathError as e:
         return {"error": str(e), "code": f"PATH_{e.code}"}
+
+    # Auto-enable validation only when a sample dir is present; an explicit
+    # validate flag (True/False) always wins. Never validate without samples.
+    should_validate = bool(sample_dir) if req.do_validate is None else bool(req.do_validate)
+    if should_validate and not sample_dir:
+        should_validate = False
 
     # Atomic guard: try_start flips running=True under the lock or returns False.
     if not opt_state.try_start(progress=0, total=0, msg="Starting...", results={}):
@@ -86,7 +104,12 @@ async def run_optimize(req: OptimizeRequest):
                     opt_state.update(progress=step_idx, total=total,
                                      msg=f"Step {step_idx}/{total}: {name}")
 
-                result = pipe.run(model_path, out, on_progress=_prog)
+                # The pipeline runs validation internally so the original model
+                # path is the true pre-optimization input.
+                result = pipe.run(model_path, out, on_progress=_prog,
+                                  validate=should_validate, sample_dir=sample_dir,
+                                  validate_max_images=req.validate_max_images,
+                                  validate_threshold=req.validate_threshold)
             elif req.method:
                 # Single method mode
                 opt = registry.get(req.method)
@@ -96,11 +119,39 @@ async def run_optimize(req: OptimizeRequest):
                 opt_state.update(total=1, msg=f"Running {req.method}...")
                 result = opt.apply(model_path, out, **req.params)
                 opt_state["progress"] = 1
+                if should_validate:
+                    # Single-method ops have no built-in validation hook; run it
+                    # here against the original input. Never let a validation
+                    # failure mask a successful optimization.
+                    opt_state["msg"] = "Validating accuracy..."
+                    from core.quantizer import (
+                        validate_optimization, DEFAULT_AGREEMENT_THRESHOLD,
+                    )
+                    threshold = (DEFAULT_AGREEMENT_THRESHOLD
+                                 if req.validate_threshold is None
+                                 else req.validate_threshold)
+                    try:
+                        result["validation"] = validate_optimization(
+                            original_path=model_path, optimized_path=out,
+                            sample_dir=sample_dir,
+                            max_images=req.validate_max_images,
+                            threshold=threshold)
+                    except Exception as ve:  # noqa: BLE001
+                        result["validation"] = {"validated": False,
+                                                "error": str(ve),
+                                                "original_path": model_path}
             else:
                 opt_state.update(running=False, msg="Error: specify method or pipeline")
                 return
 
-            opt_state.update(running=False, msg="Complete", results=result)
+            # Surface degradation in the status message so a polling UI can warn
+            # without parsing the nested result body.
+            msg = "Complete"
+            validation = result.get("validation") if isinstance(result, dict) else None
+            if validation and validation.get("degraded"):
+                msg = (f"Complete (WARNING: accuracy degraded — agreement "
+                       f"{validation.get('agreement')} < {validation.get('threshold')})")
+            opt_state.update(running=False, msg=msg, results=result)
         except Exception as e:
             opt_state.update(running=False, msg=f"Error: {e}")
 

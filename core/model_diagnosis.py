@@ -1,6 +1,14 @@
 """Model Diagnosis Engine — analyze, diagnose, and recommend optimizations."""
+import logging
 import os
 import numpy as np
+
+log = logging.getLogger("ssook.diagnosis")
+
+# Fusable-pattern detection is bounded so a very large graph can't make the
+# scan quadratic. Above this node count we skip the (now index-based but still
+# per-node) fusion scan and report it as not-analyzed rather than hang.
+_FUSABLE_SCAN_MAX_NODES = 50_000
 
 # ── Architecture detection patterns ─────────────────────
 
@@ -35,18 +43,61 @@ class ModelDiagnosisEngine:
     def diagnose(self, model_path: str) -> dict:
         import onnx
         from onnx import numpy_helper
+        from onnx.external_data_helper import uses_external_data
 
-        model = onnx.load(model_path, load_external_data=False)
+        # Models with external-data sidecars must be loaded WITH the sidecar or
+        # numpy_helper.to_array() raises (it can't read the unmaterialized
+        # tensor). onnx.load(..., load_external_data=True) materializes the
+        # weights when the .data file sits next to the model; if the sidecar is
+        # missing/inaccessible the load itself raises, so we fall back to a
+        # structure-only load (graph topology stays valid) and skip weight stats.
+        weights_materialized = True
+        weight_load_note: str | None = None
+        try:
+            model = onnx.load(model_path, load_external_data=True)
+        except Exception as load_err:
+            log.warning(
+                "external-data load failed for %s (%s); diagnosing graph "
+                "structure without weight statistics",
+                os.path.basename(model_path), load_err,
+            )
+            model = onnx.load(model_path, load_external_data=False)
+            weights_materialized = False
+            weight_load_note = (
+                "Weight statistics unavailable: the model uses external data "
+                "but the sidecar (.data) file is missing or inaccessible. "
+                "Graph-structure analysis is still complete."
+            )
+
         graph = model.graph
         file_size_mb = os.path.getsize(model_path) / (1024 * 1024)
 
-        # Basic info
+        # Basic info. Build init_map only from materialized tensors — an
+        # external tensor that didn't load is skipped (not a crash) so weight,
+        # quant-sensitivity and pruning analyses degrade gracefully.
         init_map = {}
         total_params = 0
+        skipped_external_inits = 0
         for init in graph.initializer:
-            arr = numpy_helper.to_array(init)
+            if not weights_materialized and uses_external_data(init):
+                skipped_external_inits += 1
+                continue
+            try:
+                arr = numpy_helper.to_array(init)
+            except Exception as conv_err:
+                # Defensive: a single unreadable tensor must not abort the scan.
+                skipped_external_inits += 1
+                log.warning("skipping unreadable initializer %s: %s",
+                            init.name, conv_err)
+                continue
             init_map[init.name] = arr
             total_params += arr.size
+
+        if skipped_external_inits and weight_load_note is None:
+            weight_load_note = (
+                f"{skipped_external_inits} weight tensor(s) could not be "
+                "materialized and were skipped from weight statistics."
+            )
 
         op_counts = {}
         for node in graph.node:
@@ -78,6 +129,14 @@ class ModelDiagnosisEngine:
             file_size_mb, total_params, quant_analysis,
             pruning_analysis, graph_analysis, architecture, weight_analysis)
 
+        # Surface unmaterialized-weight degradation as an explicit warning so a
+        # user doesn't read "no weight findings" as "weights are healthy".
+        if weight_load_note:
+            findings.insert(0, {
+                "severity": "warning", "category": "weights",
+                "message": weight_load_note,
+            })
+
         # Health score (0-100) — continuous multiplicative decay so it doesn't
         # saturate at 0 after a handful of findings. Each critical multiplies by
         # 0.7, each warning by 0.9; the result is a smooth gradient that still
@@ -93,6 +152,7 @@ class ModelDiagnosisEngine:
                 "num_nodes": num_nodes,
                 "opset_version": model.opset_import[0].version if model.opset_import else 0,
                 "health_score": health_score,
+                "weights_materialized": weights_materialized,
             },
             "architecture": architecture,
             "findings": findings,
@@ -149,7 +209,11 @@ class ModelDiagnosisEngine:
                         target_inits.add(inp)
                         break
         for name in sorted(target_inits):
-            arr = init_map[name].astype(np.float64)
+            # float32 (not float64) for the stats: a large model's weights would
+            # otherwise double in RAM during analysis. float32 precision is more
+            # than enough for min/max/mean/std summaries. astype(copy=False)
+            # avoids a copy when the tensor is already float32 (the common case).
+            arr = init_map[name].astype(np.float32, copy=False)
             flat = arr.flatten()
             std = float(np.std(flat))
             results.append({
@@ -177,7 +241,9 @@ class ModelDiagnosisEngine:
                 continue
             for inp in node.input:
                 if inp in init_map:
-                    w = init_map[inp].flatten().astype(np.float64)
+                    # float32 keeps the sensitivity stats cheap in RAM; see the
+                    # note in _analyze_weights.
+                    w = init_map[inp].astype(np.float32, copy=False).flatten()
                     if w.size == 0:
                         continue
                     rng = float(np.max(np.abs(w)))
@@ -245,27 +311,46 @@ class ModelDiagnosisEngine:
         memory_bound = sum(op_counts.get(op, 0) for op in _MEMORY_BOUND_OPS)
         memory_ratio = memory_bound / max(num_nodes, 1)
 
-        # Detect fusable patterns
+        # Detect fusable patterns. The previous implementation scanned all nodes
+        # again for each producer output (O(nodes^2)), which hung on large
+        # graphs. Instead build a tensor-name -> consuming-nodes index once, then
+        # each producer looks up its output's consumers directly.
         node_list = list(graph.node)
-        out_to_node = {}
-        for n in node_list:
-            for o in n.output:
-                out_to_node[o] = n
         fusable_count = 0
-        for i, node in enumerate(node_list):
-            for pattern in _FUSABLE_PATTERNS:
-                if node.op_type == pattern[0] and len(pattern) >= 2:
-                    # Check if next node matches
+        fusable_scan_capped = False
+        if num_nodes > _FUSABLE_SCAN_MAX_NODES:
+            # Even the linear scan touches every node's inputs; on pathologically
+            # large graphs we skip it rather than risk a long blocking pass.
+            fusable_scan_capped = True
+            log.info(
+                "fusable-pattern scan skipped: graph has %d nodes (> cap %d)",
+                num_nodes, _FUSABLE_SCAN_MAX_NODES,
+            )
+        else:
+            consumers_by_input: dict[str, list] = {}
+            for n in node_list:
+                for inp in n.input:
+                    consumers_by_input.setdefault(inp, []).append(n)
+            # Only the first two ops of each pattern are matched (producer ->
+            # immediate consumer), preserving the original per-pattern counting:
+            # one node can match several patterns (e.g. Conv->Relu and Conv->Add)
+            # and each match is counted once.
+            for node in node_list:
+                for pattern in _FUSABLE_PATTERNS:
+                    if node.op_type != pattern[0] or len(pattern) < 2:
+                        continue
+                    next_op = pattern[1]
                     for o in node.output:
-                        for j, other in enumerate(node_list):
-                            if other.op_type == pattern[1] and o in other.input:
-                                fusable_count += 1
-                                break
+                        if any(c.op_type == next_op
+                               for c in consumers_by_input.get(o, ())):
+                            fusable_count += 1
+                            break
 
         return {
             "memory_bound_ops": memory_bound,
             "memory_bound_ratio": round(memory_ratio, 3),
             "fusable_patterns": fusable_count,
+            "fusable_scan_capped": fusable_scan_capped,
             "total_nodes": num_nodes,
         }
 

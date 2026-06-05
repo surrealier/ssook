@@ -1,4 +1,5 @@
 """/api/quality/* 라우터."""
+import logging
 import os
 
 import cv2
@@ -13,6 +14,8 @@ from server.state import anomaly_state, quality_state, dup_state, leaky_state, s
 from server.utils import imread, glob_images
 
 router = APIRouter()
+
+log = logging.getLogger("ssook.quality")
 
 
 # ── Result caps ─────────────────────────────────────────
@@ -48,6 +51,10 @@ class LeakyRequest(BaseModel):
     val_dir: Optional[str] = ""
     test_dir: Optional[str] = ""
     threshold: int = 0
+    # Real split layouts nest images under train/images/, val/images/ etc.;
+    # without recursion the detector reports 0 leaks on a nested dataset —
+    # a false "clean" verdict that is worse than no tool at all (LEAKY P0).
+    recursive: bool = False
 
 
 class SimRequest(BaseModel):
@@ -56,6 +63,16 @@ class SimRequest(BaseModel):
     top_k: int = 10
     recursive: bool = False
 
+
+class DeleteFilesRequest(BaseModel):
+    # The quality tools (duplicate/leaky) surface problem files but give the
+    # user no way to act on them. This is the explicit, conservative delete
+    # contract: an img_dir root plus the exact files to remove. No globs /
+    # wildcards — every entry is validated to resolve strictly inside the
+    # validated root before deletion (P1 missing-goal).
+    img_dir: str
+    files: list[str]
+
 # ── Quality: Anomaly Detector API ──────────────────────
 # NOTE: All *_state instances are imported from server.state — do NOT re-declare.
 # Re-declaring breaks /api/force-stop because all_states[...] would still point
@@ -63,34 +80,51 @@ class SimRequest(BaseModel):
 
 @router.post("/api/quality/anomaly")
 async def quality_anomaly(req: QualityDirRequest):
-    if anomaly_state["running"]:
-        return {"error": "Already running"}
     img_dir = safe_image_dir(req.img_dir)
     # Validate label_dir at the boundary too — it feeds open() below, so a
     # raw path would let a crafted request read arbitrary <stem>.txt files
     # outside the path-safety surface (QUAL-07).
     label_dir = safe_label_dir(req.label_dir) if req.label_dir else ""
     recursive = req.recursive
-    anomaly_state.update(running=True, progress=0, total=0, msg="Scanning...", results=[])
+    # Atomic start guard — a read-then-write pair let two near-simultaneous
+    # POSTs both pass the check and race on results/progress (QUAL P1).
+    if not anomaly_state.try_start(progress=0, total=0, msg="Scanning...", results=[]):
+        return {"error": "Already running"}
 
     @route_errors(state=anomaly_state, scope="anomaly")
     def _run():
         imgs = glob_images(img_dir, recursive=recursive)
         anomaly_state["total"] = len(imgs)
         results = []
+        # A data-quality tool must survive bad data: a single non-numeric
+        # token previously raised ValueError, route_errors aborted the whole
+        # run, and every anomaly found so far was discarded (anomaly P0).
+        # We now count corruption and keep scanning.
+        malformed_lines = 0
+        missing_labels = 0
         for i, fp in enumerate(imgs):
             if not anomaly_state.get("running", True):
                 anomaly_state.update(msg="Stopped by user")
                 break
             stem = os.path.splitext(os.path.basename(fp))[0]
             txt = os.path.join(label_dir, stem + ".txt") if label_dir else ""
-            if txt and os.path.isfile(txt):
+            if label_dir and not (txt and os.path.isfile(txt)):
+                # No label file for this image — a wrong label_dir would
+                # otherwise read as "0 issues found" / clean dataset (anomaly P1).
+                missing_labels += 1
+            elif txt and os.path.isfile(txt):
                 with open(txt) as f:
                     for ln, line in enumerate(f):
                         parts = line.strip().split()
                         if len(parts) < 5:
                             continue
-                        cx, cy, bw, bh = map(float, parts[1:5])
+                        try:
+                            cx, cy, bw, bh = map(float, parts[1:5])
+                        except ValueError:
+                            # Header row, CSV, or corrupt byte — skip this line,
+                            # tally it, and continue rather than aborting.
+                            malformed_lines += 1
+                            continue
                         issues = []
                         if cx - bw/2 < -0.01 or cy - bh/2 < -0.01 or cx + bw/2 > 1.01 or cy + bh/2 > 1.01:
                             issues.append("Out-of-bounds")
@@ -112,9 +146,15 @@ async def quality_anomaly(req: QualityDirRequest):
         anomaly_state["results"] = results[:ANOMALY_CAP]
         anomaly_state["truncated"] = truncated
         anomaly_state["total_found"] = total_found
+        anomaly_state["malformed_lines"] = malformed_lines
+        anomaly_state["missing_labels"] = missing_labels
         msg = f"Complete — {total_found} issues found"
         if truncated:
             msg += f" (showing first {ANOMALY_CAP})"
+        if missing_labels:
+            msg += f" ({missing_labels} images had no label file)"
+        if malformed_lines:
+            msg += f" ({malformed_lines} malformed label lines skipped)"
         anomaly_state.update(running=False, msg=msg)
 
     executor.submit(_run)
@@ -129,8 +169,6 @@ async def anomaly_status():
 
 @router.post("/api/quality/image-quality")
 async def quality_check(req: QualityDirRequest):
-    if quality_state["running"]:
-        return {"error": "Already running"}
     img_dir = safe_image_dir(req.img_dir)
     recursive = req.recursive
     # `threshold` is the legacy UI field; treat it as the blur cutoff so it
@@ -141,7 +179,9 @@ async def quality_check(req: QualityDirRequest):
     bright_threshold = req.bright_threshold
     entropy_threshold = req.entropy_threshold
     aspect_min, aspect_max = req.aspect_min, req.aspect_max
-    quality_state.update(running=True, progress=0, total=0, msg="Checking...", results=[])
+    # Atomic start guard (QUAL P1) — see quality_anomaly.
+    if not quality_state.try_start(progress=0, total=0, msg="Checking...", results=[]):
+        return {"error": "Already running"}
 
     @route_errors(state=quality_state, scope="quality")
     def _run():
@@ -212,6 +252,7 @@ from core.hashing import (
     hamming as _core_hamming,
     find_near_duplicates as _find_near_duplicates,
     cluster_near_duplicates as _cluster_near_duplicates,
+    BKTree as _BKTree,
 )
 
 
@@ -220,18 +261,22 @@ def _dhash(img, size=8):
 
 @router.post("/api/quality/duplicate")
 async def quality_duplicate(req: QualityDirRequest):
-    if dup_state["running"]:
-        return {"error": "Already running"}
     img_dir = safe_image_dir(req.img_dir)
     threshold = int(req.threshold if req.threshold is not None else 10)
     recursive = req.recursive
-    dup_state.update(running=True, progress=0, total=0, msg="Hashing...", results=[])
+    # Atomic start guard (QUAL P1) — see quality_anomaly.
+    if not dup_state.try_start(progress=0, total=0, msg="Hashing...", results=[]):
+        return {"error": "Already running"}
 
     @route_errors(state=dup_state, scope="duplicate")
     def _run():
         imgs = glob_images(img_dir, recursive=recursive)
         dup_state["total"] = len(imgs)
         names: list[str] = []
+        # Path relative to img_dir uniquely identifies a file under a recursive
+        # scan, where two same-named images in different subfolders share a
+        # basename and are otherwise indistinguishable / un-actionable (QUAL P1).
+        rels: list[str] = []
         hashes: list[int] = []
         skipped = 0
         for i, fp in enumerate(imgs):
@@ -243,6 +288,7 @@ async def quality_duplicate(req: QualityDirRequest):
                 skipped += 1
             else:
                 names.append(os.path.basename(fp))
+                rels.append(os.path.relpath(fp, img_dir))
                 hashes.append(_dhash(frame))
             dup_state["progress"] = i + 1
         dup_state["msg"] = "Comparing..."
@@ -250,7 +296,11 @@ async def quality_duplicate(req: QualityDirRequest):
         # instead of a per-pair counter that never expressed clusters (QUAL-05).
         groups = _cluster_near_duplicates(hashes, threshold)
         pairs = _find_near_duplicates(hashes, threshold)
+        # image_a/image_b stay as basenames for back-compat; rel_a/rel_b carry
+        # the subfolder-qualified path so the frontend can resolve thumbnails
+        # and the user can act on the right file under a recursive scan.
         results = [{"group": groups[i], "image_a": names[i], "image_b": names[j],
+                    "rel_a": rels[i], "rel_b": rels[j],
                     "distance": _core_hamming(hashes[i], hashes[j])}
                    for i, j in pairs[:DUP_CAP]]
         total_found = len(pairs)
@@ -274,25 +324,86 @@ async def duplicate_status():
     return dup_state.snapshot() if hasattr(dup_state, 'snapshot') else dict(dup_state)
 
 
+# ── Quality: Safe batch delete (act on duplicate/leaky findings) ───────
+# The duplicate detector emits rel_a/rel_b (Wave 6); the frontend offers
+# "keep one, delete the rest" per group and POSTs img_dir + the rel/abs
+# paths it wants gone. We only implement the safe delete of an EXPLICIT
+# list — the keep-one selection is the frontend's job.
+
+@router.post("/api/quality/delete-files")
+async def quality_delete_files(req: DeleteFilesRequest):
+    # safe_image_dir enforces exists + is-dir + traversal-normalized root.
+    root = safe_image_dir(req.img_dir)
+    # realpath resolves symlinks AND `..`, so commonpath compares the true
+    # on-disk location — a symlinked file inside the root that points outside
+    # is rejected, not followed (this is a destructive op; be conservative).
+    root_real = os.path.realpath(root)
+
+    deleted: list[str] = []
+    skipped: list[dict[str, str]] = []
+
+    for raw in req.files:
+        if not isinstance(raw, str) or not raw or "\x00" in raw:
+            skipped.append({"path": str(raw), "reason": "Invalid path"})
+            continue
+        # Accept either a path relative to img_dir (what the frontend sends,
+        # e.g. rel_a) or an absolute path. join() leaves an absolute `raw`
+        # untouched, so both forms funnel through the same containment check.
+        candidate = os.path.realpath(os.path.join(root_real, raw))
+
+        # Strict containment: the file must be INSIDE the root, never the root
+        # itself. commonpath raises ValueError across drives (Windows) — treat
+        # that as "outside". The `!= root_real` guard refuses deleting the dir.
+        try:
+            inside = os.path.commonpath([root_real, candidate]) == root_real
+        except ValueError:
+            inside = False
+        if not inside or candidate == root_real:
+            skipped.append({"path": raw, "reason": "Outside img_dir"})
+            continue
+
+        if not os.path.exists(candidate):
+            skipped.append({"path": raw, "reason": "Not found"})
+            continue
+        if not os.path.isfile(candidate):
+            # Never recurse into / remove a directory via this endpoint.
+            skipped.append({"path": raw, "reason": "Not a file"})
+            continue
+
+        try:
+            os.remove(candidate)
+        except OSError as e:
+            skipped.append({"path": raw, "reason": f"Delete failed: {e}"})
+            continue
+        # Log every deletion — this is a destructive, irreversible action.
+        log.info("delete-files: removed %s (root=%s)", candidate, root_real)
+        deleted.append(candidate)
+
+    return {"deleted": deleted, "skipped": skipped, "count": len(deleted)}
+
+
 # ── Quality: Leaky Split Detector API ──────────────────
 
 @router.post("/api/quality/leaky")
 async def quality_leaky(req: LeakyRequest):
-    if leaky_state["running"]:
-        return {"error": "Already running"}
     dirs = {k: getattr(req, k) for k in ["train_dir", "val_dir", "test_dir"]}
     # Validate any provided dirs.
     for k, d in list(dirs.items()):
         if d:
             dirs[k] = safe_image_dir(d)
     threshold = int(req.threshold)
-    leaky_state.update(running=True, progress=0, total=0, msg="Scanning...", results=[])
+    recursive = req.recursive
+    # Atomic start guard (QUAL P1) — see quality_anomaly.
+    if not leaky_state.try_start(progress=0, total=0, msg="Scanning...", results=[]):
+        return {"error": "Already running"}
 
     @route_errors(state=leaky_state, scope="leaky")
     def _run():
         # Glob every split up front so the progress bar has a real `total`
         # before hashing starts (was set only afterwards → bar stuck at 0%).
-        split_files = {name: glob_images(d) for name, d in dirs.items() if d}
+        # Recursive so nested split layouts (train/images/...) are scanned —
+        # otherwise the tool falsely reports 0 leaks (LEAKY P0).
+        split_files = {name: glob_images(d, recursive=recursive) for name, d in dirs.items() if d}
         leaky_state["total"] = sum(len(v) for v in split_files.values())
         done = 0
         skipped = 0
@@ -309,7 +420,12 @@ async def quality_leaky(req: LeakyRequest):
                 if frame is None:
                     skipped += 1
                 else:
-                    hashes[os.path.basename(fp)] = _dhash(frame)
+                    # Key by path relative to the split root, not basename: a
+                    # recursive scan of train/images/ + train/labels/ can hold
+                    # two same-named files in different subfolders. Basename keys
+                    # collided (later overwrote earlier), under-counting leaks
+                    # and pointing the user at the wrong file (QUAL P1).
+                    hashes[os.path.relpath(fp, dirs[name])] = _dhash(frame)
                 done += 1
                 leaky_state["progress"] = done
             split_hashes[name] = hashes
@@ -317,18 +433,33 @@ async def quality_leaky(req: LeakyRequest):
                 break
         results = []
         names = list(split_hashes.keys())
+        # Hard cap on the per-pair sample list — the full match set can be huge,
+        # but the status payload is polled every second so it must stay small.
+        FILE_SAMPLE_CAP = 10
         for i in range(len(names)):
             for j in range(i+1, len(names)):
+                # Build a BKTree over split B's hashes once, then query each of
+                # split A's hashes within `threshold` — O(M log N) instead of the
+                # old O(MxN) all-pairs Hamming scan that froze on real splits
+                # (LEAKY scale P1). Keep a parallel (rel_path, hash) list so query
+                # indices map back to the subfolder-qualified path for the sample.
+                b_items = list(split_hashes[names[j]].items())
+                b_tree = _BKTree().build([h for _, h in b_items])
                 dupes = 0
                 files = []
                 for fa, ha in split_hashes[names[i]].items():
-                    for fb, hb in split_hashes[names[j]].items():
-                        dist = _core_hamming(ha, hb)
-                        if dist <= threshold:
-                            dupes += 1
-                            if len(files) < 10:
-                                files.append(f"{fa} ↔ {fb}")
-                results.append({"pair": f"{names[i]} ↔ {names[j]}", "duplicates": dupes, "files": "; ".join(files)})
+                    for b_idx in b_tree.query(ha, threshold):
+                        dupes += 1
+                        if len(files) < FILE_SAMPLE_CAP:
+                            files.append(f"{fa} ↔ {b_items[b_idx][0]}")
+                files_str = "; ".join(files)
+                # Tell the user the sample is partial instead of silently dropping
+                # the rest — "showing 10 of 137" so a capped list isn't mistaken
+                # for the full leak set (QUAL-09 parity with the other tools).
+                if dupes > len(files):
+                    files_str += f" … (showing {len(files)} of {dupes})"
+                results.append({"pair": f"{names[i]} ↔ {names[j]}", "duplicates": dupes,
+                                "files": files_str})
         leaky_state["results"] = results
         leaky_state["skipped"] = skipped
         msg = "Complete"
@@ -353,25 +484,28 @@ _SIM_HASH_SIZE = 8
 
 @router.post("/api/quality/similarity")
 async def quality_similarity(req: SimRequest):
-    if sim_state["running"]:
-        return {"error": "Already running"}
     img_dir = safe_image_dir(req.img_dir)
     # Validate the query at the boundary — must_exist + image extension —
     # now that the frontend actually sends query_path (QUAL-01/QUAL-08).
     query = safe_image_file(req.query_path) if req.query_path else ""
     top_k = int(req.top_k)
     recursive = req.recursive
-    sim_state.update(running=True, progress=0, total=0, msg="Building index...", results=[])
+    # Atomic start guard (QUAL P1) — see quality_anomaly. Preserve the cached
+    # corpus index across runs (try_start only sets the keys we pass).
+    if not sim_state.try_start(progress=0, total=0, msg="Building index...", results=[]):
+        return {"error": "Already running"}
 
     @route_errors(state=sim_state, scope="similarity")
     def _run():
-        # Reuse the cached hash list when the corpus (dir, recursion, width)
-        # is unchanged so repeat queries against the same folder skip the
-        # full re-glob + re-decode (QUAL-04). Invalidated when the key differs.
+        # Reuse the cached hash list AND BKTree when the corpus (dir, recursion,
+        # width) is unchanged so repeat queries against the same folder skip the
+        # full re-glob + re-decode AND the re-build of the index (QUAL-04 + the
+        # similarity scale P1). Invalidated when the key differs.
         cache_key = (img_dir, recursive, _SIM_HASH_SIZE)
         cached = sim_state.get("index")
         if cached and cached.get("key") == cache_key:
             hashes = cached["hashes"]
+            tree = cached["tree"]
             skipped = cached.get("skipped", 0)
             sim_state["total"] = len(hashes)
             sim_state["progress"] = len(hashes)
@@ -390,7 +524,10 @@ async def quality_similarity(req: SimRequest):
                 else:
                     hashes.append((os.path.basename(fp), _dhash(frame, _SIM_HASH_SIZE)))
                 sim_state["progress"] = i + 1
-            sim_state["index"] = {"key": cache_key, "hashes": hashes, "skipped": skipped}
+            # Build the BKTree once and cache it; index i in the tree maps to
+            # hashes[i] so query results recover the filename.
+            tree = _BKTree().build([h for _, h in hashes])
+            sim_state["index"] = {"key": cache_key, "hashes": hashes, "tree": tree, "skipped": skipped}
 
         if query:
             q_frame = imread(query)
@@ -400,8 +537,13 @@ async def quality_similarity(req: SimRequest):
                 sim_state.update(running=False, msg="Error: query image could not be decoded")
                 return
             q_hash = _dhash(q_frame, _SIM_HASH_SIZE)
-            ranked = sorted(hashes, key=lambda x: _core_hamming(x[1], q_hash))
-            sim_state["results"] = [{"rank": i+1, "image": name, "distance": _core_hamming(h, q_hash)} for i, (name, h) in enumerate(ranked[:top_k])]
+            # Expanding-radius BKTree query returns the top-k (distance, index)
+            # without sorting all N — sublinear on a large cached corpus. 64 bits
+            # because _SIM_HASH_SIZE=8. Falls back to scanning everything only
+            # when the radius has to widen to the full width.
+            ranked = tree.query_top_k(q_hash, top_k, max_bits=_SIM_HASH_SIZE * _SIM_HASH_SIZE)
+            sim_state["results"] = [{"rank": rank + 1, "image": hashes[idx][0], "distance": dist}
+                                    for rank, (dist, idx) in enumerate(ranked)]
         else:
             sim_state["results"] = [{"rank": i+1, "image": name, "distance": 0} for i, (name, _) in enumerate(hashes[:top_k])]
         msg = "Complete"

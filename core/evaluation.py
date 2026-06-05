@@ -69,7 +69,19 @@ def _compute_ap(recalls, precisions):
     return float(np.mean(mpre[indices]))
 
 
-def evaluate_dataset(gt_data, pred_data, iou_thres=0.5):
+def evaluate_dataset(gt_data, pred_data, iou_thres=0.5, averaging: str = "micro"):
+    """Detection P/R/F1 + per-class AP at a single IoU threshold.
+
+    averaging controls only how the __overall__ Precision/Recall/F1 are pooled
+    across classes (per-class numbers and AP are identical either way):
+      - "micro" (default, legacy behavior): pool every class's TP/FP/FN into one
+        global confusion count, so a class with 5000 GT boxes dominates. Matches
+        what the tab reported before this option existed.
+      - "macro": average each class's own P/R/F1 with equal weight, so a class
+        with 3 GT boxes counts as much as one with 5000 (small classes are not
+        drowned out). mAP (__overall__["ap"]) is already a macro mean of per-class
+        AP and is unchanged by this flag.
+    """
     all_classes = set()
     for boxes in list(gt_data.values()) + list(pred_data.values()):
         for b in boxes:
@@ -124,13 +136,23 @@ def evaluate_dataset(gt_data, pred_data, iou_thres=0.5):
         prec = tp_total / (tp_total + fp_total + 1e-9)
         rec = tp_total / (n_gt + 1e-9)
         f1 = 2 * prec * rec / (prec + rec + 1e-9)
-        results[cid] = {"ap": ap, "precision": prec, "recall": rec, "f1": f1}
+        # tp/fp/fn are surfaced per-class so the route can render them without
+        # a second matching pass (the result dict is the single source).
+        results[cid] = {"ap": ap, "precision": prec, "recall": rec, "f1": f1,
+                        "tp": tp_total, "fp": fp_total, "fn": fn_total}
 
-    prec_all = total_tp / (total_tp + total_fp + 1e-9)
-    rec_all = total_tp / (total_tp + total_fn + 1e-9)
-    f1_all = 2 * prec_all * rec_all / (prec_all + rec_all + 1e-9)
+    if averaging == "macro":
+        per_class = [v for v in results.values()]
+        prec_all = float(np.mean([v["precision"] for v in per_class])) if per_class else 0.0
+        rec_all = float(np.mean([v["recall"] for v in per_class])) if per_class else 0.0
+        f1_all = float(np.mean([v["f1"] for v in per_class])) if per_class else 0.0
+    else:
+        prec_all = total_tp / (total_tp + total_fp + 1e-9)
+        rec_all = total_tp / (total_tp + total_fn + 1e-9)
+        f1_all = 2 * prec_all * rec_all / (prec_all + rec_all + 1e-9)
     mean_ap = float(np.mean([v["ap"] for v in results.values()])) if results else 0.0
-    results["__overall__"] = {"ap": mean_ap, "precision": prec_all, "recall": rec_all, "f1": f1_all}
+    results["__overall__"] = {"ap": mean_ap, "precision": prec_all, "recall": rec_all,
+                              "f1": f1_all, "averaging": averaging}
     return results
 
 

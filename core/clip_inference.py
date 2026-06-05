@@ -43,6 +43,84 @@ class CLIPModel:
         emb = out[0][0].flatten().astype(np.float32)
         return emb / (np.linalg.norm(emb) + 1e-9)
 
+    def encode_images(self, frames: "list[np.ndarray]") -> np.ndarray:
+        """Encode N BGR frames in one batched forward → (N, D) L2-normalized rows.
+
+        Stacks all preprocessed frames into a single image-encoder call instead
+        of N sequential calls (the per-image path's bottleneck on large eval
+        sets). Respects a detected fixed batch (self._img_bs): chunks the input
+        so the model only ever sees a batch it can accept, pads the final short
+        chunk up to the fixed size, and trims the padded rows from the output.
+        Single-image fallback is preserved via encode_image.
+        """
+        if not frames:
+            return np.zeros((0, 0), dtype=np.float32)
+
+        tensors = [self._preprocess_image(f) for f in frames]
+        batch = np.concatenate(tensors, axis=0)  # (N, C, H, W)
+        n = batch.shape[0]
+        fixed_bs = self._img_bs if self._img_bs > 1 else 0
+
+        rows: list[np.ndarray] = []
+        # Dynamic batch (fixed_bs==0): one forward for all N. Fixed batch: chunk.
+        step = fixed_bs if fixed_bs else n
+        for start in range(0, n, step):
+            chunk = batch[start:start + step]
+            real = chunk.shape[0]
+            if fixed_bs and real < fixed_bs:
+                # Pad the short final chunk up to the model's fixed batch.
+                chunk = np.concatenate(
+                    [chunk, np.repeat(chunk[-1:], fixed_bs - real, axis=0)], axis=0)
+            feed = self._build_image_feed(chunk)
+            out = self.img_session.run(None, feed)[0]
+            # out: (chunk_bs, D) or higher-rank — flatten per row.
+            out = out.reshape(out.shape[0], -1)[:real].astype(np.float32)
+            rows.append(out)
+
+        embs = np.concatenate(rows, axis=0)  # (N, D)
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        return embs / (norms + 1e-9)
+
+    def _build_image_feed(self, tensor: np.ndarray) -> dict:
+        """Feed dict for the image encoder; non-image inputs get shape-matched zeros."""
+        feed = {}
+        for inp in self.img_session.get_inputs():
+            if inp.name == self._img_input.name:
+                feed[inp.name] = tensor
+            else:
+                shape = [s if isinstance(s, int) and s > 0 else tensor.shape[0] if i == 0 else 1
+                         for i, s in enumerate(inp.shape)]
+                feed[inp.name] = np.zeros(
+                    shape, dtype=np.float32 if "float" in (inp.type or "") else np.int64)
+        return feed
+
+    def zero_shot_classify_batch(self, frames: "list[np.ndarray]", text_embeddings: list,
+                                 labels: list) -> "list[list]":
+        """Batched zero-shot: encode all frames once, score against text embeddings.
+
+        Returns one ranked [(label, prob), ...] list per frame, matching the
+        per-image zero_shot_classify ordering (descending prob). text_embeddings
+        is the precomputed (per-label) embedding list reused across all frames.
+        """
+        if not frames:
+            return []
+        img_embs = self.encode_images(frames)  # (N, D), L2-normalized
+        text_mat = np.asarray(text_embeddings, dtype=np.float32)  # (L, D)
+        sims = (img_embs @ text_mat.T).astype(np.float64)  # (N, L) cosine
+        # softmax with the same temperature scaling (×100) as the single-image
+        # path. Compute in float64 and subtract the row max before exp — temp
+        # scaling pushes exp(100) past the float32 range, so a naive float32
+        # exp overflows to inf → NaN probabilities.
+        scaled = sims * 100.0
+        scaled -= scaled.max(axis=1, keepdims=True)
+        exp = np.exp(scaled)
+        probs = exp / exp.sum(axis=1, keepdims=True)
+        ranked_all = []
+        for row in probs:
+            ranked = sorted(zip(labels, row.tolist()), key=lambda x: -x[1])
+            ranked_all.append(ranked)
+        return ranked_all
+
     def encode_text(self, tokens: np.ndarray) -> np.ndarray:
         """토큰 배열 → normalized embedding vector"""
         if self.txt_session is None:

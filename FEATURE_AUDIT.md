@@ -15,6 +15,8 @@
 6. [Quality](#6-quality) — anomaly, quality, duplicate, leaky, similarity
 7. [Specialized / 사이드바 미노출](#7-specialized--사이드바-미노출) — segmentation, clip, embedder, pose, instance-seg, tracking, vlm
 8. [공통 / 횡단 이슈](#8-공통--횡단-이슈)
+9. [Training](#9-training) — training
+10. [Deployment](#10-deployment) — deployment
 
 ---
 
@@ -1001,6 +1003,89 @@ dHash 16×16(256bit) 쿼리 → Top-K(1-100). 출력: rank/image/distance.
 
 ---
 
+## 9. Training
+
+### `training` — 모델 학습
+
+**[1] 기능 / 최종 목표**
+
+데이터셋으로 비전 모델을 학습/파인튜닝하고 결과 체크포인트를 Deployment로 인계. YOLO 검출/분할/포즈/분류(ultralytics) + 분류 백본(timm/torchvision) 지원. 에폭별 진행·메트릭 실시간 표시, 협조적 중지.
+
+**[2] 현재 구현 구성**
+
+- `core/training/registry.py` — `BaseTrainer` ABC + `TrainerRegistry` + 싱글톤 (optimizer_registry 미러).
+- `core/training/trainers.py` — `UltralyticsTrainer`(detect/segment/pose/classify, `on_fit_epoch_end` 콜백으로 진행·메트릭, `trainer.stop`으로 협조적 중지) + `TimmClassifierTrainer`(ImageFolder).
+- `core/training/dataset.py` — `prepare_yolo_dataset`: 라벨에서 클래스 자동 발견, names 해석(인자→catalog→`class_{i}`), train/val split(deterministic), hardlink + `data.yaml` 생성. 기존 data.yaml 패스스루.
+- `core/training/runner.py` — `run_training` 순수 함수(콜백 주도).
+- `server/training_routes.py` — `/api/training/{trainers,run,status,stop}`, `training_state` TaskState + `try_start` + `executor.submit`, `task_locks["gpu_infer"]` 직렬화, 경로 검증.
+- `web/js/tabs-mlops.js` `Tabs.training` — 트레이너/하이퍼파라미터 폼, 진행바, 에폭 메트릭 테이블, "이 모델 배포" 핸드오프.
+
+**[3] 1과 2의 괴리 / 리스크**
+
+- (a) torch/ultralytics/timm은 optional — 미설치 시 트레이너 비활성(사유 표시). 검증 env: `torch271`.
+- (b) 분류(classify)는 사전 분할된 `train/`·`val/` ImageFolder 필요 — 자동 split 미지원(검출과 비대칭).
+- (c) 협조적 중지는 에폭 경계에서만 동작(에폭 중간 선점 불가) — 긴 에폭은 중지 지연.
+- (d) 학습은 단일 `executor`(max_workers=4) + `gpu_infer` 락을 장시간 점유 → 동시 추론/벤치 starvation 가능.
+- (e) keep/multilabel/dominant는 `data.yaml` 패스스루만 — stock ultralytics는 무시, anydetection fork에서만 동작.
+- (f) CenterNet(metro) 학습 경로 미구현(task.md 10절) — 별도 trainer 필요.
+
+**[4] 개선 작업 항목**
+
+| 우선순위 | 작업 | 파일/함수 | 작업량 | 상태 |
+|---|---|---|---|---|
+| P1 | classify 데이터셋 자동 split(ImageFolder → train/val) | `core/training/dataset.py` | M | ✅ `prepare_classification_dataset` |
+| P1 | 학습 전용 executor 또는 작업 중 추론 락 양보 정책 | `server/state.py`, `training_routes` | M | — (deployment 측 조건부 락만 적용) |
+| P2 | 에폭 내 step 단위 진행/중지(batch 콜백) | `trainers.py` | M | — |
+| P2 | CenterNet keep/gaussian-heatmap trainer 추가 | `core/training/` 신규 | L | — |
+| P2 | 학습 출력(runs/) 관리 UI(목록/삭제/배포 연결) | `tabs-mlops.js` | S | ✅ `core/training/runs.py` + `/api/training/runs` + Trained runs 카드 |
+| — | timm classify early-stopping(patience) + UI | `trainers.py`, `tabs-mlops.js` | S | ✅ patience 조기 종료 + Advanced 입력 |
+
+> 해결 완료 (`feat/training-deployment`, 2026-06-02): 분류 자동 split(평면 ImageFolder → train/val), timm early-stopping(patience), 학습 run 관리(목록/삭제/배포·벤치 핸드오프, traversal 방어). 테스트 `tests/test_training.py` 확장.
+
+---
+
+## 10. Deployment
+
+### `deployment` — 모델 내보내기 / 배포
+
+**[1] 기능 / 최종 목표**
+
+학습된 모델(.pt) 또는 기존 .onnx를 타깃 런타임/EP용 산출물로 export. onnxruntime(CPU/CUDA/DirectML), TensorRT(.engine), OpenVINO(IR), CoreML, TorchScript. opset/batch/input/precision(fp32·fp16·int8) 설정 + `deploy.json` 매니페스트.
+
+**[2] 현재 구현 구성**
+
+- `core/deployment/registry.py` — `BaseExportTarget` ABC + `ExportTargetRegistry` + 싱글톤.
+- `core/deployment/targets.py` — onnxruntime_cpu/cuda/directml(동일 ONNX, provider만 상이) + tensorrt + openvino + coreml + torchscript. `is_available()`로 백엔드 가용성 보고.
+- `core/deployment/exporters.py` — `.pt`는 ultralytics 익스포터(opset/imgsz/batch/dynamic/half), `.onnx`는 quantizer(fp16/int8)·TensorRT API(.engine)·`openvino.convert_model`(IR).
+- `core/deployment/manifest.py` — provider/provider_options(DirectML `enable_mem_pattern=False`)·input/batch/opset·클래스명·env 스냅샷 기록.
+- `core/deployment/runner.py` — `run_export`: 타깃 해석·가용성·export·아티팩트 load-verify(ONNX는 CPU 세션)·매니페스트.
+- `server/deployment_routes.py` — `/api/deploy/{targets,run,status,stop}`, `deploy_state` + `try_start` + `executor.submit` + `gpu_infer` 락, `safe_weights_file`/`safe_export_output`.
+- `web/js/tabs-mlops.js` `Tabs.deployment` — 소스/타깃/정밀도/opset/batch/input 폼, 결과 카드(산출물·크기·provider·검증·매니페스트), "벤치마크" 핸드오프.
+
+**[3] 1과 2의 괴리 / 리스크**
+
+- (a) ONNX 변종은 한 프로세스 공존 불가 — 현재 **인프로세스** export라 openvino/coreml은 해당 백엔드가 설치된 env에서 실행해야 함(미설치 시 타깃 비활성). `ep_manager.launch_worker` 서브프로세스 라우팅 미연결.
+- (b) 기존 .onnx의 opset/batch 재지정은 best-effort(`onnx.version_converter`) — 깨끗한 변경은 .pt에서 재export 권장.
+- (c) CoreML/TorchScript는 .pt 소스 + 해당 백엔드 필요(.onnx 소스 미지원).
+- (d) fp16 onnx(.onnx 소스)는 `onnxconverter_common` 필요(torch271 미설치) — .pt 소스는 ultralytics `half=True`로 의존성 없이 처리.
+- (e) TensorRT/CUDA 빌드는 `gpu_infer` 락 장시간 점유.
+
+**[4] 개선 작업 항목**
+
+| 우선순위 | 작업 | 파일/함수 | 작업량 | 상태 |
+|---|---|---|---|---|
+| P1 | EP-격리 서브프로세스 export(`ep_worker`에 `export` task 추가, openvino/coreml를 전용 venv로 라우팅) | `core/ep_worker.py`, `ep_manager`, `runner` | L | — (범위 외) |
+| P2 | export 후 타깃 EP에서 실제 load-verify(TensorRT/OpenVINO 세션) | `core/deployment/runner.py` | M | ✅ 타깃 provider 가용 시 그 EP로 검증 + CPU fallback 경고 |
+| P2 | int8 calibration `data.yaml` 자동 생성(이미지 dir → ultralytics int8) | `exporters.py` | S | ✅ `_calibration_data_yaml` |
+| P2 | 매니페스트 기반 "원클릭 추론/벤치" 통합 | `tabs-mlops.js` | S | △ runs/결과 카드 → Benchmark 핸드오프(.onnx) |
+| — | opset 재지정 실패 조용한 보고 → 경고 + manifest 실제 opset 기록 | `targets.py`, `runner.py`, `manifest.py` | S | ✅ |
+| — | 조건부 GPU 락(CPU 전용 export는 추론 미차단) | `deployment_routes.py`, `registry.py` | S | ✅ `uses_gpu` |
+| — | 소스↔타깃 호환성(`accepts`) 사전 차단 + opset/batch/workspace 입력 검증 | `registry.py`, `targets.py`, `deployment_routes.py` | S | ✅ |
+
+> 해결 완료 (`feat/training-deployment`, 2026-06-02): opset 재지정 실패를 경고로 표면화하고 manifest에 산출물 실제 opset 기록, int8 calibration data.yaml 자동 생성, 타깃 EP 기반 load-verify, 조건부 GPU 락(`uses_gpu`), 소스/타깃 호환성·입력 사전 검증. 테스트 `tests/test_deployment.py` 확장.
+
+---
+
 ## 분석 메타데이터
 
 - 분석 시점: 2026-05-27
@@ -1008,3 +1093,40 @@ dHash 16×16(256bit) 쿼리 → Top-K(1-100). 출력: rank/image/distance.
 - 분석 범위: 30개 탭 (사이드바 등록 23 + 미등록 7)
 - 방법: 섹션별 병렬 sub-agent 7개 (Explore subagent_type) — 각 에이전트가 프론트엔드 + 라우터 + core + 문서를 모두 읽고 [1]-[4] 4-section 템플릿 적용 → 본 문서에서 정합
 - 우선순위는 "기능적 정확성 > 동시성·상태 > 스케일/병목 > UX > 보안 > 의존성" 순으로 부여됨
+
+---
+
+## 12. 대규모 개선 프로그램 결과 (2026-06, `feat/training-deployment`)
+
+> 본 감사(2026-05-27) 이후, 전 모듈을 대상으로 한 다중 에이전트 개선 프로그램을 수행했다.
+> 모듈별 심층 재분석(Wave 0, 32개 모듈 → 186 findings: P0 25 / P1 99 / P2 62)으로 현재 코드
+> 기준 백로그를 만들고, **파일 소유권 단위 병렬 wave**로 구현·검증(`torch271` 전체 pytest,
+> baseline 304 → **568 passed**)·커밋했다. 검증은 단일 프로세스로 중앙집중(동시 torch 로드로 인한
+> 메모리 스파이크 방지).
+>
+> 분석 시점에 이미 해결돼 있던 항목(stale): 경로검증 `safe_*` 전 라우터, 상태격리 `TaskState`,
+> error-analyzer class_id 매칭, remapper auto_reindex, merger/duplicate 1차 BKTree,
+> benchmark 고정배치 FPS, 사이드바 39탭 전부 등록.
+
+**해결 완료 (wave별)**
+
+- **MLOps** (`0a1dfe7`): 분류 자동 split, timm early-stopping, 학습 run 관리(목록/삭제/배포).
+- **Wave 1 — 백엔드 P0** (`6ebe0f7`): converter 경로 traversal, VLM endpoint SSRF, settings 커스텀모델·`fs/*` 경로 검증, embedder 미검증 경로; error-analyzer score-sort, splitter webp/tif, sampler/remapper 재귀 basename 덮어쓰기, anomaly 라인오류 중단, leaky 재귀, instance-seg/pose 미지원타입 가짜출력 차단, diagnose external-data 크래시, benchmark CSV 라벨; 다수 라우터 `try_start` 원자적 가드, event-loop 오프로드, tracking class-gating.
+- **Wave 2 — 스케일·UX·고급** (`c49b08e`): leaky/similarity/merger BKTree, inspector DOM-XSS escaping, segmentation 지표/오버레이 렌더, quality 임계값 UI, 취소버튼·파라미터 전송 복구, inspector EP 실제 프로브, quantizer fp16 I/O(fp32 유지)+static calib 명시.
+- **Wave 3 — 프론트 tabs.js·eval·profiler·vlm** (`890293a`): viewer 에러 i18n+FPS, analysis conf 컨트롤, splitter seed/overwrite, explorer 썸네일; eval GT부재 경고+macro/micro, profiler 고정배치 throughput 정정+EP fallback 경고, vlm 결과 영속화+transformers 캐시.
+- **Wave 4 — 배치·augmentation** (`93ddbdc`): pose/instance-seg/clip/embedder 배치·디렉토리 추론(`run_pose_batch`/`run_instance_seg_batch`/`encode_images`), CLIP float32 overflow→NaN 수정, `core/augmentation.py` 라벨 동시 변환, settings 배치 class-style 엔드포인트, diagnose 차트 병렬 생성.
+- **Wave 5 — UI 노출·viewer 동시성** (`7b141cc`): pose/iseg 디렉토리 결과 갤러리, augmentation 라벨 미리보기, model-compare 점진 렌더, duplicate 썸네일; viewer 시퀀셜/프레임버퍼 상태를 세션별 `seq_state`로 분리(동시 스트림 오염 해소, `run_inference(seq_state=)` additive).
+- **Wave 6**: Select-All 배치 class-style 적용, duplicate/leaky relpath 반환(폴더 간 동명 파일 식별).
+
+- **Wave 7 — 보류했던 대형 기능 (1)** (`7c0c32e`): duplicate/leaky **안전 삭제** 엔드포인트(`/api/quality/delete-files`, root 내부 strict 검증, keep-one 기반), pose **HRNet/ViTPose** heatmap 디코더 + instance-seg **Mask R-CNN** 파서(정식 구현, 타입 디스패치), tracking **시퀀스/비디오 러너**(job별 독립 tracker, dead-track 정리).
+- **Wave 8 — 보류했던 대형 기능 (2)** (`1754b1a`): viewer **추론 입력 다운스케일**(`infer_max_side`, additive·박스 역스케일), 양자화/최적화 후 **정확도 검증 + degraded/롤백 신호**(`do_validate`), **EP-격리 서브프로세스 export**(OpenVINO/CoreML → 전용 venv, in-process fallback).
+- **Wave 9 — UI 노출 + P2** (`6d0945b`): tracking 시퀀스 UI, duplicate keep-one/삭제 + 재귀 썸네일, calibration 검증결과 표시(degraded 경고), HRNet/ViTPose/Mask R-CNN 모델타입 옵션, viewer 다운스케일 컨트롤, embedding-viewer 팔레트 확장 + 대형 N 서브샘플, anomaly/quality 임계값 안내문.
+
+> **결과**: 2026-05-27 감사가 P0로 지목한 항목과 이전에 "보류"로 분류했던 대형 기능까지 **전부 구현 완료**.
+> 누적 11 커밋, 회귀 0(568 passed). 메모리 스파이크는 "에이전트는 가벼운 검증만, 무거운 pytest는 중앙 단일 프로세스" 프로토콜로 해결.
+
+**남은 항목 (소규모 P2 / 선택)**
+
+- albumentations 기반 추가 증강(Shear/Cutout/MixUp/HSV) — `core/augmentation.py`가 자연스러운 확장 지점.
+- dHash 크기 옵션(8 vs 16) 통일, embedding-viewer L2-norm 토글 등 세부 UX 토글.
+- 토픽 docs(`docs/*.md`)의 신규 기능 반영(개념 문서라 현재도 정확성 유지).

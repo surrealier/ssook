@@ -10,6 +10,16 @@ from core.model_loader import ModelInfo
 
 _NMS_IOU = 0.45
 
+
+class UnsupportedModelError(Exception):
+    """Raised when a model type/output layout is advertised but not yet decodable.
+
+    WHY: pose (HRNet/ViTPose) and instance-seg (Mask R-CNN) types are exposed in
+    the UI/model_loader but only the YOLO layouts are implemented. Failing loudly
+    here lets the route surface a precise message instead of returning silent
+    empty results that look like "the model detected nothing".
+    """
+
 # 통합 14-class 체계
 UNIFIED_NAMES = {
     0: "person", 1: "falldown", 2: "crawl", 3: "jump",
@@ -123,6 +133,45 @@ def preprocess_darknet(frame: np.ndarray, input_size: tuple) -> np.ndarray:
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
+# Sequential models carry per-stream mutable state (frame ring buffer, stride
+# counter, async-preprocess future, last result). Historically this lived as
+# attrs on the process-wide singleton ModelInfo, so two concurrent viewer
+# streams of the same model corrupted each other's buffer/counter/last-result.
+# The viewer now passes a per-session dict (seq_state) into run_inference; these
+# accessors read/write that dict when present and fall back to the model attrs
+# otherwise, so every non-viewer caller (eval/analysis/benchmark) is unchanged.
+
+
+def _seq_get(seq_state: "dict | None", model_info: ModelInfo, key: str, default):
+    """Read a sequential-state value from the per-session dict or model attr."""
+    if seq_state is not None:
+        return seq_state.get(key, default)
+    return getattr(model_info, key, default)
+
+
+def _seq_set(seq_state: "dict | None", model_info: ModelInfo, key: str, value) -> None:
+    """Write a sequential-state value to the per-session dict or model attr."""
+    if seq_state is not None:
+        seq_state[key] = value
+    else:
+        setattr(model_info, key, value)
+
+
+def reset_seq_state(seq_state: "dict | None") -> None:
+    """Reset a per-session sequential-state dict in place (start/seek/step hook).
+
+    Mirrors the manual buffer clears the viewer previously did on the model
+    singleton, but targets the isolated per-session store. Leaves the async
+    thread pool intact — it is reused across the session and torn down on stop.
+    """
+    if seq_state is None:
+        return
+    seq_state["_frame_buffer"] = []
+    seq_state["_seq_tensor_buf"] = []
+    seq_state["_seq_frame_counter"] = 0
+    seq_state["_seq_last_result"] = None
+    seq_state["_seq_async_future"] = None
+
 
 def _preprocess_single_frame(frame: np.ndarray, input_size: tuple,
                              imagenet_norm: bool, use_letterbox: bool):
@@ -186,24 +235,28 @@ def preprocess_sequential(frames: list, input_size: tuple,
 
 def preprocess_sequential_cached(model_info, frame: np.ndarray, input_size: tuple,
                                  imagenet_norm: bool = False,
-                                 use_letterbox: bool = False) -> "tuple[np.ndarray, float, tuple] | None":
+                                 use_letterbox: bool = False,
+                                 seq_state: "dict | None" = None) -> "tuple[np.ndarray, float, tuple] | None":
     """3프레임 → (1, 9, H, W) tensor. 캐싱 + stride=2 + 비동기 전처리.
 
     Stride=2: [0,1,2] → [2,3,4] → [4,5,6] (매 2프레임마다 추론)
     홀수 프레임에서는 None 반환 → 호출자가 이전 결과 재사용.
     비동기: 추론 완료 후 다음 프레임 전처리를 백그라운드에서 시작.
 
+    seq_state: per-stream state dict. None → fall back to model_info attrs
+    (single-stream behavior, used by eval/benchmark callers).
+
     Returns: (tensor, ratio, pad) or None (skip this frame)
     """
     h, w = input_size
-    tbuf = getattr(model_info, '_seq_tensor_buf', None)
+    tbuf = _seq_get(seq_state, model_info, '_seq_tensor_buf', None)
     if tbuf is None:
         tbuf = []
-        model_info._seq_tensor_buf = tbuf
-    counter = getattr(model_info, '_seq_frame_counter', 0)
+        _seq_set(seq_state, model_info, '_seq_tensor_buf', tbuf)
+    counter = _seq_get(seq_state, model_info, '_seq_frame_counter', 0)
 
     # 비동기 전처리 결과 수거
-    fut = getattr(model_info, '_seq_async_future', None)
+    fut = _seq_get(seq_state, model_info, '_seq_async_future', None)
     if fut is not None:
         try:
             async_chw, async_ratio, async_pad = fut.result(timeout=0.1)
@@ -212,7 +265,7 @@ def preprocess_sequential_cached(model_info, frame: np.ndarray, input_size: tupl
                 tbuf.pop(0)
         except Exception:
             pass
-        model_info._seq_async_future = None
+        _seq_set(seq_state, model_info, '_seq_async_future', None)
 
     # 현재 프레임 전처리
     chw, ratio, pad = _preprocess_single_frame(frame, input_size, imagenet_norm, use_letterbox)
@@ -220,7 +273,7 @@ def preprocess_sequential_cached(model_info, frame: np.ndarray, input_size: tupl
     if len(tbuf) > 3:
         tbuf.pop(0)
     counter += 1
-    model_info._seq_frame_counter = counter
+    _seq_set(seq_state, model_info, '_seq_frame_counter', counter)
 
     # 버퍼가 3개 미만이면 skip
     if len(tbuf) < 3:
@@ -239,15 +292,17 @@ def preprocess_sequential_cached(model_info, frame: np.ndarray, input_size: tupl
 
 
 def _start_async_preprocess(model_info, frame: np.ndarray, input_size: tuple,
-                            imagenet_norm: bool, use_letterbox: bool):
+                            imagenet_norm: bool, use_letterbox: bool,
+                            seq_state: "dict | None" = None):
     """다음 프레임 전처리를 백그라운드 스레드에서 시작."""
     from concurrent.futures import ThreadPoolExecutor
-    pool = getattr(model_info, '_seq_thread_pool', None)
+    pool = _seq_get(seq_state, model_info, '_seq_thread_pool', None)
     if pool is None:
         pool = ThreadPoolExecutor(max_workers=1)
-        model_info._seq_thread_pool = pool
-    model_info._seq_async_future = pool.submit(
+        _seq_set(seq_state, model_info, '_seq_thread_pool', pool)
+    fut = pool.submit(
         _preprocess_single_frame, frame.copy(), input_size, imagenet_norm, use_letterbox)
+    _seq_set(seq_state, model_info, '_seq_async_future', fut)
 
 
 
@@ -753,11 +808,89 @@ def _make_batch_tensor(tensor: np.ndarray, bs: int, model_info: ModelInfo) -> np
     return buf
 
 
+def _infer_downscale(frame: np.ndarray, infer_max_side: int) -> "tuple[np.ndarray, float, tuple]":
+    """Downscale a frame for inference when its longer side exceeds infer_max_side.
+
+    WHY: the viewer's stream_max_height only shrinks the OUTPUT jpeg AFTER full-res
+    inference, so 4K inference cost is unchanged. Running inference on a smaller
+    copy cuts preprocess+forward cost; detections are mapped back to the original
+    frame afterwards via `_rescale_detection_result`.
+
+    Returns (frame_for_inference, scale, orig_shape). `scale` is the single
+    isotropic factor applied to both axes (longer-side fit preserves aspect), so
+    original_coord = inferred_coord / scale. When the frame already fits (or
+    infer_max_side <= 0), returns the frame unchanged with scale=1.0.
+    """
+    orig_shape = frame.shape
+    if infer_max_side <= 0:
+        return frame, 1.0, orig_shape
+    h, w = orig_shape[:2]
+    longer = max(h, w)
+    if longer <= infer_max_side:
+        return frame, 1.0, orig_shape
+    scale = infer_max_side / longer
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    # INTER_AREA is the right filter for downsampling (avoids aliasing); the model
+    # sees a clean shrunk image rather than a subsampled one.
+    small = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return small, scale, orig_shape
+
+
+def _rescale_detection_result(result: DetectionResult, scale: float,
+                              orig_shape: tuple) -> DetectionResult:
+    """Map a DetectionResult produced on a downscaled frame back to original coords.
+
+    `scale` is the factor the frame was multiplied by before inference (see
+    `_infer_downscale`); original_coord = inferred_coord / scale. Returns a NEW
+    DetectionResult with rescaled+clipped boxes (does NOT mutate the input) so the
+    seq_ stride cache — which holds the pre-rescale result — is never double-scaled
+    on a subsequent skip frame. A no-op pass-through when scale==1.0 (the
+    default/today's path), so behavior is unchanged when infer_max_side is unset.
+    """
+    if scale == 1.0 or len(result.boxes) == 0:
+        return result
+    oh, ow = orig_shape[:2]
+    boxes = result.boxes / scale
+    boxes[:, 0] = np.clip(boxes[:, 0], 0, ow)
+    boxes[:, 1] = np.clip(boxes[:, 1], 0, oh)
+    boxes[:, 2] = np.clip(boxes[:, 2], 0, ow)
+    boxes[:, 3] = np.clip(boxes[:, 3], 0, oh)
+    return DetectionResult(
+        boxes=boxes.astype(np.float32),
+        scores=result.scores,
+        class_ids=result.class_ids,
+        infer_ms=result.infer_ms,
+        extra_attrs=result.extra_attrs,
+    )
+
+
 def run_inference(model_info: ModelInfo, frame: np.ndarray,
-                  conf: float) -> DetectionResult:
+                  conf: float, seq_state: "dict | None" = None,
+                  infer_max_side: int = 0) -> DetectionResult:
+    """단일 프레임 추론.
+
+    seq_state: optional per-stream sequential-state dict (frame buffer / stride
+    counter / async future / last result). Only consumed by seq_ models; when
+    None, sequential state falls back to attrs on the shared ModelInfo singleton
+    (legacy single-stream behavior). The viewer passes a per-session dict so two
+    concurrent streams of the same seq model do not corrupt each other.
+
+    infer_max_side: optional inference-input downscale cap (longer-side pixels).
+    0/None (default) = today's behavior = inference at full frame resolution. When
+    >0 and the frame's longer side exceeds it, inference runs on a downscaled copy
+    and the resulting boxes are rescaled back to the original frame coords. The
+    caller's display frame is unaffected (it keeps using the original `frame`).
+    This is additive and OFF by default — existing callers see no change.
+    """
     if model_info.session is None:
         return DetectionResult.empty()
 
+    # Optional inference-input downscale (additive, default off). Inference runs on
+    # the (possibly) smaller `frame`; orig_shape tracks the downscaled size so the
+    # postprocess letterbox-unscale lands in downscaled coords, then we map the
+    # boxes back to the true frame size below.
+    frame, infer_scale, true_shape = _infer_downscale(frame, infer_max_side)
     orig_shape = frame.shape
     bs = model_info.batch_size
     t0 = time.perf_counter()
@@ -816,11 +949,12 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
         imagenet_norm = model_info.model_type in ("seq_rfdetr", "seq_dinov3")
         use_letterbox = model_info.model_type == "seq_yolo"
         prep_result = preprocess_sequential_cached(
-            model_info, frame, model_info.input_size, imagenet_norm, use_letterbox)
+            model_info, frame, model_info.input_size, imagenet_norm, use_letterbox,
+            seq_state=seq_state)
         if prep_result is None:
             # Stride skip — 이전 결과 재사용
             infer_ms = 0.0
-            cached = getattr(model_info, '_seq_last_result', None)
+            cached = _seq_get(seq_state, model_info, '_seq_last_result', None)
             result = cached if cached is not None else DetectionResult.empty()
         else:
             tensor, ratio, pad = prep_result
@@ -834,9 +968,10 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
                 result = postprocess_dinov3_seq(output, conf, model_info.input_size, orig_shape)
             else:
                 result = DetectionResult.empty()
-            model_info._seq_last_result = result
+            _seq_set(seq_state, model_info, '_seq_last_result', result)
             # 비동기: 다음 프레임 전처리 시작 (현재 프레임을 미리 처리)
-            _start_async_preprocess(model_info, frame, model_info.input_size, imagenet_norm, use_letterbox)
+            _start_async_preprocess(model_info, frame, model_info.input_size, imagenet_norm, use_letterbox,
+                                    seq_state=seq_state)
     else:
         padded, ratio, pad = letterbox(frame, model_info.input_size)
         tensor = _padded_to_tensor(padded, model_info.input_size)
@@ -850,6 +985,11 @@ def run_inference(model_info: ModelInfo, frame: np.ndarray,
             result = postprocess_v5(single_out, conf, ratio, pad, orig_shape)
 
     result.infer_ms = infer_ms
+    # Map boxes from the downscaled inference frame back to the true frame coords.
+    # No-op when infer_max_side unset / frame already fit (infer_scale == 1.0).
+    if infer_scale != 1.0:
+        result = _rescale_detection_result(result, infer_scale, true_shape)
+        result.infer_ms = infer_ms
     return result
 
 
@@ -1129,7 +1269,7 @@ COCO_KPT_NAMES = [
 class PoseResult:
     boxes: np.ndarray       # (N, 4) xyxy
     scores: np.ndarray      # (N,)
-    keypoints: np.ndarray   # (N, 17, 3) x,y,conf
+    keypoints: np.ndarray   # (N, K, 3) x,y,conf — K derived from model output
     infer_ms: float
 
     @classmethod
@@ -1140,23 +1280,41 @@ class PoseResult:
 
 def postprocess_pose_v8(output: np.ndarray, conf: float,
                         ratio: float, pad: tuple, orig_shape: tuple) -> PoseResult:
-    """YOLOv8/v11-pose output: (1, 56, 8400) = 4 box + 1 conf + 51 kpts(17*3)"""
-    data = output[0]  # (56, 8400)
-    n_kpts = 17
-    box_dim = 4
-    # conf is at index 4
-    if data.shape[0] == box_dim + 1 + n_kpts * 3:
-        scores_all = data[4]  # (8400,)
-    else:
-        # fallback: treat as (4 + nc + 51)
-        nc = data.shape[0] - box_dim - n_kpts * 3
-        scores_all = data[4:4+nc].max(axis=0) if nc > 0 else data[4]
+    """YOLOv8/v11-pose output: (1, 4+1+K*3, anchors) = 4 box + 1 conf + K kpts(x,y,v).
 
+    K (keypoint count) is derived from the channel dim, not hardcoded — so hand
+    (21), animal, or custom-kpt exports decode correctly. A non-YOLO-pose layout
+    (e.g. HRNet/ViTPose heatmaps, shape (1,K,Hh,Ww)) raises UnsupportedModelError
+    instead of mis-slicing heatmap rows as box+score+kpts and emitting garbage.
+    """
+    data = output[0]  # YOLO: (4+1+K*3, anchors); heatmap: (Hh, Ww) after batch strip
+
+    # Heatmap outputs are not 2D channel-major detection tensors. Reject anything
+    # that doesn't look like YOLO-pose (must be 2D and channel count = 5 + 3K).
+    if data.ndim != 2:
+        raise UnsupportedModelError(
+            f"Pose output rank {data.ndim} is not the YOLO-pose layout "
+            f"(expected a 2D (4+1+K*3, anchors) tensor). HRNet/ViTPose heatmap "
+            f"decoding is not implemented yet."
+        )
+
+    box_dim = 4
+    channels = data.shape[0]
+    kpt_channels = channels - box_dim - 1  # subtract box(4) + conf(1)
+    # TODO(later/L-effort): heatmap (soft-argmax) decoder for HRNet/ViTPose.
+    if kpt_channels <= 0 or kpt_channels % 3 != 0:
+        raise UnsupportedModelError(
+            f"Pose output has {channels} channels, which is not 4+1+K*3 for any "
+            f"K>=1 — not a YOLO-pose layout. HRNet/ViTPose are not supported yet."
+        )
+    n_kpts = kpt_channels // 3
+
+    scores_all = data[4]  # (anchors,)
     mask = scores_all > conf
     if not mask.any():
         return PoseResult.empty()
 
-    filtered = data[:, mask].T  # (K, 56)
+    filtered = data[:, mask].T  # (K, channels)
     boxes_xywh = filtered[:, :4]
     scores = scores_all[mask].astype(np.float32)
     kpt_raw = filtered[:, -n_kpts*3:].reshape(-1, n_kpts, 3)
@@ -1179,10 +1337,95 @@ def postprocess_pose_v8(output: np.ndarray, conf: float,
                       keypoints=kpts.astype(np.float32), infer_ms=0.0)
 
 
+def postprocess_pose_heatmap(heatmaps: np.ndarray, ratio: float, pad: tuple,
+                             input_size: tuple, orig_shape: tuple) -> PoseResult:
+    """Top-down heatmap pose (HRNet / ViTPose): (N, K, Hh, Ww) → one PoseResult.
+
+    These models are *top-down*: they assume the whole input image is a single
+    cropped person and emit one heatmap per keypoint. We therefore return a
+    single pose. K (keypoint count) is derived from the heatmap channel dim — NOT
+    hardcoded to 17 — so 17-kpt COCO, 21-kpt hand, or animal exports decode.
+
+    Decoding per keypoint:
+      - argmax over the (Hh, Ww) heatmap gives the integer peak cell.
+      - A quarter-pixel offset toward the larger of the two neighbours in each
+        axis refines the location (the standard HRNet/DARK-lite sub-pixel trick);
+        this halves the systematic bias of plain argmax without needing the full
+        Gaussian-modulation pass.
+      - The peak value is the keypoint confidence.
+      - Coords are scaled from heatmap space → letterboxed input space → original
+        image coords (undo the letterbox ratio/pad applied during preprocess).
+
+    The bounding box is the min/max of the decoded keypoints (top-down models do
+    not regress a box themselves), with the pose score = mean keypoint conf.
+
+    Assumes the heatmap spatial grid maps linearly onto the *letterboxed input*
+    (the common HRNet/ViTPose ONNX export: feature stride = input / heatmap).
+    """
+    # Strip a leading batch dim if present: (N, K, Hh, Ww) → first instance.
+    data = heatmaps[0] if heatmaps.ndim == 4 else heatmaps
+    if data.ndim != 3:
+        raise UnsupportedModelError(
+            f"Heatmap pose output rank {heatmaps.ndim} is not (N, K, Hh, Ww); "
+            f"cannot decode as HRNet/ViTPose heatmaps."
+        )
+
+    n_kpts, hh, ww = data.shape
+    flat = data.reshape(n_kpts, -1)
+    peak_idx = flat.argmax(axis=1)            # (K,) flat index of the peak cell
+    peak_val = flat[np.arange(n_kpts), peak_idx]  # (K,) confidence
+    py = (peak_idx // ww).astype(np.float32)  # row (y) in heatmap space
+    px = (peak_idx % ww).astype(np.float32)   # col (x) in heatmap space
+
+    # Quarter-pixel sub-pixel refinement: nudge toward the brighter neighbour.
+    for k in range(n_kpts):
+        x, y = int(px[k]), int(py[k])
+        if 0 < x < ww - 1:
+            if data[k, y, x + 1] > data[k, y, x - 1]:
+                px[k] += 0.25
+            elif data[k, y, x + 1] < data[k, y, x - 1]:
+                px[k] -= 0.25
+        if 0 < y < hh - 1:
+            if data[k, y + 1, x] > data[k, y - 1, x]:
+                py[k] += 0.25
+            elif data[k, y + 1, x] < data[k, y - 1, x]:
+                py[k] -= 0.25
+
+    ih, iw = input_size
+    # heatmap grid → letterboxed input pixels (sample at cell centre via +0.5).
+    x_in = (px + 0.5) * (iw / ww)
+    y_in = (py + 0.5) * (ih / hh)
+
+    # letterboxed input → original image coords (undo ratio + pad).
+    pad_w, pad_h = pad
+    oh, ow = orig_shape[:2]
+    x_orig = np.clip((x_in - pad_w) / ratio, 0, ow)
+    y_orig = np.clip((y_in - pad_h) / ratio, 0, oh)
+
+    kpts = np.stack([x_orig, y_orig, peak_val.astype(np.float32)], axis=1)
+    kpts = kpts.reshape(1, n_kpts, 3).astype(np.float32)
+
+    # Top-down: derive the person box from the keypoint extent.
+    x1, x2 = float(x_orig.min()), float(x_orig.max())
+    y1, y2 = float(y_orig.min()), float(y_orig.max())
+    box = np.array([[x1, y1, x2, y2]], dtype=np.float32)
+    score = np.array([float(peak_val.mean())], dtype=np.float32)
+
+    return PoseResult(boxes=box, scores=score, keypoints=kpts, infer_ms=0.0)
+
+
 def run_pose(model_info: ModelInfo, frame: np.ndarray, conf: float) -> PoseResult:
-    """Pose estimation inference"""
+    """Pose estimation inference.
+
+    Dispatches on model_type: 'pose_yolo' uses the YOLO-pose regression head
+    (postprocess_pose_v8); 'pose_hrnet' / 'pose_vitpose' decode top-down keypoint
+    heatmaps (postprocess_pose_heatmap). Any other advertised type, or an output
+    layout that matches neither, raises UnsupportedModelError so the route can
+    report a precise reason instead of returning a misleading empty pose.
+    """
     if model_info.session is None:
         return PoseResult.empty()
+
     t0 = time.perf_counter()
     padded, ratio, pad = letterbox(frame, model_info.input_size)
     tensor = _padded_to_tensor(padded, model_info.input_size)
@@ -1191,9 +1434,89 @@ def run_pose(model_info: ModelInfo, frame: np.ndarray, conf: float) -> PoseResul
         tensor = np.repeat(tensor, bs, axis=0)
     output = model_info.session.run(None, {model_info.input_name: tensor})
     infer_ms = (time.perf_counter() - t0) * 1000.0
-    result = postprocess_pose_v8(output[0][:1], conf, ratio, pad, frame.shape)
+
+    if model_info.model_type == "pose_yolo":
+        result = postprocess_pose_v8(output[0][:1], conf, ratio, pad, frame.shape)
+    elif model_info.model_type in ("pose_hrnet", "pose_vitpose"):
+        result = postprocess_pose_heatmap(
+            output[0][:1], ratio, pad, model_info.input_size, frame.shape)
+    else:
+        raise UnsupportedModelError(
+            f"Pose estimation for model type '{model_info.model_type}' is not "
+            f"supported — expected 'pose_yolo', 'pose_hrnet', or 'pose_vitpose'."
+        )
     result.infer_ms = infer_ms
     return result
+
+
+def _batch_preprocess_letterbox(frames: list, input_size: tuple) -> "tuple[np.ndarray, list]":
+    """Stack N frames into one NCHW tensor via letterbox. Returns (tensor, [(ratio,pad), ...]).
+
+    Shared by the pose/instance-seg batch helpers. Uses fresh arrays (no thread
+    buffer) because every frame in the batch is distinct, so the buffer reuse
+    that benefits the single-image hot path would just be overwritten here.
+    """
+    metas = []
+    tensors = []
+    for f in frames:
+        padded, ratio, pad = letterbox(f, input_size)
+        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+        tensors.append(np.ascontiguousarray(
+            rgb.transpose(2, 0, 1)[np.newaxis], dtype=np.float32) / 255.0)
+        metas.append((ratio, pad))
+    return np.concatenate(tensors, axis=0), metas
+
+
+def run_pose_batch(model_info: ModelInfo, frames: list, conf: float) -> "list[PoseResult]":
+    """Pose inference over multiple frames, batched through one forward where possible.
+
+    Mirrors run_pose's type guard. Respects fixed-batch models: pads the batch
+    up to model_info.batch_size and divides timing by the real frame count.
+    Falls back to a per-frame loop only when the model batch dim is fixed and
+    smaller than the requested count.
+    """
+    if model_info.session is None or not frames:
+        return [PoseResult.empty() for _ in frames]
+    is_heatmap = model_info.model_type in ("pose_hrnet", "pose_vitpose")
+    if model_info.model_type != "pose_yolo" and not is_heatmap:
+        raise UnsupportedModelError(
+            f"Pose estimation for model type '{model_info.model_type}' is not "
+            f"supported — expected 'pose_yolo', 'pose_hrnet', or 'pose_vitpose'."
+        )
+
+    n = len(frames)
+    bs = model_info.batch_size
+    orig_shapes = [f.shape for f in frames]
+
+    # Fixed-batch model whose batch dim can't hold all frames at once: chunk by
+    # bs so we never feed a tensor the model can't accept.
+    if bs > 1 and bs < n:
+        results: list[PoseResult] = []
+        for start in range(0, n, bs):
+            chunk = frames[start:start + bs]
+            results.extend(run_pose_batch(model_info, chunk, conf))
+        return results
+
+    t0 = time.perf_counter()
+    batch_tensor, metas = _batch_preprocess_letterbox(frames, model_info.input_size)
+    if bs > n:
+        # Pad fixed-batch input up to bs by repeating the last frame; trim outputs.
+        pad_tensor = np.repeat(batch_tensor[-1:], bs - n, axis=0)
+        batch_tensor = np.concatenate([batch_tensor, pad_tensor], axis=0)
+    output = model_info.session.run(None, {model_info.input_name: batch_tensor})
+    infer_ms = (time.perf_counter() - t0) * 1000.0
+
+    results = []
+    for i in range(n):
+        ratio, pad = metas[i]
+        if is_heatmap:
+            r = postprocess_pose_heatmap(
+                output[0][i:i + 1], ratio, pad, model_info.input_size, orig_shapes[i])
+        else:
+            r = postprocess_pose_v8(output[0][i:i + 1], conf, ratio, pad, orig_shapes[i])
+        r.infer_ms = infer_ms / n
+        results.append(r)
+    return results
 
 
 # ── Instance Segmentation Inference ─────────────────────
@@ -1213,9 +1536,24 @@ class InstanceSegResult:
 
 def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
                      conf: float) -> InstanceSegResult:
-    """YOLO-Seg instance segmentation: returns per-instance masks"""
+    """Instance segmentation: returns per-instance masks.
+
+    Dispatches on model_type: 'instseg_yolo' decodes the YOLO-Seg layout (det
+    tensor + proto tensor); 'instseg_maskrcnn' decodes the torchvision /
+    detectron2 layout (separate boxes / labels / scores / masks tensors). Any
+    other type, or an output layout that matches neither expected set, raises
+    UnsupportedModelError so the caller can report a precise reason instead of a
+    misleading empty result.
+    """
     if model_info.session is None:
         return InstanceSegResult.empty()
+
+    if model_info.model_type not in ("instseg_yolo", "instseg_maskrcnn"):
+        raise UnsupportedModelError(
+            f"Instance segmentation for model type '{model_info.model_type}' is not "
+            f"supported — expected 'instseg_yolo' or 'instseg_maskrcnn'."
+        )
+
     t0 = time.perf_counter()
     h_orig, w_orig = frame.shape[:2]
     padded, ratio, pad = letterbox(frame, model_info.input_size)
@@ -1226,13 +1564,130 @@ def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
     output = model_info.session.run(None, {model_info.input_name: tensor})
     infer_ms = (time.perf_counter() - t0) * 1000.0
 
+    if model_info.model_type == "instseg_maskrcnn":
+        result = _decode_maskrcnn_seg(output, conf, ratio, pad,
+                                      model_info.input_size, (h_orig, w_orig))
+        result.infer_ms = infer_ms
+        return result
+
+    # YOLO-Seg requires a 3D det tensor + 4D proto tensor. A different layout
+    # (e.g. Mask R-CNN's separate boxes/labels/scores/masks) means this model
+    # was mislabeled as instseg_yolo — surface it rather than returning empty.
     if len(output) < 2 or output[0].ndim != 3 or output[1].ndim != 4:
+        raise UnsupportedModelError(
+            "Model output does not match the YOLO-Seg layout "
+            "(expected a 3D detection tensor + 4D prototype tensor). "
+            "This model cannot be decoded as 'instseg_yolo'."
+        )
+
+    result = _decode_yolo_seg(output[0][0], output[1][0], conf,
+                             ratio, pad, model_info.input_size, (h_orig, w_orig))
+    result.infer_ms = infer_ms
+    return result
+
+
+def _identify_maskrcnn_outputs(output: list) -> "tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]":
+    """Locate Mask R-CNN's (boxes, labels, scores, masks) among raw ORT outputs.
+
+    torchvision/detectron2 ONNX exports emit four named tensors per image with no
+    batch dim: boxes (N,4), labels (N,), scores (N,), masks (N,1,Hm,Wm) or
+    (N,Hm,Wm). The order/names vary by export, so we identify by rank/shape:
+      - masks: the rank-3 or rank-4 tensor (the only spatial output).
+      - boxes: the rank-2 tensor whose last dim == 4.
+      - scores: a rank-1 float tensor.
+      - labels: a rank-1 integer tensor.
+    Raises UnsupportedModelError if the set cannot be identified — the model was
+    mislabeled as instseg_maskrcnn.
+    """
+    boxes = labels = scores = masks = None
+    for o in output:
+        if o.ndim >= 3:
+            masks = o
+        elif o.ndim == 2 and o.shape[-1] == 4:
+            boxes = o
+        elif o.ndim == 1:
+            # int dtype → class labels; float dtype → confidence scores.
+            if np.issubdtype(o.dtype, np.integer):
+                labels = o
+            else:
+                scores = o
+
+    if boxes is None or scores is None or masks is None:
+        raise UnsupportedModelError(
+            "Model output does not match the Mask R-CNN layout (expected separate "
+            "boxes (N,4), scores (N,), and masks (N,1,H,W) tensors). This model "
+            "cannot be decoded as 'instseg_maskrcnn'."
+        )
+    if labels is None:
+        # Some single-class exports omit labels — default every instance to 0.
+        labels = np.zeros(len(scores), dtype=np.int32)
+    return boxes, labels, scores, masks
+
+
+def _decode_maskrcnn_seg(output: list, conf: float, ratio: float, pad: tuple,
+                         input_size: tuple, orig_hw: tuple) -> InstanceSegResult:
+    """Decode torchvision/detectron2 Mask R-CNN outputs → InstanceSegResult.
+
+    Assumes the model ran on the letterboxed input, so boxes/masks are in
+    letterboxed-input pixel space; we undo the letterbox (pad + ratio) to map
+    back to original-image coords. Boxes are absolute xyxy. Masks are per-instance
+    soft probabilities (N,1,Hm,Wm) or (N,Hm,Wm); we resize each to the input,
+    strip the letterbox padding, scale to the original image, and threshold at
+    0.5 to a binary uint8 mask — matching _decode_yolo_seg's mask contract.
+    """
+    boxes, labels, scores, masks = _identify_maskrcnn_outputs(output)
+    h_orig, w_orig = orig_hw
+    ih, iw = input_size
+    pad_w, pad_h = pad
+
+    keep = scores > conf
+    if not keep.any():
         return InstanceSegResult.empty()
 
-    det = output[0][0]      # (116, 8400)
-    protos = output[1][0]   # (32, mh, mw)
+    boxes_k = boxes[keep]
+    scores_k = scores[keep].astype(np.float32)
+    labels_k = labels[keep].astype(np.int32)
+    masks_k = masks[keep]
+    # Collapse a singleton channel dim: (M,1,Hm,Wm) → (M,Hm,Wm).
+    if masks_k.ndim == 4:
+        masks_k = masks_k[:, 0]
+
+    # Boxes: letterboxed-input xyxy → original coords.
+    x1 = np.clip((boxes_k[:, 0] - pad_w) / ratio, 0, w_orig)
+    y1 = np.clip((boxes_k[:, 1] - pad_h) / ratio, 0, h_orig)
+    x2 = np.clip((boxes_k[:, 2] - pad_w) / ratio, 0, w_orig)
+    y2 = np.clip((boxes_k[:, 3] - pad_h) / ratio, 0, h_orig)
+    boxes_out = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
+
+    pad_h_i, pad_w_i = int(round(pad_h)), int(round(pad_w))
+    masks_out = []
+    for m in masks_k:
+        # Resize mask to the letterboxed input, strip pad, scale to original.
+        m_full = cv2.resize(m.astype(np.float32), (iw, ih),
+                            interpolation=cv2.INTER_LINEAR)
+        unpadded = m_full[pad_h_i:ih - pad_h_i if pad_h_i else ih,
+                          pad_w_i:iw - pad_w_i if pad_w_i else iw]
+        inst_mask = cv2.resize(unpadded, (w_orig, h_orig),
+                               interpolation=cv2.INTER_LINEAR)
+        masks_out.append((inst_mask > 0.5).astype(np.uint8))
+
+    return InstanceSegResult(
+        boxes=boxes_out, scores=scores_k, class_ids=labels_k,
+        masks=masks_out, infer_ms=0.0,
+    )
+
+
+def _decode_yolo_seg(det: np.ndarray, protos: np.ndarray, conf: float,
+                     ratio: float, pad: tuple, input_size: tuple,
+                     orig_hw: tuple) -> InstanceSegResult:
+    """Decode one image's YOLO-Seg det+proto tensors → InstanceSegResult (infer_ms=0).
+
+    Extracted from run_instance_seg so the batch path can reuse the identical
+    per-image decode without changing single-image behavior.
+    """
     nm = protos.shape[0]
     nc = det.shape[0] - 4 - nm
+    h_orig, w_orig = orig_hw
 
     scores_all = det[4:4+nc, :]
     max_scores = scores_all.max(axis=0)
@@ -1259,7 +1714,7 @@ def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
     raw_masks = (mask_coeffs @ protos.reshape(nm, -1)).reshape(-1, mh, mw)
     raw_masks = 1.0 / (1.0 + np.exp(-raw_masks))
 
-    ih, iw = model_info.input_size
+    ih, iw = input_size
     pad_h_i, pad_w_i = int(round(pad[1])), int(round(pad[0]))
 
     boxes_out, scores_out, cids_out, masks_out = [], [], [], []
@@ -1286,5 +1741,62 @@ def run_instance_seg(model_info: ModelInfo, frame: np.ndarray,
         boxes=np.array(boxes_out, dtype=np.float32),
         scores=np.array(scores_out, dtype=np.float32),
         class_ids=np.array(cids_out, dtype=np.int32),
-        masks=masks_out, infer_ms=infer_ms,
+        masks=masks_out, infer_ms=0.0,
     )
+
+
+def run_instance_seg_batch(model_info: ModelInfo, frames: list,
+                           conf: float) -> "list[InstanceSegResult]":
+    """Instance segmentation over multiple frames, batched through one forward.
+
+    Mirrors run_instance_seg's type/layout guards. Respects fixed-batch models:
+    chunks by batch_size when fixed and smaller than the request, pads up when
+    larger, and divides timing by the real frame count.
+    """
+    if model_info.session is None or not frames:
+        return [InstanceSegResult.empty() for _ in frames]
+    if model_info.model_type not in ("instseg_yolo", "instseg_maskrcnn"):
+        raise UnsupportedModelError(
+            f"Instance segmentation for model type '{model_info.model_type}' is not "
+            f"supported — expected 'instseg_yolo' or 'instseg_maskrcnn'."
+        )
+
+    # Mask R-CNN emits a variable instance count per image and is not reliably
+    # batchable through one forward, so decode it frame-by-frame via the
+    # single-image path (which already handles the maskrcnn layout).
+    if model_info.model_type == "instseg_maskrcnn":
+        return [run_instance_seg(model_info, f, conf) for f in frames]
+
+    n = len(frames)
+    bs = model_info.batch_size
+    if bs > 1 and bs < n:
+        results: list[InstanceSegResult] = []
+        for start in range(0, n, bs):
+            results.extend(run_instance_seg_batch(model_info, frames[start:start + bs], conf))
+        return results
+
+    orig_shapes = [f.shape for f in frames]
+    t0 = time.perf_counter()
+    batch_tensor, metas = _batch_preprocess_letterbox(frames, model_info.input_size)
+    if bs > n:
+        pad_tensor = np.repeat(batch_tensor[-1:], bs - n, axis=0)
+        batch_tensor = np.concatenate([batch_tensor, pad_tensor], axis=0)
+    output = model_info.session.run(None, {model_info.input_name: batch_tensor})
+    infer_ms = (time.perf_counter() - t0) * 1000.0
+
+    if len(output) < 2 or output[0].ndim != 3 or output[1].ndim != 4:
+        raise UnsupportedModelError(
+            "Model output does not match the YOLO-Seg layout "
+            "(expected a 3D detection tensor + 4D prototype tensor). "
+            "This model cannot be decoded as 'instseg_yolo'."
+        )
+
+    results = []
+    for i in range(n):
+        ratio, pad = metas[i]
+        h_orig, w_orig = orig_shapes[i][:2]
+        r = _decode_yolo_seg(output[0][i], output[1][i], conf, ratio, pad,
+                             model_info.input_size, (h_orig, w_orig))
+        r.infer_ms = infer_ms / n
+        results.append(r)
+    return results

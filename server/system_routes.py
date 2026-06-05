@@ -10,9 +10,14 @@ import psutil
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from server.path_safety import UnsafePathError, safe_path
 from server.utils import check_gpu_available, get_gpu_info
 
 router = APIRouter()
+
+# Bound a recursive directory walk so `fs_list(recursive=True)` on a huge root
+# (e.g. C:\) cannot hang the event loop indefinitely.
+_FS_LIST_CAP = 5000
 
 # ── Hardware Stats ──────────────────────────────────────
 _gpu_available = None  # None=미확인, True/False=캐싱
@@ -342,23 +347,36 @@ class FsListRequest(BaseModel):
 async def fs_list(req: FsListRequest):
     """List files in a directory, optionally filtered by extensions."""
     from pathlib import Path
-    p = Path(req.path) if req.path else Path(".")
-    if not p.exists():
-        return {"files": [], "error": f"Path not found: {req.path}"}
+    try:
+        base = safe_path(req.path or ".", must_exist=True, must_be_dir=True)
+    except UnsafePathError as e:
+        return {"files": [], "error": f"{e.code}: {e}"}
+    p = Path(base)
     files = []
+    truncated = False
     try:
         items = p.rglob("*") if req.recursive else p.iterdir()
+        exts = (
+            [e.lower() if e.startswith('.') else f'.{e.lower()}' for e in req.extensions]
+            if req.extensions else None
+        )
         for f in items:
             if f.is_file():
-                if req.extensions:
-                    if f.suffix.lower() in [e.lower() if e.startswith('.') else f'.{e.lower()}' for e in req.extensions]:
-                        files.append(str(f))
-                else:
+                if exts is None or f.suffix.lower() in exts:
                     files.append(str(f))
+                    # Cap the walk so a recursive list on a huge root can't run
+                    # unbounded and block the event loop.
+                    if len(files) >= _FS_LIST_CAP:
+                        truncated = True
+                        break
     except PermissionError:
         pass
     files.sort()
-    return {"files": files, "count": len(files)}
+    out = {"files": files, "count": len(files)}
+    if truncated:
+        out["truncated"] = True
+        out["cap"] = _FS_LIST_CAP
+    return out
 
 
 @router.post("/api/fs/select-dir")
@@ -380,7 +398,16 @@ class FsBrowseRequest(BaseModel):
 async def fs_browse(req: FsBrowseRequest):
     """Browse directory contents for the web-based file browser."""
     from pathlib import Path
-    p = Path(req.path) if req.path else Path.home()
+    # Normalize + reject NUL / un-resolvable paths, but keep the picker's
+    # fall-back-to-home behavior: an empty / bad / missing path lands on $HOME
+    # rather than erroring (this is a browse dialog, not a strict load).
+    if req.path:
+        try:
+            p = Path(safe_path(req.path))
+        except UnsafePathError:
+            p = Path.home()
+    else:
+        p = Path.home()
     if not p.exists():
         p = Path.home()
     if p.is_file():
@@ -420,9 +447,11 @@ class ListFilesRequest(BaseModel):
 async def list_files(req: ListFilesRequest):
     """List image/label files in a directory (used by pose/instance-seg tabs)."""
     from pathlib import Path
-    p = Path(req.dir) if req.dir else Path(".")
-    if not p.exists():
-        return {"files": [], "error": f"Path not found: {req.dir}"}
+    try:
+        base = safe_path(req.dir or ".", must_exist=True, must_be_dir=True)
+    except UnsafePathError as e:
+        return {"files": [], "error": f"{e.code}: {e}"}
+    p = Path(base)
     exts = req.extensions or [".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"]
     files = sorted([
         str(f) for f in p.iterdir()

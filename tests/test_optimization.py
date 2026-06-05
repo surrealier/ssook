@@ -430,6 +430,53 @@ class TestDiagnoseCharts:
         assert isinstance(img, str)
 
 
+class TestGenerateAllCharts:
+    """generate_all_charts parallelizes the 5 builders; dict shape must match
+    the keys the diagnose route previously built serially."""
+
+    _EXPECTED_KEYS = {
+        "weight_distribution", "op_distribution", "quantization_sensitivity",
+        "channel_importance", "model_overview",
+    }
+
+    def test_keys_match_serial_contract(self, conv_bn_conv_model):
+        from core.diagnosis_charts import generate_all_charts
+        diag = ModelDiagnosisEngine().diagnose(conv_bn_conv_model)
+        charts = generate_all_charts(diag)
+        # Exact same key set as the legacy serial dict — no more, no fewer.
+        assert set(charts.keys()) == self._EXPECTED_KEYS
+
+    def test_each_chart_is_str(self, conv_bn_conv_model):
+        from core.diagnosis_charts import generate_all_charts
+        diag = ModelDiagnosisEngine().diagnose(conv_bn_conv_model)
+        charts = generate_all_charts(diag)
+        for key, img in charts.items():
+            assert isinstance(img, str), key
+            # When matplotlib is present each value is a base64 PNG; "" is the
+            # graceful fallback when matplotlib is absent.
+            if img:
+                assert img.startswith("data:image/png;base64,"), key
+
+    def test_matches_serial_builders(self, conv_bn_conv_model):
+        # The parallel orchestrator must feed each builder the same diagnosis
+        # slice the route fed serially, so non-empty charts come back non-empty.
+        from core.diagnosis_charts import generate_all_charts
+        diag = ModelDiagnosisEngine().diagnose(conv_bn_conv_model)
+        charts = generate_all_charts(diag)
+        # model_overview is built from the whole diagnosis and always renders.
+        assert charts["model_overview"].startswith("data:image/png;base64,")
+
+    def test_single_builder_failure_isolated(self, conv_bn_conv_model):
+        # A broken slice for one chart must not sink the rest of the batch.
+        from core.diagnosis_charts import generate_all_charts
+        diag = ModelDiagnosisEngine().diagnose(conv_bn_conv_model)
+        diag["weight_analysis"] = [{"name": "bad", "mean": "not-a-number"}]
+        charts = generate_all_charts(diag)
+        assert set(charts.keys()) == self._EXPECTED_KEYS
+        # The healthy charts still render despite the poisoned weight slice.
+        assert charts["model_overview"].startswith("data:image/png;base64,")
+
+
 # ============================================================
 # v1.6.0 hardening — TOOLS-01/02/03/08/09/11/12
 # ============================================================
@@ -579,3 +626,386 @@ class TestModelCacheAtomic:
         # All workers get the same value; compute ran once (per-key lock).
         assert all(r == {"value": 42} for r in results)
         assert calls["n"] == 1
+
+
+# ============================================================
+# Diagnosis hardening — external-data models + bounded fusable scan
+# ============================================================
+def _make_external_data_model(path: str, in_features=64, out_features=32):
+    """Linear model whose weights live in a sidecar .data file (external data).
+
+    Mirrors how exporters emit >2GB models: numpy_helper.to_array() on these
+    initializers raises when the model is loaded with load_external_data=False.
+    """
+    import onnx
+    from onnx import helper, TensorProto, numpy_helper
+    from onnx.external_data_helper import convert_model_to_external_data
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, in_features])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, out_features])
+    W = numpy_helper.from_array(
+        np.random.randn(in_features, out_features).astype(np.float32), "W")
+    B = numpy_helper.from_array(np.random.randn(out_features).astype(np.float32), "B")
+    mm = helper.make_node("MatMul", ["X", "W"], ["mm"])
+    add = helper.make_node("Add", ["mm", "B"], ["Y"])
+    graph = helper.make_graph([mm, add], "lin_ext", [X], [Y], [W, B])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    onnx.save(model, path)
+    # Force every tensor out to a sidecar regardless of size.
+    loaded = onnx.load(path)
+    convert_model_to_external_data(
+        loaded, all_tensors_to_one_file=True,
+        location=os.path.basename(path) + ".data", size_threshold=0)
+    onnx.save(loaded, path)
+    return path
+
+
+class TestDiagnoseExternalData:
+    def test_external_data_with_sidecar_diagnoses(self, tmp_dir):
+        # Sidecar present: weights must be materialized and stats computed.
+        p = _make_external_data_model(os.path.join(tmp_dir, "ext.onnx"))
+        assert os.path.isfile(p + ".data")
+        result = ModelDiagnosisEngine().diagnose(p)
+        assert result["summary"]["total_params"] > 0
+        assert result["summary"]["weights_materialized"] is True
+        assert len(result["weight_analysis"]) > 0
+
+    def test_external_data_missing_sidecar_no_crash(self, tmp_dir):
+        # Sidecar deleted: diagnosis must NOT crash; it degrades to a
+        # structure-only report with a clear warning finding.
+        p = _make_external_data_model(os.path.join(tmp_dir, "ext_missing.onnx"))
+        os.remove(p + ".data")
+        result = ModelDiagnosisEngine().diagnose(p)  # must not raise
+        assert result["summary"]["weights_materialized"] is False
+        # Graph structure still analyzed (nodes counted).
+        assert result["summary"]["num_nodes"] >= 1
+        # A weights-category warning explains why stats are absent.
+        weight_warnings = [f for f in result["findings"]
+                           if f["category"] == "weights"
+                           and f["severity"] == "warning"]
+        assert weight_warnings, "expected a warning about unmaterialized weights"
+        assert "external data" in weight_warnings[0]["message"].lower()
+
+
+class TestDiagnoseFusableScanBounded:
+    def test_large_graph_scan_capped(self, conv_model, monkeypatch):
+        # Lower the cap so a tiny graph trips the bound, proving the scan is
+        # skipped (not run quadratically) and flagged instead of hanging.
+        import core.model_diagnosis as md
+        monkeypatch.setattr(md, "_FUSABLE_SCAN_MAX_NODES", 1)
+        result = ModelDiagnosisEngine().diagnose(conv_model)
+        ga = result["graph_analysis"]
+        assert ga["fusable_scan_capped"] is True
+        assert ga["fusable_patterns"] == 0  # scan skipped, nothing counted
+
+    def test_small_graph_scan_runs(self, conv_bn_conv_model):
+        # Under the default cap the scan runs and finds the Conv->BN fusion.
+        result = ModelDiagnosisEngine().diagnose(conv_bn_conv_model)
+        ga = result["graph_analysis"]
+        assert ga["fusable_scan_capped"] is False
+        assert ga["fusable_patterns"] >= 1
+
+
+# ============================================================
+# Quantizer P0s — FP16 I/O preservation + static-calib preprocessing spec
+# ============================================================
+def _make_square_image_dir(d: str, n: int = 3, size: int = 32):
+    """Write a few small JPEGs so the calibration reader has inputs."""
+    import cv2
+    for i in range(n):
+        img = (np.random.rand(size, size, 3) * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(d, f"img_{i}.jpg"), img)
+
+
+def _make_fp32_conv_model(path: str, hw: int = 8):
+    """Square-input Conv+Relu fp32 model with fixed I/O for fp16/static tests."""
+    import onnx
+    from onnx import helper, TensorProto, numpy_helper
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 3, hw, hw])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4, hw, hw])
+    W = numpy_helper.from_array(np.random.randn(4, 3, 3, 3).astype(np.float32), "W")
+    B = numpy_helper.from_array(np.zeros(4, dtype=np.float32), "B")
+    conv = helper.make_node("Conv", ["X", "W", "B"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    relu = helper.make_node("Relu", ["c"], ["Y"])
+    g = helper.make_graph([conv, relu], "fp32_conv", [X], [Y], [W, B])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+    m.ir_version = 8
+    onnx.save(m, path)
+    return path
+
+
+@pytest.fixture
+def import_cv2():
+    import cv2  # noqa: F401 — guard: skip quantizer tests when cv2 absent
+    return cv2
+
+
+class TestConvertFp16IOTypes:
+    def test_keeps_float32_graph_io(self, tmp_dir, import_cv2):
+        import onnxruntime as ort
+        from core.quantizer import convert_fp16
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "fp32.onnx"))
+        out = os.path.join(tmp_dir, "fp16.onnx")
+        result = convert_fp16(src, out)
+        assert os.path.isfile(out)
+        assert result["method"] == "fp16"
+        sess = ort.InferenceSession(out, providers=["CPUExecutionProvider"])
+        # I/O must remain fp32 so the benchmark/profiler hand-off keeps working.
+        assert sess.get_inputs()[0].type == "tensor(float)"
+        assert sess.get_outputs()[0].type == "tensor(float)"
+        # And it must actually run on an fp32 feed.
+        feed = {sess.get_inputs()[0].name: np.random.rand(1, 3, 8, 8).astype(np.float32)}
+        out_vals = sess.run(None, feed)
+        assert out_vals[0].dtype == np.float32
+
+    def test_external_data_model_converts_and_loads(self, tmp_dir, import_cv2):
+        import onnxruntime as ort
+        from core.quantizer import convert_fp16
+        # Force external data so the load_external_data=True path is exercised.
+        src = _make_external_data_model(os.path.join(tmp_dir, "ext_fp32.onnx"))
+        assert os.path.isfile(src + ".data")
+        out = os.path.join(tmp_dir, "ext_fp16.onnx")
+        result = convert_fp16(src, out)
+        assert os.path.isfile(out)
+        # The converted model must still load and keep fp32 I/O.
+        sess = ort.InferenceSession(out, providers=["CPUExecutionProvider"])
+        assert sess.get_inputs()[0].type == "tensor(float)"
+        assert "external_data" in result
+
+
+class TestStaticCalibPreprocessing:
+    def test_auto_guess_is_reported(self, tmp_dir, import_cv2):
+        from core.quantizer import quantize_static
+        _make_square_image_dir(tmp_dir)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "calib_src.onnx"))
+        out = os.path.join(tmp_dir, "calib_int8.onnx")
+        result = quantize_static(src, out, calibration_dir=tmp_dir, max_images=3)
+        # The auto-guessed preprocessing must be surfaced, not silent.
+        assert result["preprocess_auto_guessed"] is True
+        pp = result["preprocess"]
+        assert pp["color_order"] == "rgb"
+        assert pp["scale"] == 255.0
+        # Square input (H==W) -> letterbox guessed on.
+        assert pp["use_letterbox"] is True
+
+    def test_explicit_spec_overrides_and_is_reported(self, tmp_dir, import_cv2, monkeypatch):
+        import core.inference as inference
+        from core.quantizer import quantize_static, PreprocessSpec
+        _make_square_image_dir(tmp_dir)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "calib_src2.onnx"))
+        out = os.path.join(tmp_dir, "calib_int8_2.onnx")
+
+        # Spy on letterbox: with use_letterbox=False it must NOT be called.
+        called = {"n": 0}
+        real_letterbox = inference.letterbox
+
+        def _spy(img, shape):
+            called["n"] += 1
+            return real_letterbox(img, shape)
+
+        monkeypatch.setattr(inference, "letterbox", _spy)
+
+        spec = PreprocessSpec(use_letterbox=False, color_order="bgr",
+                              mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+        result = quantize_static(src, out, calibration_dir=tmp_dir, max_images=3,
+                                 preprocess=spec)
+        assert called["n"] == 0  # plain resize path, letterbox never invoked
+        assert result["preprocess_auto_guessed"] is False
+        pp = result["preprocess"]
+        assert pp["use_letterbox"] is False
+        assert pp["color_order"] == "bgr"
+        assert pp["mean"] == [0.5, 0.5, 0.5]
+
+    def test_letterbox_spec_invokes_letterbox(self, tmp_dir, import_cv2, monkeypatch):
+        import core.inference as inference
+        from core.quantizer import quantize_static, PreprocessSpec
+        _make_square_image_dir(tmp_dir)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "calib_src3.onnx"))
+        out = os.path.join(tmp_dir, "calib_int8_3.onnx")
+
+        called = {"n": 0}
+        real_letterbox = inference.letterbox
+
+        def _spy(img, shape):
+            called["n"] += 1
+            return real_letterbox(img, shape)
+
+        monkeypatch.setattr(inference, "letterbox", _spy)
+
+        quantize_static(src, out, calibration_dir=tmp_dir, max_images=3,
+                        preprocess=PreprocessSpec(use_letterbox=True))
+        assert called["n"] >= 1  # letterbox used for every calibration image
+
+
+# ============================================================
+# Post-optimization accuracy validation — agreement metric math (PURE LOGIC)
+# These import only numpy via core.quantizer's metric helpers; safe to RUN.
+# ============================================================
+class TestAgreementMetricsPureLogic:
+    """compute_agreement_metrics / _cosine_similarity operate on plain numpy
+    output lists — no onnxruntime, no cv2 — so the math is verifiable here."""
+
+    def test_identical_outputs_perfect_agreement(self):
+        from core.quantizer import compute_agreement_metrics
+        a = [np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)]
+        m = compute_agreement_metrics(a, [x.copy() for x in a])
+        assert m["cosine"] == pytest.approx(1.0, abs=1e-6)
+        assert m["max_abs_diff"] == pytest.approx(0.0, abs=1e-6)
+        assert m["top1_match"] is True
+
+    def test_divergent_outputs_low_cosine(self):
+        # Anti-correlated vectors -> cosine near -1, top-1 differs.
+        from core.quantizer import compute_agreement_metrics
+        a = [np.array([[1.0, 2.0, 3.0, 10.0]], dtype=np.float32)]
+        b = [np.array([[10.0, 3.0, 2.0, 1.0]], dtype=np.float32)]
+        m = compute_agreement_metrics(a, b)
+        assert m["cosine"] < 0.9
+        assert m["top1_match"] is False
+        assert m["max_abs_diff"] == pytest.approx(9.0, abs=1e-6)
+
+    def test_cosine_similarity_zero_vectors(self):
+        from core.quantizer import _cosine_similarity
+        z = np.zeros(4, dtype=np.float32)
+        # Both zero -> treated as agreeing (avoids 0/0 NaN poisoning the mean).
+        assert _cosine_similarity(z, z) == 1.0
+        # One zero, one non-zero -> fully divergent.
+        assert _cosine_similarity(z, np.array([1.0, 0, 0, 0])) == 0.0
+
+    def test_shape_mismatch_marks_inf_diff(self):
+        # A pruned/quantized model that changes output shape is a strong
+        # degradation signal: max_abs_diff must surface as inf, not silently 0.
+        from core.quantizer import compute_agreement_metrics
+        a = [np.array([[1.0, 2.0, 3.0]], dtype=np.float32)]
+        b = [np.array([[1.0, 2.0]], dtype=np.float32)]
+        m = compute_agreement_metrics(a, b)
+        assert m["max_abs_diff"] == float("inf")
+
+    def test_empty_outputs_fail_closed(self):
+        from core.quantizer import compute_agreement_metrics
+        m = compute_agreement_metrics([], [])
+        assert m["cosine"] == 0.0
+        assert m["top1_match"] is False
+
+    def test_cosine_to_agreement_remap_range(self):
+        # The route/validator remaps cosine [-1,1] -> agreement [0,1] as
+        # (cosine + 1) / 2. Verify the boundary mapping the validator relies on.
+        from core.quantizer import compute_agreement_metrics
+        a = [np.array([[1.0, 0.0]], dtype=np.float32)]
+        same = compute_agreement_metrics(a, [a[0].copy()])
+        agreement = (same["cosine"] + 1.0) / 2.0
+        assert agreement == pytest.approx(1.0, abs=1e-6)
+
+    def test_default_threshold_exposed(self):
+        from core.quantizer import DEFAULT_AGREEMENT_THRESHOLD
+        assert 0.0 < DEFAULT_AGREEMENT_THRESHOLD <= 1.0
+        assert DEFAULT_AGREEMENT_THRESHOLD == 0.9
+
+
+# ============================================================
+# Post-optimization accuracy validation — end-to-end (ONNX/ORT; DO NOT RUN here)
+# These build real ONNX models and run onnxruntime CPU; deferred to the central
+# memory-managed test pass per the memory-safe protocol.
+# ============================================================
+def _make_divergent_conv_model(path: str, hw: int = 8):
+    """Same I/O as _make_fp32_conv_model but with weights * -1 and a bias shift,
+    so running it on the same inputs yields very different outputs (a stand-in
+    for a 'wrecked' optimization). Reuses the square-input fixed-I/O shape so the
+    validator can feed both models identical tensors."""
+    import onnx
+    from onnx import helper, TensorProto, numpy_helper
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 3, hw, hw])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4, hw, hw])
+    # Strong negative weights -> outputs anti-correlated with the original.
+    W = numpy_helper.from_array((np.ones((4, 3, 3, 3)) * -5.0).astype(np.float32), "W")
+    B = numpy_helper.from_array((np.ones(4) * 7.0).astype(np.float32), "B")
+    conv = helper.make_node("Conv", ["X", "W", "B"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    relu = helper.make_node("Relu", ["c"], ["Y"])
+    g = helper.make_graph([conv, relu], "divergent_conv", [X], [Y], [W, B])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+    m.ir_version = 8
+    onnx.save(m, path)
+    return path
+
+
+class TestValidateOptimizationE2E:
+    """DO NOT RUN in the memory-safe pass — uses onnxruntime. The agreement math
+    these assert against is already covered by TestAgreementMetricsPureLogic."""
+
+    def test_identical_model_high_agreement(self, tmp_dir, import_cv2):
+        from core.quantizer import validate_optimization
+        _make_square_image_dir(tmp_dir, n=4)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "val_src.onnx"))
+        # An exact copy is a no-op "optimization" -> agreement ~1.0, not degraded.
+        import shutil as _sh
+        dst = os.path.join(tmp_dir, "val_copy.onnx")
+        _sh.copy2(src, dst)
+        result = validate_optimization(src, dst, sample_dir=tmp_dir, max_images=4)
+        assert result["validated"] is True
+        assert result["n_images"] == 4
+        assert result["agreement"] >= 0.99
+        assert result["degraded"] is False
+        # Original path is preserved for fallback.
+        assert result["original_path"] == src
+
+    def test_wrecked_model_flagged_degraded(self, tmp_dir, import_cv2):
+        from core.quantizer import validate_optimization
+        _make_square_image_dir(tmp_dir, n=4)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "val_src2.onnx"))
+        wrecked = _make_divergent_conv_model(os.path.join(tmp_dir, "val_wrecked.onnx"))
+        result = validate_optimization(src, wrecked, sample_dir=tmp_dir,
+                                       max_images=4, threshold=0.9)
+        assert result["validated"] is True
+        assert result["degraded"] is True
+        assert result["agreement"] < 0.9
+
+    def test_no_sample_images_fails_closed(self, tmp_dir, import_cv2):
+        from core.quantizer import validate_optimization
+        # Empty dir (no images) -> validated False, never a false "good".
+        empty = os.path.join(tmp_dir, "empty")
+        os.makedirs(empty, exist_ok=True)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "val_src3.onnx"))
+        result = validate_optimization(src, src, sample_dir=empty)
+        assert result["validated"] is False
+        assert result["n_images"] == 0
+
+    def test_result_keys_contract(self, tmp_dir, import_cv2):
+        from core.quantizer import validate_optimization
+        _make_square_image_dir(tmp_dir, n=2)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "val_src4.onnx"))
+        result = validate_optimization(src, src, sample_dir=tmp_dir, max_images=2)
+        for key in ("validated", "agreement", "threshold", "degraded",
+                    "n_images", "max_abs_diff", "top1_agreement", "original_path"):
+            assert key in result
+
+
+class TestPipelineValidationE2E:
+    """DO NOT RUN — pipeline + onnxruntime validation wiring."""
+
+    def test_validate_off_by_default(self, linear_model, tmp_dir):
+        # Default behaviour unchanged: no validation key unless requested.
+        pipe = OptimizationPipeline(registry)
+        pipe.add_step("weight_pruning", sparsity_ratio=0.1)
+        out = os.path.join(tmp_dir, "pipe_noval.onnx")
+        result = pipe.run(linear_model, out)
+        assert "validation" not in result
+
+    def test_validate_runs_when_requested(self, tmp_dir, import_cv2):
+        _make_square_image_dir(tmp_dir, n=3)
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "pipe_val_src.onnx"))
+        pipe = OptimizationPipeline(registry)
+        pipe.add_step("dead_node_eliminator")  # near-lossless -> high agreement
+        out = os.path.join(tmp_dir, "pipe_val_out.onnx")
+        result = pipe.run(src, out, validate=True, sample_dir=tmp_dir,
+                          validate_max_images=3)
+        assert "validation" in result
+        assert result["validation"]["validated"] is True
+        assert result["validation"]["degraded"] is False
+
+    def test_validate_without_sample_dir_skips(self, tmp_dir, import_cv2):
+        src = _make_fp32_conv_model(os.path.join(tmp_dir, "pipe_val_src2.onnx"))
+        pipe = OptimizationPipeline(registry)
+        pipe.add_step("dead_node_eliminator")
+        out = os.path.join(tmp_dir, "pipe_val_out2.onnx")
+        # validate=True but no sample_dir -> the pipeline skips (no validation key).
+        result = pipe.run(src, out, validate=True, sample_dir="")
+        assert "validation" not in result

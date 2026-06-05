@@ -27,6 +27,23 @@ from server.utils import imread, glob_images, encode_jpeg, generate_palette, dra
 router = APIRouter()
 
 
+def _glob_images_canonical(img_dir: str, recursive: bool = False) -> list[str]:
+    """Enumerate images using the canonical extension set (path_safety._IMAGE_EXTS),
+    which includes .webp/.tif/.tiff — the shared utils.glob_images only covers
+    4 extensions and silently drops those (DATA splitter P0). Matches both case
+    variants so .JPG / .PNG are not lost on case-sensitive filesystems."""
+    files: list[str] = []
+    for ext in _IMAGE_EXTS:
+        for pat in (ext, ext.upper()):
+            files.extend(glob_module.glob(os.path.join(img_dir, "*" + pat)))
+            if recursive:
+                files.extend(glob_module.glob(os.path.join(img_dir, "**", "*" + pat), recursive=True))
+    # Dedup (case-insensitive filesystems can match both case patterns) and sort.
+    files = list(dict.fromkeys(files))
+    files.sort()
+    return files
+
+
 def _find_image_for_stem(input_dir: str, stem: str) -> Optional[str]:
     """Locate the image matching a label stem, probing the full image-extension
     set (DATA-06 — the old 4-ext probe silently skipped .webp/.tif)."""
@@ -93,9 +110,10 @@ async def data_explorer(req: dict):
     except UnsafePathError as e:
         return {"error": e.code}
     limit = min(int(req.get("limit", 5000)), 50000)
-    if explorer_state["running"]:
+    # Atomic check-and-set: two near-simultaneous POSTs must not both launch a
+    # scan thread that interleaves writes to explorer_state["data"].
+    if not explorer_state.try_start(progress=0, total=0, msg="Scanning...", data=None):
         return {"error": "Already loading"}
-    explorer_state.update(running=True, progress=0, total=0, msg="Scanning...", data=None)
 
     def _run():
         try:
@@ -263,6 +281,8 @@ class SplitterRequest(BaseModel):
     val: float = 0.2
     test: float = 0.1
     strategy: str = "random"  # random | stratified
+    seed: Optional[int] = None  # reproducible splits (None = nondeterministic)
+    overwrite: bool = False  # clear stale split dirs so re-runs stay disjoint
 
 
 @router.post("/api/data/splitter")
@@ -273,14 +293,16 @@ async def data_splitter(req: SplitterRequest):
         output_dir = safe_path(req.output_dir, must_be_dir=False)
     except UnsafePathError as e:
         return {"error": e.code}
-    if splitter_state["running"]:
+    if not splitter_state.try_start(msg="Splitting...", progress=0, total=0, results={}):
         return {"error": "Already running"}
-    splitter_state.update(running=True, msg="Splitting...", progress=0, total=0, results={})
 
     def _run():
         try:
-            import random, shutil
-            imgs = glob_images(img_dir)
+            import shutil
+            # Local seeded RNG keeps splits reproducible without touching the
+            # global random module other workers may share (splitter P1).
+            rng = random.Random(req.seed)
+            imgs = _glob_images_canonical(img_dir)
             if not imgs:
                 splitter_state.update(running=False, msg="No images found")
                 return
@@ -321,7 +343,7 @@ async def data_splitter(req: SplitterRequest):
                 # Splits that should receive coverage (ratio > 0), ordered for tie-breaking.
                 active = [s for s in ("train", "val", "test") if ratios[s] > 0]
                 for group_imgs in class_groups.values():
-                    random.shuffle(group_imgs)
+                    rng.shuffle(group_imgs)
                     gn = len(group_imgs)
                     frac_train += gn * norm["train"]
                     frac_val += gn * norm["val"]
@@ -352,17 +374,33 @@ async def data_splitter(req: SplitterRequest):
                     frac_val -= len(g_val)
             else:
                 # Random split
-                random.shuffle(imgs)
+                rng.shuffle(imgs)
                 n_train = round(n * norm["train"])
                 n_val = round(n * norm["val"])
                 # Clamp to avoid exceeding total.
                 n_val = min(n_val, n - n_train)
                 splits = {"train": imgs[:n_train], "val": imgs[n_train:n_train + n_val], "test": imgs[n_train + n_val:]}
 
+            # Stale-output guard: copying by basename into a pre-populated split
+            # dir leaves prior-run files behind, so an image that moved train->val
+            # on this run would exist in BOTH splits — breaking the disjointness a
+            # splitter must guarantee. Refuse unless overwrite clears the targets.
+            split_dirs = {s: os.path.join(output_dir, s) for s in ("train", "val", "test")}
+            existing = [s for s, d in split_dirs.items()
+                        if os.path.isdir(d) and any(os.scandir(d))]
+            if existing and not req.overwrite:
+                splitter_state.update(running=False, msg="Error: OUTPUT_NOT_EMPTY")
+                splitter_state["results"] = {"error": "OUTPUT_NOT_EMPTY", "existing_splits": existing}
+                return
+            if existing and req.overwrite:
+                for s in existing:
+                    shutil.rmtree(split_dirs[s], ignore_errors=True)
+
             # Copy files with progress
             total_files = sum(len(v) for v in splits.values())
             splitter_state["total"] = total_files
             done = 0
+            missing_labels = 0  # image with no matching .txt (only meaningful when label_dir set)
             for split_name, split_files in splits.items():
                 if not split_files:
                     continue
@@ -379,12 +417,18 @@ async def data_splitter(req: SplitterRequest):
                     txt = os.path.join(label_dir, stem + ".txt") if label_dir else ""
                     if txt and os.path.isfile(txt):
                         shutil.copy2(txt, lbl_out)
+                    elif label_dir:
+                        missing_labels += 1
                     done += 1
                     splitter_state["progress"] = done
-            splitter_state["results"] = {
+            results = {
                 **{k: len(v) for k, v in splits.items()},
                 "ratios": {k: round(v, 4) for k, v in norm.items()},  # echo normalized ratios (DATA-10)
+                "seed": req.seed,
             }
+            if label_dir:
+                results["missing_labels"] = missing_labels
+            splitter_state["results"] = results
             splitter_state.update(running=False, msg="Complete")
         except Exception as e:
             splitter_state.update(running=False, msg=f"Error: {e}")
@@ -411,9 +455,8 @@ async def data_converter(req: ConverterRequest):
         output_dir = safe_path(req.output_dir, must_be_dir=False)
     except UnsafePathError as e:
         return {"error": e.code}
-    if converter_state["running"]:
+    if not converter_state.try_start(progress=0, total=0, msg="Converting...", results={}):
         return {"error": "Already running"}
-    converter_state.update(running=True, progress=0, total=0, msg="Converting...", results={})
 
     def _run():
         try:
@@ -511,14 +554,34 @@ async def data_converter(req: ConverterRequest):
                     nw = bw / w
                     nh = bh / h
                     per_image.setdefault(iid, []).append(f"{ann['category_id']} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
+                skipped_unsafe = 0  # records whose file_name escaped output_dir (DATA converter P0)
+                written_images = 0
+                written_labels = 0
                 for iid, lines in per_image.items():
                     img_info = img_map.get(iid, {})
-                    stem = os.path.splitext(img_info.get("file_name", str(iid)))[0]
-                    with open(os.path.join(output_dir, stem + ".txt"), "w") as f:
+                    raw_name = img_info.get("file_name", str(iid))
+                    # file_name is untrusted COCO content — a value like '../../foo'
+                    # or an absolute path would otherwise write outside output_dir.
+                    # Reduce to basename, then re-validate the final path stays under
+                    # output_dir via safe_path's roots= boundary check.
+                    stem = os.path.splitext(os.path.basename(raw_name))[0]
+                    if not stem:
+                        skipped_unsafe += 1
+                        continue
+                    try:
+                        out_path = safe_path(os.path.join(output_dir, stem + ".txt"),
+                                             must_be_dir=False, roots=[output_dir])
+                    except UnsafePathError:
+                        skipped_unsafe += 1
+                        continue
+                    with open(out_path, "w") as f:
                         f.write("\n".join(lines) + "\n")
-                converter_state["results"] = {"images": len(per_image),
-                                              "labels": sum(len(v) for v in per_image.values()),
-                                              "skipped_no_size": skipped_no_size}
+                    written_images += 1
+                    written_labels += len(lines)
+                converter_state["results"] = {"images": written_images,
+                                              "labels": written_labels,
+                                              "skipped_no_size": skipped_no_size,
+                                              "skipped_unsafe": skipped_unsafe}
 
             elif req.from_fmt == "YOLO" and "VOC" in req.to_fmt:
                 from xml.etree.ElementTree import Element, SubElement, tostring
@@ -608,9 +671,8 @@ async def data_remapper(req: RemapperRequest):
         output_dir = safe_path(req.output_dir, must_be_dir=False)
     except UnsafePathError as e:
         return {"error": e.code}
-    if remapper_state["running"]:
-        return {"error": "Already running"}
-    remapper_state.update(running=True, progress=0, total=0, msg="Remapping...", results={})
+    if not remapper_state.try_start(progress=0, total=0, msg="Remapping...", results={}):
+        return {"error": "BUSY"}
 
     def _run():
         try:
@@ -653,6 +715,8 @@ async def data_remapper(req: RemapperRequest):
                 reindex = {old: new for new, old in enumerate(sorted(present))}
 
             count = 0
+            written_paths: set[str] = set()  # detect basename collisions (recursive P0)
+            collisions = 0
             for idx, txt in enumerate(label_files):
                 if not remapper_state["running"]:
                     remapper_state.update(msg="Cancelled")  # DATA-11
@@ -675,10 +739,23 @@ async def data_remapper(req: RemapperRequest):
                             cid = reindex[cid]
                         lines.append(f"{cid} {' '.join(parts[1:])}")
                         count += 1
-                with open(os.path.join(output_dir, os.path.basename(txt)), "w") as f:
+                # Recursive mode: mirror the input subtree under output_dir so
+                # sub1/x.txt and sub2/x.txt don't both flatten to output_dir/x.txt
+                # and silently clobber each other (recursive P0 data loss).
+                if req.recursive:
+                    rel = os.path.relpath(txt, label_dir)
+                    out_path = os.path.join(output_dir, rel)
+                    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                else:
+                    out_path = os.path.join(output_dir, os.path.basename(txt))
+                if out_path in written_paths:
+                    collisions += 1  # two sources resolved to the same output path
+                written_paths.add(out_path)
+                with open(out_path, "w") as f:
                     f.write("\n".join(lines) + "\n" if lines else "")
                 remapper_state["progress"] = idx + 1
-            results = {"files": len(label_files), "labels": count, "bad_lines": bad_lines}
+            results = {"files": len(label_files), "labels": count, "bad_lines": bad_lines,
+                       "collisions": collisions}
             if reindex:
                 # Expose the reindex map (old->new) so the UI can show the new id space (DATA-04).
                 results["reindex_map"] = {str(k): v for k, v in reindex.items()}
@@ -711,9 +788,8 @@ async def data_merger(req: MergerRequest):
         return {"error": e.code}
     if not datasets:
         return {"error": "EMPTY"}
-    if merger_state["running"]:
+    if not merger_state.try_start(progress=0, total=0, msg="Merging...", results={}):
         return {"error": "Already running"}
-    merger_state.update(running=True, progress=0, total=0, msg="Merging...", results={})
 
     def _run():
         try:
@@ -727,8 +803,10 @@ async def data_merger(req: MergerRequest):
                 all_imgs.extend(glob_images(d, recursive=req.recursive))
             merger_state["total"] = len(all_imgs)
 
-            # Phase 1: hash every readable image (DATA-08 — BK-tree clustering
-            # replaces the old O(N²) incremental Hamming scan).
+            # Phase 1: hash every readable image (DATA-08). Clustering below uses
+            # cluster_near_duplicates, which is BK-tree-backed for large corpora
+            # (core.hashing routes find_near_duplicates through BKTree above its
+            # pair threshold) so large merges no longer hang on the O(N²) scan.
             merger_state["msg"] = "Hashing..."
             valid_imgs: list[str] = []
             hashes: list[int] = []
@@ -805,6 +883,103 @@ class SamplerRequest(BaseModel):
     include_labels: bool = True
     recursive: bool = False
 
+def _sampler_label_for(fp: str, lbl_dir: str, recursive: bool) -> Optional[str]:
+    """Resolve the YOLO label for an image. In recursive mode labels live beside
+    the image (sibling .txt), so a flat `lbl_dir/<basename>.txt` join would miss
+    nested labels and could pair an image with the WRONG class's label after a
+    basename collision (sampler recursive P0). Non-recursive keeps the flat join."""
+    if recursive:
+        sibling = os.path.splitext(fp)[0] + ".txt"
+        if os.path.isfile(sibling):
+            return sibling
+        # Fall back to the flat dir for layouts that keep labels separate.
+    txt = os.path.join(lbl_dir, os.path.splitext(os.path.basename(fp))[0] + ".txt")
+    return txt if os.path.isfile(txt) else None
+
+
+def _proportional_trim(selected, target, class_images, rng):
+    """Trim `selected` down to `target` while preserving the per-class proportions
+    Stratified/Balanced just built. A flat random.sample across all classes would
+    collapse the distribution back toward Random (sampler P1).
+
+    Strategy: give each class a quota proportional to how many of its images are
+    in the current selection, then keep only that many per class. Box-less images
+    (no class) are trimmed first since they carry no stratification signal.
+    """
+    selected_set = set(selected)
+    if len(selected_set) <= target:
+        return list(selected)
+
+    # Per-image class membership over the current selection.
+    img_classes: dict[str, set] = {fp: set() for fp in selected_set}
+    for cid, cimgs in class_images.items():
+        for fp in cimgs:
+            if fp in img_classes:
+                img_classes[fp].add(cid)
+
+    labeled = [fp for fp in selected_set if img_classes[fp]]
+    unlabeled = [fp for fp in selected_set if not img_classes[fp]]
+
+    # Current per-class counts within the labeled selection.
+    counts: dict[int, int] = {}
+    for fp in labeled:
+        for cid in img_classes[fp]:
+            counts[cid] = counts.get(cid, 0) + 1
+    total_assoc = sum(counts.values())
+
+    # Quota per class proportional to its current share, scaled to `target`.
+    # (Multi-class images count toward each of their classes, matching the
+    # before/after associations the results report uses.)
+    quota: dict[int, int] = {}
+    if total_assoc > 0:
+        for cid, c in counts.items():
+            quota[cid] = round(target * c / total_assoc)
+
+    # Keep images per class up to quota, preferring images that "fill" the
+    # scarcest still-needed class so rare classes are not starved.
+    keep: set = set()
+    kept_per_class: dict[int, int] = {cid: 0 for cid in counts}
+    # Deterministic order under the seeded rng.
+    order = list(labeled)
+    rng.shuffle(order)
+
+    def _needed(fp) -> int:
+        # How many of fp's classes still have remaining quota.
+        return sum(1 for cid in img_classes[fp] if kept_per_class.get(cid, 0) < quota.get(cid, 0))
+
+    # Greedily keep images that still satisfy an unmet quota.
+    progressed = True
+    while len(keep) < target and progressed:
+        progressed = False
+        # Sort remaining by how many unmet-quota classes they cover (desc) so
+        # rare classes get filled.
+        candidates = sorted((fp for fp in order if fp not in keep),
+                            key=_needed, reverse=True)
+        for fp in candidates:
+            if len(keep) >= target:
+                break
+            if _needed(fp) <= 0:
+                continue
+            keep.add(fp)
+            for cid in img_classes[fp]:
+                kept_per_class[cid] = kept_per_class.get(cid, 0) + 1
+            progressed = True
+
+    # Top up to target if quotas under-filled (rounding), then with unlabeled.
+    if len(keep) < target:
+        for fp in order:
+            if len(keep) >= target:
+                break
+            keep.add(fp)
+    if len(keep) < target:
+        for fp in unlabeled:
+            if len(keep) >= target:
+                break
+            keep.add(fp)
+
+    return [fp for fp in selected if fp in keep]
+
+
 def _farthest_point_sample(candidates, features, n):
     """Select n items from candidates maximizing diversity via farthest-point sampling."""
     import numpy as np, random as _rnd
@@ -849,11 +1024,10 @@ async def data_sampler(req: SamplerRequest):
             class_images = {}  # {cid: set of img paths}
             img_features = {}  # {img_path: mean bbox center [cx, cy]}
             for fp in imgs:
-                stem = os.path.splitext(os.path.basename(fp))[0]
-                txt = os.path.join(lbl_dir, stem + ".txt")
+                txt = _sampler_label_for(fp, lbl_dir, req.recursive)
                 centers = []
                 classes = set()
-                if os.path.isfile(txt):
+                if txt:
                     with open(txt) as f:
                         for line in f:
                             p = line.strip().split()
@@ -897,8 +1071,14 @@ async def data_sampler(req: SamplerRequest):
             # DATA-09: trim/top-up to EXACTLY target (when target <= pool). Per-class
             # rounding routinely over- or under-shoots; correct it deterministically.
             selected = list(selected)
+            trim_rng = random.Random(req.seed)  # deterministic, independent of global state
             if len(selected) > target:
-                selected = random.sample(selected, target)
+                if strategy in ("stratified", "balanced") and class_images:
+                    # Strategy-aware trim: a flat random.sample would collapse the
+                    # per-class distribution we just built back toward Random (P1).
+                    selected = _proportional_trim(selected, target, class_images, trim_rng)
+                else:
+                    selected = random.sample(selected, target)
             elif len(selected) < target:
                 remaining = [f for f in imgs if f not in set(selected)]
                 if remaining:
@@ -911,22 +1091,36 @@ async def data_sampler(req: SamplerRequest):
                 os.makedirs(os.path.join(output_dir, "labels"), exist_ok=True)
             before_classes = {c: len(v) for c, v in class_images.items()}
             after_classes = {}
+            img_out_dir = os.path.join(output_dir, "images")
+            lbl_out_dir = os.path.join(output_dir, "labels")
+            used_names: set[str] = set()  # disambiguate basename collisions (recursive P0)
+            collisions = 0
             for i, fp in enumerate(selected):
                 if not sampler_state["running"]:
                     sampler_state.update(msg="Cancelled")  # DATA-11
                     return
-                shutil.copy2(fp, os.path.join(output_dir, "images"))
+                # Preserve uniqueness: a/1.jpg and b/1.jpg must not both land on
+                # images/1.jpg (the second would clobber the first). Suffix the
+                # stem on collision and keep the paired label filename in lock-step.
+                name, ext = os.path.splitext(os.path.basename(fp))
+                out_name = name + ext
+                if out_name in used_names:
+                    collisions += 1
+                    out_name = f"{name}_{i}{ext}"
+                used_names.add(out_name)
+                shutil.copy2(fp, os.path.join(img_out_dir, out_name))
                 if req.include_labels:
-                    stem = os.path.splitext(os.path.basename(fp))[0]
-                    txt = os.path.join(lbl_dir, stem + ".txt")
-                    if os.path.isfile(txt):
-                        shutil.copy2(txt, os.path.join(output_dir, "labels"))
+                    txt = _sampler_label_for(fp, lbl_dir, req.recursive)
+                    if txt:
+                        # Label basename must match the (possibly disambiguated) image.
+                        out_stem = os.path.splitext(out_name)[0]
+                        shutil.copy2(txt, os.path.join(lbl_out_dir, out_stem + ".txt"))
                 for c, cimgs in class_images.items():
                     if fp in cimgs:
                         after_classes[c] = after_classes.get(c, 0) + 1
                 sampler_state["progress"] = i + 1
             sampler_state["results"] = {"total": len(imgs), "sampled": len(selected),
-                                         "target": target,
+                                         "target": target, "collisions": collisions,
                                          "before": before_classes, "after": after_classes}
             sampler_state.update(running=False, msg="Complete")
         except Exception as e:

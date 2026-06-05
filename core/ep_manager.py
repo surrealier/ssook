@@ -152,3 +152,59 @@ def launch_worker(task: dict) -> subprocess.Popen:
     proc.stdin.write(json.dumps(task, ensure_ascii=False))
     proc.stdin.close()
     return proc
+
+
+def run_export_in_venv(
+    ep_key: str,
+    config: dict,
+    on_progress=None,
+) -> dict:
+    """Run a deployment export inside the ``ep_key`` venv and return its result.
+
+    Drives the ep_worker "export" task to completion: streams ``progress``
+    events to ``on_progress`` (done, total, msg) and returns the single
+    ``result`` payload (the dict from ``core.deployment.runner.run_export``).
+
+    This is a blocking, single-shot helper — exports are not cancellable, so we
+    simply read until the worker emits ``finished``. Raises RuntimeError if the
+    worker dies without ever producing a result, so the caller can fall back to
+    an in-process attempt rather than silently reporting success.
+    """
+    task = {"task": "export", "ep_key": ep_key, "config": config}
+    proc = launch_worker(task)
+
+    result: "dict | None" = None
+    error_msg: "str | None" = None
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            # Worker prints only JSON event lines; ignore stray output.
+            continue
+        kind = event.get("type")
+        if kind == "progress":
+            if on_progress:
+                on_progress(event.get("done", 0), event.get("total", 1), event.get("msg", ""))
+        elif kind == "result":
+            result = event.get("data")
+        elif kind == "error":
+            error_msg = event.get("msg")
+        elif kind == "finished":
+            break
+
+    proc.wait()
+
+    if result is not None:
+        return result
+    if error_msg is not None:
+        # Surface as a result-shaped dict so callers treat it like any export error.
+        return {"error": error_msg}
+    raise RuntimeError(
+        f"export worker for ep '{ep_key}' exited without a result "
+        f"(rc={proc.returncode})"
+    )

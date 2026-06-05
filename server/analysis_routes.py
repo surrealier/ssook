@@ -1,4 +1,5 @@
 """/api/analysis/* 라우터."""
+import asyncio
 import base64
 import os
 import tempfile
@@ -20,7 +21,14 @@ from server.path_safety import (
     safe_model_file,
     safe_image_file,
 )
-from server.state import compare_state, error_analysis_state, conf_opt_state, embedding_state, executor
+from server.state import (
+    compare_state,
+    error_analysis_state,
+    conf_opt_state,
+    embedding_state,
+    executor,
+    task_locks,
+)
 from server.utils import imread, encode_jpeg, draw_detections, glob_images
 
 router = APIRouter()
@@ -42,9 +50,10 @@ async def run_model_compare(req: ModelCompareRequest):
     model_b = safe_model_file(req.model_b)
     img_dir = safe_image_dir(req.img_dir)
 
-    if compare_state["running"]:
+    # Atomic check-and-set — two concurrent POSTs must not both pass the guard
+    # and clobber each other's shared _tmp_dir (ssook_compare rmtree below).
+    if not compare_state.try_start(progress=0, total=0, msg="Starting...", results=[], images=[]):
         return {"error": "Already running"}
-    compare_state.update(running=True, progress=0, total=0, msg="Starting...", results=[], images=[])
 
     # 이전 비교 임시 파일 정리
     _cmp_dir = os.path.join(tempfile.gettempdir(), "ssook_compare")
@@ -156,9 +165,8 @@ async def run_error_analysis(req: ErrorAnalysisRequest):
     img_dir = safe_image_dir(req.img_dir)
     label_dir = safe_label_dir(req.label_dir)
 
-    if error_analysis_state["running"]:
+    if not error_analysis_state.try_start(progress=0, total=0, msg="Starting...", results={}):
         return {"error": "Already running"}
-    error_analysis_state.update(running=True, progress=0, total=0, msg="Starting...", results={})
 
     def _run():
         from core.model_loader import load_model as _load
@@ -214,7 +222,16 @@ async def run_error_analysis(req: ErrorAnalysisRequest):
                                 x2 = (cx + bw/2) * w; y2 = (cy + bh/2) * h
                                 gt_boxes.append([x1, y1, x2, y2, cy, cls])
 
-                pred_boxes = list(zip(res.boxes, res.scores, res.class_ids))
+                # Sort predictions by score descending so the highest-scoring
+                # prediction claims a GT first — matches the canonical greedy
+                # matcher (core.evaluation._match_greedy) used by the Evaluation
+                # tab. Raw NMS order would let a low-conf pred book a GT that a
+                # higher-conf pred should own, diverging FP/FN from Evaluation.
+                pred_boxes = sorted(
+                    zip(res.boxes, res.scores, res.class_ids),
+                    key=lambda p: float(p[1]),
+                    reverse=True,
+                )
                 gt_matched = [False] * len(gt_boxes)
                 pred_matched = [False] * len(pred_boxes)
 
@@ -284,9 +301,8 @@ async def run_conf_optimizer(req: ConfOptimizerRequest):
     img_dir = safe_image_dir(req.img_dir)
     label_dir = safe_label_dir(req.label_dir)
 
-    if conf_opt_state["running"]:
+    if not conf_opt_state.try_start(progress=0, total=0, msg="Starting...", results=[]):
         return {"error": "Already running"}
-    conf_opt_state.update(running=True, progress=0, total=0, msg="Starting...", results=[])
 
     def _run():
         from core.model_loader import load_model as _load
@@ -309,33 +325,38 @@ async def run_conf_optimizer(req: ConfOptimizerRequest):
             conf_opt_state["total"] = len(imgs)
             conf_opt_state["msg"] = "Running inference..."
 
-            for idx, fp in enumerate(imgs):
-                # force-stop 협조: 루프 본문 상단에서 running 재검사.
-                if not conf_opt_state["running"]:
-                    conf_opt_state["msg"] = "Stopped"
-                    return
-                frame = imread(fp)
-                if frame is None:
+            # Serialize the phase-1 GPU inference under the shared gpu_infer lock
+            # so it does not interleave on the same ORT session with sibling
+            # routes (model-compare/error-analysis/eval). The running re-check
+            # stays inside the lock so force-stop still cooperates per-image.
+            with task_locks["gpu_infer"]:
+                for idx, fp in enumerate(imgs):
+                    # force-stop 협조: 루프 본문 상단에서 running 재검사.
+                    if not conf_opt_state["running"]:
+                        conf_opt_state["msg"] = "Stopped"
+                        return
+                    frame = imread(fp)
+                    if frame is None:
+                        conf_opt_state["progress"] = idx + 1
+                        continue
+                    h, w = frame.shape[:2]
+                    res = run_inference(mi, frame, 0.01)
+                    for box, score, cid in zip(res.boxes, res.scores, res.class_ids):
+                        all_preds.append((int(cid), float(score), *box, idx))
+                    # Load GT
+                    stem = os.path.splitext(os.path.basename(fp))[0]
+                    txt = os.path.join(label_dir, stem + ".txt")
+                    if os.path.isfile(txt):
+                        with open(txt) as f:
+                            for line in f:
+                                parts = line.strip().split()
+                                if len(parts) >= 5:
+                                    cid = int(float(parts[0]))
+                                    cx, cy, bw, bh = map(float, parts[1:5])
+                                    x1 = (cx - bw/2) * w; y1 = (cy - bh/2) * h
+                                    x2 = (cx + bw/2) * w; y2 = (cy + bh/2) * h
+                                    all_gt.append((cid, x1, y1, x2, y2, idx))
                     conf_opt_state["progress"] = idx + 1
-                    continue
-                h, w = frame.shape[:2]
-                res = run_inference(mi, frame, 0.01)
-                for box, score, cid in zip(res.boxes, res.scores, res.class_ids):
-                    all_preds.append((int(cid), float(score), *box, idx))
-                # Load GT
-                stem = os.path.splitext(os.path.basename(fp))[0]
-                txt = os.path.join(label_dir, stem + ".txt")
-                if os.path.isfile(txt):
-                    with open(txt) as f:
-                        for line in f:
-                            parts = line.strip().split()
-                            if len(parts) >= 5:
-                                cid = int(float(parts[0]))
-                                cx, cy, bw, bh = map(float, parts[1:5])
-                                x1 = (cx - bw/2) * w; y1 = (cy - bh/2) * h
-                                x2 = (cx + bw/2) * w; y2 = (cy + bh/2) * h
-                                all_gt.append((cid, x1, y1, x2, y2, idx))
-                conf_opt_state["progress"] = idx + 1
 
             # Group by class — GT 또는 예측 어느 쪽에 나타난 클래스 모두 sweep.
             # (모델이 예측하나 GT에 없는 클래스도 행을 받게; F1 수식이 gt_cls=[] 처리.)
@@ -402,6 +423,57 @@ async def conf_optimizer_status():
 
 
 # ── 4. Embedding Viewer API ────────────────────────────
+
+# t-SNE is O(N^2); above this many points the projection dominates wall time and
+# memory. We deterministically subsample down to this cap before reduction so the
+# viewer stays responsive on large datasets. UMAP/PCA scale better but we apply
+# the same cap uniformly so the "plotted vs total" reporting is consistent.
+_EMBEDDING_PLOT_CAP = 5000
+
+
+def _subsample_indices(n: int, cap: int, *, seed: int = 0) -> list[int]:
+    """Pick at most `cap` row indices out of `n`, deterministically.
+
+    Returns sorted indices so the original label ordering is preserved in the
+    plot legend. Seeded RNG makes the same dataset always yield the same subset
+    (reproducible visualizations across runs). When n <= cap, returns all rows.
+    """
+    if n <= cap:
+        return list(range(n))
+    rng = np.random.default_rng(seed)
+    chosen = rng.choice(n, size=cap, replace=False)
+    return sorted(int(i) for i in chosen)
+
+
+def _qualitative_colors(n: int) -> list[tuple[float, float, float, float]]:
+    """Return `n` visually distinct RGBA colors.
+
+    matplotlib's tab10/tab20 only carry 10/20 fixed colors, so datasets with many
+    classes wrap and become indistinguishable. We use tab20 directly for <=20
+    classes (well-tuned, high-contrast) and otherwise walk an HSV ring with evenly
+    spaced hues so any class count stays separable.
+    """
+    import colorsys
+
+    if n <= 0:
+        return []
+    if n <= 20:
+        import matplotlib.pyplot as plt
+
+        cmap = plt.cm.get_cmap("tab20", n)
+        return [tuple(cmap(i)) for i in range(n)]
+    # Many classes: evenly spaced hues. Vary saturation/value slightly per index
+    # so adjacent hues that read similarly still differ in tone.
+    colors: list[tuple[float, float, float, float]] = []
+    for i in range(n):
+        hue = (i / n) % 1.0
+        sat = 0.65 if i % 2 == 0 else 0.9
+        val = 0.95 if i % 3 else 0.7
+        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+        colors.append((r, g, b, 1.0))
+    return colors
+
+
 class EmbeddingViewerRequest(BaseModel):
     model_path: str
     img_dir: str
@@ -413,20 +485,21 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
     model_path = safe_model_file(req.model_path)
     img_dir_safe = safe_image_dir(req.img_dir)
 
-    if embedding_state["running"]:
+    if not embedding_state.try_start(progress=0, total=0, msg="Starting...", image=None):
         return {"error": "Already running"}
-    embedding_state.update(running=True, progress=0, total=0, msg="Starting...", image=None)
 
     def _run():
-        import onnxruntime as ort
+        from core.model_loader import load_model as _load
+        from core.inference import run_embedding
+        # Reuse the canonical load_model + run_embedding path so the model's
+        # real input_size is honored (no 224 fallback) and the output vector is
+        # L2-normalized — otherwise dynamic-axis models silently ran at 224x224
+        # and unnormalized vectors made distances magnitude-dominated.
         try:
-            session = ort.InferenceSession(model_path)
+            mi = _load(model_path)
         except Exception as e:
             embedding_state.update(running=False, msg=f"Load error: {e}")
             return
-        inp = session.get_inputs()[0]
-        h = int(inp.shape[2]) if isinstance(inp.shape[2], int) else 224
-        w = int(inp.shape[3]) if isinstance(inp.shape[3], int) else 224
 
         embeddings, labels = [], []
         img_dir = Path(img_dir_safe)
@@ -456,12 +529,8 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
             if img is None:
                 embedding_state["progress"] = i + 1
                 continue
-            img = cv2.resize(img, (w, h))
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            tensor = np.ascontiguousarray(rgb.transpose(2, 0, 1)[np.newaxis], dtype=np.float32) / 255.0
-            out = session.run(None, {inp.name: tensor})
-            vec = out[0].flatten()
-            embeddings.append(vec)
+            emb = run_embedding(mi, img).embedding  # correct input_size + L2-normalized
+            embeddings.append(emb)
             labels.append(label)
             embedding_state["progress"] = i + 1
             embedding_state["msg"] = f"Extracting embeddings: {i+1}/{len(files)}"
@@ -471,6 +540,18 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
             return
 
         X = np.array(embeddings)
+        total = len(X)
+
+        # Bound the O(N^2) t-SNE (and keep UMAP/PCA snappy) by deterministically
+        # subsampling large datasets before the projection. Seeded -> same subset
+        # every run for the same dataset.
+        keep = _subsample_indices(total, _EMBEDDING_PLOT_CAP, seed=0)
+        subsampled = len(keep) < total
+        if subsampled:
+            X = X[keep]
+            labels = [labels[i] for i in keep]
+        plotted = len(X)
+
         embedding_state["msg"] = f"Running {req.method.upper()}..."
 
         try:
@@ -479,11 +560,13 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
                 coords = PCA(n_components=2).fit_transform(X)
             elif req.method == "umap":
                 import umap
-                n = min(15, len(X) - 1)
+                # n_neighbors must stay < n_samples; clamp to >=1 for tiny N.
+                n = max(1, min(15, plotted - 1))
                 coords = umap.UMAP(n_components=2, n_neighbors=n).fit_transform(X)
             else:
                 from sklearn.manifold import TSNE
-                perp = min(30, len(X) - 1)
+                # perplexity must stay < n_samples; clamp to >=1 for tiny N.
+                perp = max(1, min(30, plotted - 1))
                 coords = TSNE(n_components=2, perplexity=perp).fit_transform(X)
         except Exception as e:
             embedding_state.update(running=False, msg=f"Reduction error: {e}")
@@ -495,13 +578,17 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(figsize=(10, 8))
         unique_labels = sorted(set(labels))
-        cmap = plt.cm.get_cmap('tab10', max(len(unique_labels), 1))
+        colors = _qualitative_colors(len(unique_labels))
         for idx, lbl in enumerate(unique_labels):
             mask = [l == lbl for l in labels]
             pts = coords[mask]
-            ax.scatter(pts[:, 0], pts[:, 1], c=[cmap(idx)], label=lbl, s=20, alpha=0.7)
-        ax.legend(fontsize=8, markerscale=2)
-        ax.set_title(f"Embedding Visualization ({req.method.upper()})")
+            ax.scatter(pts[:, 0], pts[:, 1], c=[colors[idx]], label=lbl, s=20, alpha=0.7)
+        # Many classes overflow a single legend column; cap columns to stay readable.
+        ax.legend(fontsize=8, markerscale=2, ncol=max(1, len(unique_labels) // 25 + 1))
+        title = f"Embedding Visualization ({req.method.upper()})"
+        if subsampled:
+            title += f" — {plotted}/{total} sampled"
+        ax.set_title(title)
         fig.tight_layout()
 
         import io
@@ -511,7 +598,20 @@ async def run_embedding_viewer(req: EmbeddingViewerRequest):
         buf.seek(0)
         # base64를 state에 직접 보관 — 고정 전역 temp 경로가 동시 run 간 충돌하던 것을 제거.
         embedding_state["image"] = base64.b64encode(buf.read()).decode()
-        embedding_state.update(running=False, msg="Complete")
+        # plotted/total/subsampled let the UI surface "showing N of M (sampled)".
+        note = (
+            f"Plotted {plotted} of {total} points (subsampled to cap {_EMBEDDING_PLOT_CAP})"
+            if subsampled
+            else f"Plotted all {plotted} points"
+        )
+        embedding_state.update(
+            running=False,
+            msg="Complete",
+            plotted=plotted,
+            total=total,
+            subsampled=subsampled,
+            note=note,
+        )
 
     executor.submit(_run)
     return {"ok": True}
@@ -532,90 +632,102 @@ class InferenceAnalysisRequest(BaseModel):
 
 @router.post("/api/analysis/inference-analysis")
 async def run_inference_analysis(req: InferenceAnalysisRequest):
+    # Path validation stays on the event loop so UnsafePathError surfaces via
+    # the global handler envelope (not swallowed by the worker's try/except).
     model_path = safe_model_file(req.model_path)
     image_path = safe_image_file(req.image_path)
-    try:
-        from core.model_loader import load_model as _load
-        from core.inference import run_inference, letterbox, _padded_to_tensor
-        import time as _time
 
-        mi = _load(model_path, model_type=req.model_type)
-        frame = imread(image_path)
-        if frame is None:
-            return {"error": "Cannot read image"}
-        names = mi.names or {}
+    def _do_analysis() -> dict:
+        # Synchronous body — model load, ORT inference, JPEG encodes. Runs in
+        # the shared executor (offloaded below) so it never blocks the FastAPI
+        # event loop / status pollers for the full load+inference duration.
+        try:
+            from core.model_loader import load_model as _load
+            from core.inference import run_inference, letterbox, _padded_to_tensor
+            import time as _time
 
-        # Pre-process — letterbox 한 번만 계산 후 그 결과로 텐서 구성(중복 forward pass 제거).
-        t0 = _time.perf_counter()
-        padded, ratio, pad = letterbox(frame, mi.input_size)
-        # _padded_to_tensor는 스레드별 재사용 버퍼를 반환 — 이후 run_inference가 덮어쓰므로
-        # tensor stats용으로 복사본을 떠둔다.
-        tensor = _padded_to_tensor(padded, mi.input_size).copy()
-        pre_ms = (_time.perf_counter() - t0) * 1000
+            mi = _load(model_path, model_type=req.model_type)
+            frame = imread(image_path)
+            if frame is None:
+                return {"error": "Cannot read image"}
+            names = mi.names or {}
 
-        # Inference
-        t1 = _time.perf_counter()
-        result = run_inference(mi, frame, req.conf)
-        infer_ms = result.infer_ms
-        post_ms = (_time.perf_counter() - t1) * 1000 - infer_ms
+            # Pre-process — letterbox 한 번만 계산 후 그 결과로 텐서 구성(중복 forward pass 제거).
+            t0 = _time.perf_counter()
+            padded, ratio, pad = letterbox(frame, mi.input_size)
+            # _padded_to_tensor는 스레드별 재사용 버퍼를 반환 — 이후 run_inference가 덮어쓰므로
+            # tensor stats용으로 복사본을 떠둔다.
+            tensor = _padded_to_tensor(padded, mi.input_size).copy()
+            pre_ms = (_time.perf_counter() - t0) * 1000
 
-        total_ms = pre_ms + infer_ms + post_ms
+            # Inference — serialize the ORT call under gpu_infer so it does not
+            # race the background jobs (model-compare etc.) on the GPU session.
+            t1 = _time.perf_counter()
+            with task_locks["gpu_infer"]:
+                result = run_inference(mi, frame, req.conf)
+            infer_ms = result.infer_ms
+            post_ms = (_time.perf_counter() - t1) * 1000 - infer_ms
 
-        # Letterbox visualization: highlight padding in red overlay
-        lb_vis = padded.copy()
-        h, w = padded.shape[:2]
-        pw, ph = int(pad[0]), int(pad[1])
-        overlay = lb_vis.copy()
-        if ph > 0:
-            cv2.rectangle(overlay, (0, 0), (w, ph), (0, 0, 200), -1)
-            cv2.rectangle(overlay, (0, h - ph), (w, h), (0, 0, 200), -1)
-        if pw > 0:
-            cv2.rectangle(overlay, (0, 0), (pw, h), (0, 0, 200), -1)
-            cv2.rectangle(overlay, (w - pw, 0), (w, h), (0, 0, 200), -1)
-        cv2.addWeighted(overlay, 0.4, lb_vis, 0.6, 0, lb_vis)
+            total_ms = pre_ms + infer_ms + post_ms
 
-        # Detection visualization
-        det_vis = draw_detections(frame, result, names)
+            # Letterbox visualization: highlight padding in red overlay
+            lb_vis = padded.copy()
+            h, w = padded.shape[:2]
+            pw, ph = int(pad[0]), int(pad[1])
+            overlay = lb_vis.copy()
+            if ph > 0:
+                cv2.rectangle(overlay, (0, 0), (w, ph), (0, 0, 200), -1)
+                cv2.rectangle(overlay, (0, h - ph), (w, h), (0, 0, 200), -1)
+            if pw > 0:
+                cv2.rectangle(overlay, (0, 0), (pw, h), (0, 0, 200), -1)
+                cv2.rectangle(overlay, (w - pw, 0), (w, h), (0, 0, 200), -1)
+            cv2.addWeighted(overlay, 0.4, lb_vis, 0.6, 0, lb_vis)
 
-        # Tensor stats
-        t_stats = {
-            "min": round(float(tensor.min()), 6),
-            "max": round(float(tensor.max()), 6),
-            "mean": round(float(tensor.mean()), 6),
-            "std": round(float(tensor.std()), 6),
-            "shape": list(tensor.shape),
-        }
+            # Detection visualization
+            det_vis = draw_detections(frame, result, names)
 
-        detections = []
-        for box, score, cid in zip(result.boxes, result.scores, result.class_ids):
-            detections.append({
-                "class_id": int(cid),
-                "class_name": names.get(int(cid), str(int(cid))),
-                "confidence": round(float(score), 4),
-                "bbox": [round(float(x), 1) for x in box],
-            })
+            # Tensor stats
+            t_stats = {
+                "min": round(float(tensor.min()), 6),
+                "max": round(float(tensor.max()), 6),
+                "mean": round(float(tensor.mean()), 6),
+                "std": round(float(tensor.std()), 6),
+                "shape": list(tensor.shape),
+            }
 
-        inp = mi.session.get_inputs()[0]
-        out = mi.session.get_outputs()[0]
+            detections = []
+            for box, score, cid in zip(result.boxes, result.scores, result.class_ids):
+                detections.append({
+                    "class_id": int(cid),
+                    "class_name": names.get(int(cid), str(int(cid))),
+                    "confidence": round(float(score), 4),
+                    "bbox": [round(float(x), 1) for x in box],
+                })
 
-        return {
-            "original_image": encode_jpeg(frame),
-            "letterbox_image": encode_jpeg(lb_vis),
-            "detection_image": encode_jpeg(det_vis),
-            "tensor_stats": t_stats,
-            "detections": detections,
-            "timing": {
-                "pre_ms": round(pre_ms, 2),
-                "infer_ms": round(infer_ms, 2),
-                "post_ms": round(post_ms, 2),
-                "total_ms": round(total_ms, 2),
-            },
-            "model_info": {
-                "input_shape": list(inp.shape),
-                "output_shape": list(out.shape),
-                "num_classes": len(names),
-            },
-        }
-    except Exception as e:
-        return {"error": str(e)}
+            inp = mi.session.get_inputs()[0]
+            out = mi.session.get_outputs()[0]
+
+            return {
+                "original_image": encode_jpeg(frame),
+                "letterbox_image": encode_jpeg(lb_vis),
+                "detection_image": encode_jpeg(det_vis),
+                "tensor_stats": t_stats,
+                "detections": detections,
+                "timing": {
+                    "pre_ms": round(pre_ms, 2),
+                    "infer_ms": round(infer_ms, 2),
+                    "post_ms": round(post_ms, 2),
+                    "total_ms": round(total_ms, 2),
+                },
+                "model_info": {
+                    "input_shape": list(inp.shape),
+                    "output_shape": list(out.shape),
+                    "num_classes": len(names),
+                },
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, _do_analysis)
 

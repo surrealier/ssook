@@ -136,6 +136,9 @@ Tabs['model-compare'] = {
     if (!a||!b||!imgDir) { App.setStatus(t('cmp.select_both')); return; }
     document.getElementById('cmp-stop').disabled = false;
     document.getElementById('cmp-prog').style.width = '0%';
+    // Reset prior run state so incremental polling auto-shows the first new result.
+    this._results = null; this._idx = 0;
+    const sl = document.getElementById('cmp-slider'); if (sl) { sl.max = 0; sl.value = 0; sl.disabled = true; }
     try {
       const r = await API.post('/api/analysis/model-compare', {
         model_a: a, model_b: b,
@@ -155,11 +158,21 @@ Tabs['model-compare'] = {
       const _p = document.getElementById('cmp-prog'); if (_p) _p.style.width = pct+'%';
       const _pt = document.getElementById('cmp-prog-text'); if (_pt) _pt.textContent = pct+'%';
       document.getElementById('cmp-status').textContent = s.msg||'';
+      // Render whatever results are present each poll so the user can scrub completed
+      // pairs while the run continues (the backend appends per-image; images load lazily).
+      if (s.results && s.results.length) {
+        const prevLen = this._results ? this._results.length : 0;
+        this._results = s.results;
+        const sl = document.getElementById('cmp-slider');
+        if (sl) { sl.max = s.results.length - 1; sl.disabled = false; }
+        // Show the first result as soon as it lands; don't yank the slider from the
+        // position the user is inspecting once more arrive.
+        if (prevLen === 0) { this._idx = 0; this._showAt(0); }
+      }
       if (!s.running) {
         this._polling = false;
         document.getElementById('cmp-stop').disabled = true;
         if (_p) _p.style.width = '100%'; if (_pt) _pt.textContent = '100%';
-        if (s.results) { this._results = s.results; this._idx = 0; const sl = document.getElementById('cmp-slider'); sl.max = s.results.length-1; sl.disabled = false; this._showAt(0); }
         App.setStatus(t('cmp.complete'));
       } else setTimeout(()=>this._poll(), 500);
     } catch(e) { setTimeout(()=>this._poll(), 1000); }
@@ -388,7 +401,7 @@ Tabs['embedding-viewer'] = {
           </div>
           <div style="display:flex;gap:0.5rem;margin-top:1rem;">
             <button class="btn btn-primary" onclick="Tabs['embedding-viewer'].run()">${t('run')}</button>
-            <button class="btn btn-danger btn-sm" id="ev-stop" disabled onclick="Tabs['embedding-viewer']._polling=false">${t('stop')}</button>
+            <button class="btn btn-danger btn-sm" id="ev-stop" disabled onclick="API.post('/api/force-stop/embedding',{});Tabs['embedding-viewer']._polling=false">${t('stop')}</button>
           </div>
           <div style="margin-top:0.5rem;"><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="ev-prog" style="width:0%;height:100%;"></div><span id="ev-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
             <span class="text-secondary" id="ev-status" style="margin-top:0.25rem;display:block;">${t('ready')}</span></div>
@@ -454,8 +467,9 @@ Tabs.segmentation = {
         </div>
         <div class="card" style="padding:1.5rem;">
           <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('bench.results')}</h3>
-          <div class="table-container"><table><thead><tr><th>Class</th><th>IoU</th><th>Dice</th><th>Images</th></tr></thead>
-          <tbody id="seg-results"><tr><td colspan="4" class="text-secondary" style="text-align:center;padding:2rem;">${t('seg.run_hint')}</td></tr></tbody></table></div>
+          <div id="seg-summary" class="text-secondary" style="margin-bottom:0.75rem;"></div>
+          <div class="table-container"><table><thead><tr><th>Class</th><th>IoU</th><th>Dice</th></tr></thead>
+          <tbody id="seg-results"><tr><td colspan="3" class="text-secondary" style="text-align:center;padding:2rem;">${t('seg.run_hint')}</td></tr></tbody></table></div>
         </div>
       </div>`;
   },
@@ -481,24 +495,58 @@ Tabs.segmentation = {
       const segPt = document.getElementById('seg-prog-text'); if (segPt) segPt.textContent = prog + '%';
       if (msgEl) msgEl.textContent = s.msg || `${s.progress}/${s.total}`;
       if (s.running) setTimeout(() => this._poll(), 500);
-      else App.setStatus((s.msg || 'Complete') + (s.skipped ? ` (${t('spec.skipped', {n: s.skipped})})` : ''));
+      else {
+        this._renderResults(s);
+        App.setStatus((s.msg || 'Complete') + (s.skipped ? ` (${t('spec.skipped', {n: s.skipped})})` : ''));
+      }
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  },
+  // Render the overall + per-class metrics table from results.metrics (Wave 1 shape:
+  // {mIoU, mDice, per_class:[{class,iou,dice}]}). Stash status for the Detail modal.
+  _renderResults(s) {
+    this._lastStatus = s;
+    const tbody = document.getElementById('seg-results');
+    const summaryEl = document.getElementById('seg-summary');
+    const results = s.results || {};
+    const metrics = results.metrics || {};
+    const perClass = metrics.per_class || [];
+    const mIoU = metrics.mIoU != null ? metrics.mIoU : results.mIoU;
+    const mDice = metrics.mDice != null ? metrics.mDice : results.mDice;
+    if (summaryEl) {
+      if (mIoU != null) {
+        summaryEl.innerHTML = `${t('seg.miou')}: <strong>${Number(mIoU).toFixed(2)}%</strong> · ${t('seg.mdice')}: <strong>${Number(mDice).toFixed(2)}%</strong>`
+          + (results.num_images != null ? ` · ${t('seg.images_evaluated', {n: results.num_images})}` : '');
+      } else summaryEl.textContent = '';
+    }
+    if (!tbody) return;
+    if (!perClass.length) {
+      tbody.innerHTML = `<tr><td colspan="3" class="text-secondary" style="text-align:center;padding:2rem;">${t('seg.run_hint')}</td></tr>`;
+      return;
+    }
+    let rows = '';
+    // per_class iou/dice are 0-1 floats per Wave 1 contract; show as percentages for parity with mIoU.
+    for (const c of perClass) {
+      rows += `<tr><td>${escHtml(c.class)}</td><td>${(Number(c.iou) * 100).toFixed(2)}%</td><td>${(Number(c.dice) * 100).toFixed(2)}%</td></tr>`;
+    }
+    tbody.innerHTML = rows;
   },
   _showDetail() {
     const tbody = document.getElementById('seg-results');
     if (!tbody) return;
-    // Fetch detail from last status
+    // Fetch detail from last status. Wave 1 contract: top-level `detail`/`images` is the
+    // per-image list [{path,file,iou,classes,overlay}]; overlay is a base64 PNG (only for
+    // the lowest-IoU images), so render it as PNG and escape all model-supplied filenames.
     API.get('/api/segmentation/status').then(s => {
-      const detail = s.detail || [];
+      const detail = s.detail || s.images || [];
       let html = '<div style="font-size:12px;">';
-      // Summary table
+      // Summary table (copy the live per-class metrics table)
       html += '<h4 style="margin-bottom:0.5rem;">' + t('seg.per_class') + '</h4>';
       html += tbody.parentElement.parentElement.outerHTML;
       html += '<h4 style="margin:1rem 0 0.5rem;">' + t('seg.flow') + '</h4>';
       html += '<div style="display:flex;gap:0.5rem;align-items:center;font-size:11px;color:#aaa;margin-bottom:1rem;">';
       t('seg.flow_steps').split(',').forEach((step, i) => {
         if (i > 0) html += '→';
-        html += '<span style="padding:4px 8px;background:#333;border-radius:4px;">' + step + '</span>';
+        html += '<span style="padding:4px 8px;background:#333;border-radius:4px;">' + escHtml(step) + '</span>';
       });
       html += '</div>';
       if (detail.length) {
@@ -508,14 +556,14 @@ Tabs.segmentation = {
         if (withOverlay.length) {
           html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:0.5rem;margin-bottom:1rem;">';
           for (const d of withOverlay) {
-            html += `<div style="text-align:center;"><img src="data:image/jpeg;base64,${d.overlay}" style="max-width:100%;border-radius:4px;"><div style="font-size:10px;margin-top:2px;">${d.file} (IoU: ${d.iou})</div></div>`;
+            html += `<div style="text-align:center;"><img src="data:image/png;base64,${d.overlay}" style="max-width:100%;border-radius:4px;"><div style="font-size:10px;margin-top:2px;">${escHtml(d.file || d.path)} (IoU: ${escHtml(d.iou)})</div></div>`;
           }
           html += '</div>';
         }
         html += '<table style="width:100%;"><thead><tr><th>File</th><th>Mean IoU</th><th>Classes</th></tr></thead><tbody>';
         for (const d of detail.slice(0, 100)) {
-          const color = d.iou < 0.3 ? 'style="background:rgba(255,0,0,0.08);"' : '';
-          html += `<tr ${color}><td>${d.file}</td><td>${d.iou}</td><td>${d.classes}</td></tr>`;
+          const color = Number(d.iou) < 0.3 ? 'style="background:rgba(255,0,0,0.08);"' : '';
+          html += `<tr ${color}><td>${escHtml(d.file || d.path)}</td><td>${escHtml(d.iou)}</td><td>${escHtml(d.classes)}</td></tr>`;
         }
         html += '</tbody></table>';
         if (detail.length > 100) html += `<div style="color:#888;margin-top:0.5rem;">${t('seg.more', {n: detail.length - 100})}</div>`;
@@ -557,7 +605,10 @@ Tabs.clip = {
             <label class="form-label" for="clip-prompt-template">${t('clip.prompt_template')}</label>
             <input type="text" class="form-input input-normal" placeholder="${t('clip.prompt_template_ph')}" id="clip-prompt-template" value="a photo of a {}">
           </div>
-          <button class="btn btn-primary" style="margin-top:1rem;" id="clip-run-btn" onclick="Tabs.clip.run()">${t('run')}</button>
+          <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+            <button class="btn btn-primary" id="clip-run-btn" onclick="Tabs.clip.run()">${t('run')}</button>
+            <button class="btn btn-danger btn-sm" id="clip-stop" disabled onclick="API.post('/api/force-stop/clip',{})">${t('stop')}</button>
+          </div>
         </div>
         <div>
           <div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="clip-prog" style="width:0%;height:100%;"></div><span id="clip-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
@@ -585,6 +636,7 @@ Tabs.clip = {
         prompt_template: promptTemplate
       });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      const stopBtn = document.getElementById('clip-stop'); if (stopBtn) stopBtn.disabled = false;
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
@@ -600,13 +652,18 @@ Tabs.clip = {
       if (s.results && s.results.length) {
         const tbody = document.getElementById('clip-results');
         if (tbody) tbody.innerHTML = s.results.map(r =>
-          `<tr><td>${r.label}</td><td>${r.total}</td><td>${r.correct}</td><td>${r.accuracy}</td></tr>`
+          `<tr><td>${escHtml(r.label)}</td><td>${r.total}</td><td>${r.correct}</td><td>${r.accuracy}</td></tr>`
         ).join('');
         this._detail = s.detail || [];
       }
       if (s.running) setTimeout(() => this._poll(), 500);
       else {
-        App.setStatus((s.msg || 'Complete') + (s.skipped ? ` (${t('spec.skipped', {n: s.skipped})})` : ''));
+        const stopBtn = document.getElementById('clip-stop'); if (stopBtn) stopBtn.disabled = true;
+        // matched==0 means no image's parent folder matched a label — a folder-layout
+        // mismatch (expects img_dir/<label>/*.jpg), not a 0% model (Wave 1 `matched`).
+        let extra = s.skipped ? ` (${t('spec.skipped', {n: s.skipped})})` : '';
+        if (s.matched === 0) extra += ' — ' + t('clip.no_match');
+        App.setStatus((s.msg || 'Complete') + extra);
         if (this._detail && this._detail.length) {
           const btn = document.getElementById('clip-run-btn');
           if (btn) btn.insertAdjacentHTML('afterend',
@@ -624,7 +681,9 @@ Tabs.clip = {
     html += '<div style="max-height:400px;overflow-y:auto;"><table style="width:100%;font-size:12px;"><thead><tr><th>File</th><th>GT</th><th>Pred</th><th>Score</th><th>Top-3</th></tr></thead><tbody>';
     for (const r of d.slice(0, 200)) {
       const color = r.correct ? '' : 'style="background:rgba(255,0,0,0.08);"';
-      html += `<tr ${color}><td>${r.file}</td><td>${r.gt}</td><td>${r.pred}</td><td>${r.score}</td><td>${r.top3.map(t=>t[0]+':'+t[1]).join(', ')}</td></tr>`;
+      // file/gt/pred/top3 labels come from dataset folder names — escape against DOM-XSS.
+      const top3 = (r.top3 || []).map(pair => escHtml(pair[0]) + ':' + escHtml(pair[1])).join(', ');
+      html += `<tr ${color}><td>${escHtml(r.file)}</td><td>${escHtml(r.gt)}</td><td>${escHtml(r.pred)}</td><td>${escHtml(r.score)}</td><td>${top3}</td></tr>`;
     }
     html += '</tbody></table></div>';
     if (d.length > 200) html += `<div class="text-secondary" style="margin-top:0.5rem;">${t('seg.more', {n: d.length - 200})}</div>`;
@@ -749,10 +808,11 @@ Tabs.embedder = {
       const names = res.names;
       const matrix = res.matrix;
       let html = '<div style="overflow-x:auto;"><table style="width:100%;font-size:11px;"><thead><tr><th></th>';
-      names.forEach(n => { html += `<th style="max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${n}">${n}</th>`; });
+      // names are image filenames from the chosen dir — escape against DOM-XSS.
+      names.forEach(n => { html += `<th style="max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(n)}">${escHtml(n)}</th>`; });
       html += '</tr></thead><tbody>';
       matrix.forEach((row, i) => {
-        html += `<tr><td style="font-weight:600;max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${names[i]}">${names[i]}</td>`;
+        html += `<tr><td style="font-weight:600;max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(names[i])}">${escHtml(names[i])}</td>`;
         row.forEach((v, j) => {
           const bg = i === j ? '#333' : v > 0.9 ? 'rgba(74,222,128,0.3)' : v > 0.7 ? 'rgba(74,158,255,0.2)' : v < 0.3 ? 'rgba(255,107,107,0.2)' : '';
           html += `<td style="text-align:center;${bg ? 'background:'+bg+';' : ''}">${v.toFixed(3)}</td>`;
@@ -812,14 +872,21 @@ Tabs.converter = {
       if (m) m.textContent = s.msg || `${s.progress}/${s.total}`;
       if (s.running) setTimeout(() => this._poll(), 500);
       else {
-        // DATA-06: converter skips labels whose source image dimensions are unknown
-        // (separate labels/images dirs) and labels whose image was never found.
-        // Surface those counts instead of a silent 640×640 fallback.
+        // Surface the real conversion summary + diagnostics. The backend returns
+        // direction-specific keys (images/annotations/labels/files/objects) plus
+        // skip counters (missing_image, skipped_no_size, skipped_unsafe, bad_lines).
+        // The old code read res.converted, which the backend never sets (Wave 1).
         const res = s.results || {};
         const notes = [];
-        if (res.converted !== undefined) notes.push(`${res.converted} ${t('conv.converted')}`);
+        if (res.images !== undefined) notes.push(t('conv.images', {n: res.images}));
+        if (res.labels !== undefined) notes.push(t('conv.labels', {n: res.labels}));
+        if (res.annotations !== undefined) notes.push(t('conv.annotations', {n: res.annotations}));
+        if (res.files !== undefined) notes.push(t('conv.files', {n: res.files}));
+        if (res.objects !== undefined) notes.push(t('conv.objects', {n: res.objects}));
         if (res.missing_image) notes.push(t('conv.missing_image', {n: res.missing_image}));
         if (res.skipped_no_size) notes.push(t('conv.skipped_no_size', {n: res.skipped_no_size}));
+        if (res.skipped_unsafe) notes.push(t('conv.skipped_unsafe', {n: res.skipped_unsafe}));
+        if (res.bad_lines) notes.push(t('conv.bad_lines', {n: res.bad_lines}));
         App.setStatus((s.msg || 'Complete') + (notes.length ? ` — ${notes.join(', ')}` : ''));
       }
     } catch(e) { console.warn('poll error:', e); }
@@ -863,7 +930,12 @@ Tabs.remapper = {
     const w = document.getElementById('remap-pbar-wrap'); if (w) w.style.display = 'block';
     try {
       const r = await API.post('/api/data/remapper', { label_dir, output_dir, mapping, auto_reindex: document.getElementById('remap-reindex')?.checked, recursive: document.getElementById('remap-recursive')?.checked });
-      if (r.error) { App.setStatus('Error: ' + r.error); if (w) w.style.display = 'none'; return; }
+      if (r.error) {
+        // The start-guard now returns code 'BUSY' (Wave 1) — show a clear message.
+        App.setStatus(r.error === 'BUSY' ? t('remap.busy') : 'Error: ' + r.error);
+        if (w) w.style.display = 'none';
+        return;
+      }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
@@ -875,8 +947,13 @@ Tabs.remapper = {
       const pt = document.getElementById('remap-pbar-text'); if (pt) pt.textContent = pct + '%';
       if (s.running) { setTimeout(() => this._poll(), 300); return; }
       if (p) p.style.width = '100%'; if (pt) pt.textContent = '100%';
-      if (s.results) App.setStatus(`Remap complete — ${s.results.files} files, ${s.results.labels} labels`);
-      else App.setStatus(s.msg || 'Complete');
+      if (s.results) {
+        // Recursive mode mirrors the input subtree and de-dups basenames; surface the
+        // collision count so silently-renamed files are visible (Wave 1).
+        let summary = `Remap complete — ${s.results.files} files, ${s.results.labels} labels`;
+        if (s.results.collisions) summary += ` — ${t('remap.collisions', {n: s.results.collisions})}`;
+        App.setStatus(summary);
+      } else App.setStatus(s.msg || 'Complete');
       // DATA-04: surface the applied reindex map (old class id → new contiguous id).
       const rmap = s.results && s.results.reindex_map;
       const box = document.getElementById('remap-reindex-result');
@@ -915,7 +992,10 @@ Tabs.merger = {
             <div class="text-secondary" style="font-size:10px;margin-top:0.25rem;">${t('merger.dhash_desc')}</div>
           </div>
           <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="merge-recursive"> ${t('common.recursive')}</label>
-          <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.merger.run()">${t('merger.run')}</button>
+          <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+            <button class="btn btn-primary" onclick="Tabs.merger.run()">${t('merger.run')}</button>
+            <button class="btn btn-danger btn-sm" id="merge-stop" disabled onclick="API.post('/api/force-stop/merger',{})">${t('stop')}</button>
+          </div>
           <div id="merge-pbar-wrap" style="display:none;margin-top:0.75rem;">
             <div class="progress-track" style="height:20px;position:relative;">
               <div class="progress-fill" id="merge-pbar" style="width:0%;height:100%;"></div>
@@ -941,9 +1021,15 @@ Tabs.merger = {
     const output_dir = document.getElementById('merge-out')?.value;
     if (!datasets.length || !output_dir) { App.setStatus(t('common.select_dirs')); return; }
     const w = document.getElementById('merge-pbar-wrap'); if (w) w.style.display = 'block';
+    const stopBtn = document.getElementById('merge-stop'); if (stopBtn) stopBtn.disabled = false;
     try {
       const r = await API.post('/api/data/merger', { datasets, output_dir, dhash_threshold: +(document.getElementById('merge-dhash')?.value || 10), recursive: document.getElementById('merge-recursive')?.checked });
-      if (r.error) { App.setStatus('Error: ' + r.error); if (w) w.style.display = 'none'; return; }
+      if (r.error) {
+        App.setStatus('Error: ' + r.error);
+        if (w) w.style.display = 'none';
+        if (stopBtn) stopBtn.disabled = true;
+        return;
+      }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
@@ -955,6 +1041,7 @@ Tabs.merger = {
       const pt = document.getElementById('merge-pbar-text'); if (pt) pt.textContent = pct + '%';
       if (s.running) { setTimeout(() => this._poll(), 300); return; }
       if (p) p.style.width = '100%'; if (pt) pt.textContent = '100%';
+      const stopBtn = document.getElementById('merge-stop'); if (stopBtn) stopBtn.disabled = true;
       if (s.results) App.setStatus(`Merge complete — ${s.results.copied} copied, ${s.results.duplicates} duplicates skipped`);
       else App.setStatus(s.msg || 'Complete');
       setTimeout(() => { const w = document.getElementById('merge-pbar-wrap'); if (w) w.style.display = 'none'; }, 1000);
@@ -977,7 +1064,10 @@ Tabs.sampler = {
         </div>
         <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" checked id="samp-lbl-chk"> ${t('sampler.include_lbl')}</label>
         <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="samp-recursive"> ${t('common.recursive')}</label>
-        <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.sampler.run()">${t('run')}</button>
+        <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+          <button class="btn btn-primary" onclick="Tabs.sampler.run()">${t('run')}</button>
+          <button class="btn btn-danger btn-sm" id="samp-stop" disabled onclick="API.post('/api/force-stop/sampler',{})">${t('stop')}</button>
+        </div>
         <div id="samp-pbar-wrap" style="display:none;margin-top:0.75rem;">
           <div class="progress-track" style="height:20px;position:relative;">
             <div class="progress-fill" id="samp-pbar" style="width:0%;height:100%;"></div>
@@ -997,6 +1087,7 @@ Tabs.sampler = {
     if (!img_dir || !output_dir) { App.setStatus(t('common.select_dirs')); return; }
     const w = document.getElementById('samp-pbar-wrap'); if (w) w.style.display = 'block';
     const rc = document.getElementById('samp-result-card'); if (rc) rc.style.display = 'none';
+    const stopBtn = document.getElementById('samp-stop'); if (stopBtn) stopBtn.disabled = false;
     try {
       const r = await API.post('/api/data/sampler', {
         img_dir, label_dir: document.getElementById('samp-lbl')?.value || G.lblDir, output_dir,
@@ -1006,7 +1097,12 @@ Tabs.sampler = {
         include_labels: document.getElementById('samp-lbl-chk')?.checked,
         recursive: document.getElementById('samp-recursive')?.checked
       });
-      if (r.error) { App.setStatus('Error: ' + r.error); if (w) w.style.display = 'none'; return; }
+      if (r.error) {
+        App.setStatus('Error: ' + r.error);
+        if (w) w.style.display = 'none';
+        if (stopBtn) stopBtn.disabled = true;
+        return;
+      }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   },
@@ -1018,13 +1114,17 @@ Tabs.sampler = {
       const pt = document.getElementById('samp-pbar-text'); if (pt) pt.textContent = pct + '%';
       if (s.running) { setTimeout(() => this._poll(), 300); return; }
       if (p) p.style.width = '100%'; if (pt) pt.textContent = '100%';
+      const stopBtn = document.getElementById('samp-stop'); if (stopBtn) stopBtn.disabled = true;
       if (s.results) {
         App.setStatus(`Sampled ${s.results.sampled} from ${s.results.total} images`);
         const before = s.results.before || {}, after = s.results.after || {};
         const classes = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort((a,b)=>a-b);
         const tb = document.getElementById('samp-results');
-        if (tb) tb.innerHTML = classes.map(c => `<tr><td>${c}</td><td>${before[c]||0}</td><td>${after[c]||0}</td></tr>`).join('');
-        const sm = document.getElementById('samp-summary'); if (sm) sm.textContent = `Sampled ${s.results.sampled} images`;
+        if (tb) tb.innerHTML = classes.map(c => `<tr><td>${escHtml(c)}</td><td>${before[c]||0}</td><td>${after[c]||0}</td></tr>`).join('');
+        // Recursive sampling de-dups basenames; surface the collision count (Wave 1).
+        let summary = `Sampled ${s.results.sampled} images`;
+        if (s.results.collisions) summary += ` — ${t('samp.collisions', {n: s.results.collisions})}`;
+        const sm = document.getElementById('samp-summary'); if (sm) sm.textContent = summary;
         const rc = document.getElementById('samp-result-card'); if (rc) rc.style.display = 'block';
       } else App.setStatus(s.msg || 'Complete');
       setTimeout(() => { const w = document.getElementById('samp-pbar-wrap'); if (w) w.style.display = 'none'; }, 1000);
@@ -1039,6 +1139,7 @@ Tabs.anomaly = {
     return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('anomaly.title')}</h3>
+        <p class="text-secondary" style="font-size:11px;margin-bottom:0.75rem;">${t('anomaly.domain_hint')}</p>
         ${imgDirInput('anom-img')} ${lblDirInput('anom-lbl')}
         <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="anom-recursive"> ${t('common.recursive')}</label>
         <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.anomaly.run()">${t('run')}</button>
@@ -1082,8 +1183,21 @@ Tabs.quality = {
     return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('quality.title')}</h3>
+        <p class="text-secondary" style="font-size:11px;margin-bottom:0.75rem;">${t('quality.domain_hint')}</p>
         ${imgDirInput('qual-img')}
         <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="qual-recursive"> ${t('common.recursive')}</label>
+        <details style="margin-top:0.75rem;">
+          <summary style="cursor:pointer;color:var(--text-04);">${t('quality.thresholds')}</summary>
+          <div class="text-secondary" style="font-size:11px;margin:0.5rem 0;">${t('quality.thresholds_hint')}</div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0.75rem;margin-top:0.25rem;">
+            <div class="form-group"><label class="form-label" for="qual-blur">${t('quality.blur_threshold')}</label><input type="number" step="any" class="form-input input-normal" id="qual-blur" value="50"></div>
+            <div class="form-group"><label class="form-label" for="qual-dark">${t('quality.dark')}</label><input type="number" step="any" class="form-input input-normal" id="qual-dark" value="40"></div>
+            <div class="form-group"><label class="form-label" for="qual-bright">${t('quality.bright')}</label><input type="number" step="any" class="form-input input-normal" id="qual-bright" value="220"></div>
+            <div class="form-group"><label class="form-label" for="qual-entropy">${t('quality.entropy')}</label><input type="number" step="any" class="form-input input-normal" id="qual-entropy" value="3.0"></div>
+            <div class="form-group"><label class="form-label" for="qual-aspect-min">${t('quality.aspect_min')}</label><input type="number" step="any" class="form-input input-normal" id="qual-aspect-min" value="0.25"></div>
+            <div class="form-group"><label class="form-label" for="qual-aspect-max">${t('quality.aspect_max')}</label><input type="number" step="any" class="form-input input-normal" id="qual-aspect-max" value="4.0"></div>
+          </div>
+        </details>
         <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.quality.run()">${t('run')}</button>
         <div style="margin-top:0.5rem;"><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="qual-prog" style="width:0%;height:100%;"></div><span id="qual-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
           <span class="text-secondary" id="qual-msg" style="margin-top:0.25rem;display:block;">${t('ready')}</span></div>
@@ -1094,8 +1208,19 @@ Tabs.quality = {
   async run() {
     const img_dir = document.getElementById('qual-img')?.value || G.imgDir;
     if (!img_dir) { App.setStatus(t('eval.select_images')); return; }
+    // Read a numeric threshold input, falling back to the backend default when blank/NaN.
+    const num = (id, def) => { const v = parseFloat(document.getElementById(id)?.value); return isNaN(v) ? def : v; };
     try {
-      const r = await API.post('/api/quality/image-quality', { img_dir, recursive: document.getElementById('qual-recursive')?.checked });
+      const r = await API.post('/api/quality/image-quality', {
+        img_dir,
+        recursive: document.getElementById('qual-recursive')?.checked,
+        blur_threshold: num('qual-blur', 50),
+        dark_threshold: num('qual-dark', 40),
+        bright_threshold: num('qual-bright', 220),
+        entropy_threshold: num('qual-entropy', 3.0),
+        aspect_min: num('qual-aspect-min', 0.25),
+        aspect_max: num('qual-aspect-max', 4.0)
+      });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
@@ -1109,10 +1234,19 @@ Tabs.quality = {
       const m = document.getElementById('qual-msg'); if (m) m.textContent = s.msg || '';
       if (!s.running && s.results) {
         document.getElementById('qual-results').innerHTML = s.results.map(r =>
-          `<tr><td>${escHtml(r.file)}</td><td>${r.blur}</td><td>${r.brightness}</td><td>${r.entropy}</td><td>${r.aspect}</td><td>${escHtml(r.issues)}</td></tr>`).join('');
+          `<tr><td>${escHtml(r.file)}</td><td>${r.blur}</td><td>${r.brightness}</td><td>${r.entropy}</td><td>${r.aspect}</td><td>${this._issuesLabel(r.issues)}</td></tr>`).join('');
         App.setStatus((s.msg || '') + truncationNote(s, s.results.length));
       } else if (s.running) setTimeout(() => this._poll(), 500);
     } catch(e) { console.warn('poll error:', e); }
+  },
+  // The backend joins issue tokens with ', '. Most are already display English, but
+  // 'low_detail' leaks the raw i18n key into the table — translate that one token here
+  // (backend is out of this wave's ownership). All tokens are escaped against XSS.
+  _issuesLabel(issues) {
+    return String(issues || '').split(',').map(tok => {
+      const t0 = tok.trim();
+      return escHtml(t0 === 'low_detail' ? t('quality.low_detail') : t0);
+    }).join(', ');
   }
 };
 
@@ -1130,17 +1264,39 @@ Tabs.duplicate = {
         <div style="margin-top:0.5rem;"><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="dup-prog" style="width:0%;height:100%;"></div><span id="dup-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
           <span class="text-secondary" id="dup-msg" style="margin-top:0.25rem;display:block;">${t('ready')}</span></div>
       </div>
-      <div class="card" style="padding:1.5rem;"><div class="table-container"><table><thead><tr><th>Group</th><th>Image A</th><th>Image B</th><th>Distance</th></tr></thead>
-        <tbody id="dup-results"><tr><td colspan="4" class="text-secondary" style="text-align:center;padding:2rem;">—</td></tr></tbody></table></div></div></div>`;
+      <p class="text-secondary" style="font-size:11px;margin-top:0.5rem;">${t('merger.dhash_desc')}</p>
+      <div class="card" style="padding:1.5rem;"><div class="table-container"><table><thead><tr><th>Group</th><th>${t('dup.preview')}</th><th>Image A</th><th>Image B</th><th>Distance</th><th>${t('dup.actions')}</th></tr></thead>
+        <tbody id="dup-results"><tr><td colspan="6" class="text-secondary" style="text-align:center;padding:2rem;">—</td></tr></tbody></table></div></div></div>`;
   },
+  // Stash the scanned dir so deletes/thumbnails can resolve files. rel_a/rel_b
+  // (Wave 6) uniquely identify a file under the img_dir root for BOTH flat and
+  // recursive scans, so we always prefer them over the ambiguous basename.
+  _imgDir: '',
   async run() {
     const img_dir = document.getElementById('dup-img')?.value || G.imgDir;
     if (!img_dir) { App.setStatus(t('eval.select_images')); return; }
+    this._imgDir = img_dir;
     try {
-      const r = await API.post('/api/quality/duplicate', { img_dir, threshold: +document.getElementById('dup-thr').value, recursive: document.getElementById('dup-recursive')?.checked });
+      const r = await API.post('/api/quality/duplicate', { img_dir, threshold: +document.getElementById('dup-thr').value, recursive: !!document.getElementById('dup-recursive')?.checked });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       this._poll();
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  },
+  // Lazy thumbnail via the explorer-preview endpoint. Resolve from the rel path
+  // (subfolder-qualified) so recursive scans render too (the old code bailed to
+  // '—' for recursive); fall back to the basename when no rel is present.
+  _thumbCell(rel, name) {
+    if (!this._imgDir) return '<span class="text-muted">—</span>';
+    const sep = /[\\/]$/.test(this._imgDir) ? '' : '/';
+    const imgPath = this._imgDir + sep + (rel || name);
+    const id = 'dup-thumb-' + (this._thumbSeq = (this._thumbSeq || 0) + 1);
+    // Fetch the base64 preview without GT boxes (no label_dir) and inject on arrival.
+    API.post('/api/data/explorer/preview', { img_path: imgPath }).then(d => {
+      const el = document.getElementById(id);
+      if (el && d && d.image) el.innerHTML = `<img src="data:image/jpeg;base64,${d.image}" style="max-width:64px;max-height:64px;border-radius:4px;" title="${escHtml(rel || name)}">`;
+      else if (el) el.innerHTML = '<span class="text-muted">—</span>';
+    }).catch(() => {});
+    return `<span id="${id}"><span class="text-muted">…</span></span>`;
   },
   async _poll() {
     try {
@@ -1150,12 +1306,74 @@ Tabs.duplicate = {
       const pt = document.getElementById('dup-prog-text'); if (pt) pt.textContent = pct + '%';
       const m = document.getElementById('dup-msg'); if (m) m.textContent = s.msg || '';
       if (!s.running && s.results) {
-        document.getElementById('dup-results').innerHTML = s.results.length
-          ? s.results.map(r => `<tr><td>${r.group}</td><td>${escHtml(r.image_a)}</td><td>${escHtml(r.image_b)}</td><td>${r.distance}</td></tr>`).join('')
-          : '<tr><td colspan="4" class="text-secondary" style="text-align:center;">' + t('dup.none') + '</td></tr>';
+        this._results = s.results;
+        this._render(s.results);
         App.setStatus((s.msg || '') + truncationNote(s, s.results.length));
       } else if (s.running) setTimeout(() => this._poll(), 500);
     } catch(e) {}
+  },
+  _results: [],
+  // Render rows with per-row delete + a per-group "keep first, delete rest" button
+  // on the first row of each group. Delete sends the Wave-6 rel paths to
+  // /api/quality/delete-files (which validates strict containment in img_dir).
+  _render(results) {
+    const tbody = document.getElementById('dup-results');
+    if (!tbody) return;
+    if (!results.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="text-secondary" style="text-align:center;">' + t('dup.none') + '</td></tr>';
+      return;
+    }
+    // Track the first row index per group so only it shows the group action.
+    const seenGroups = new Set();
+    tbody.innerHTML = results.map((r, i) => {
+      const relA = r.rel_a || r.image_a;
+      const relB = r.rel_b || r.image_b;
+      let groupBtn = '';
+      if (!seenGroups.has(r.group)) {
+        seenGroups.add(r.group);
+        groupBtn = `<button class="btn btn-secondary btn-sm" style="margin-bottom:4px;display:block;" onclick="Tabs.duplicate._deleteGroup(${r.group})">${t('dup.keep_first')}</button>`;
+      }
+      // Per-row deletes target the B file (A is treated as the kept reference).
+      const rowBtn = `<button class="btn btn-danger btn-sm" onclick="Tabs.duplicate._deleteRow('${encodeURIComponent(relB)}')">${t('dup.delete')}</button>`;
+      return `<tr><td>${r.group}</td>`
+        + `<td style="display:flex;gap:4px;">${this._thumbCell(r.rel_a, r.image_a)}${this._thumbCell(r.rel_b, r.image_b)}</td>`
+        + `<td>${escHtml(r.image_a)}</td><td>${escHtml(r.image_b)}</td><td>${r.distance}</td>`
+        + `<td>${groupBtn}${rowBtn}</td></tr>`;
+    }).join('');
+  },
+  async _deleteRow(encRel) {
+    const rel = decodeURIComponent(encRel);
+    if (!confirm(t('dup.confirm_one'))) return;
+    await this._delete([rel]);
+  },
+  // "Keep first, delete rest" for a group: collect every distinct rel in the
+  // group (from both rel_a and rel_b across its pairs), keep the first-seen, and
+  // delete the remainder. Insertion order of distinct rels defines "first".
+  async _deleteGroup(group) {
+    const rels = [];
+    const seen = new Set();
+    for (const r of (this._results || [])) {
+      if (r.group !== group) continue;
+      for (const rel of [r.rel_a || r.image_a, r.rel_b || r.image_b]) {
+        if (rel && !seen.has(rel)) { seen.add(rel); rels.push(rel); }
+      }
+    }
+    const toDelete = rels.slice(1);  // keep the first
+    if (!toDelete.length) { App.setStatus(t('dup.no_files')); return; }
+    if (!confirm(t('dup.confirm_group', { n: toDelete.length }))) return;
+    await this._delete(toDelete);
+  },
+  async _delete(files) {
+    if (!this._imgDir) { App.setStatus(t('eval.select_images')); return; }
+    try {
+      const r = await API.post('/api/quality/delete-files', { img_dir: this._imgDir, files });
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      let msg = t('dup.deleted', { n: r.count || 0 });
+      if (r.skipped && r.skipped.length) msg += ' · ' + t('dup.delete_failed', { n: r.skipped.length });
+      App.setStatus(msg);
+      // Re-scan so the table reflects what's left on disk.
+      this.run();
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   }
 };
 
@@ -1271,12 +1489,22 @@ Tabs.augmentation = {
         <div class="card" style="padding:1.5rem;">
           <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('aug.title')}</h3>
           ${imgDirInput('aug-img')}
+          ${lblDirInput('aug-lbl')}
+          <p class="text-secondary" style="margin-top:0.25rem;font-size:11px;">${t('aug.label_dir_hint')}</p>
           <div class="form-group" style="margin-top:0.75rem;">
             <label class="form-label">${t('aug.type')}</label>
-            <select class="form-input input-normal" id="aug-type">
+            <select class="form-input input-normal" id="aug-type" onchange="Tabs.augmentation._syncParams()">
               <option>Mosaic 2×2</option><option>Flip</option><option>Rotate</option>
               <option>Brightness</option>
             </select>
+          </div>
+          <div class="form-group" id="aug-angle-group" style="margin-top:0.75rem;display:none;">
+            <label class="form-label" for="aug-angle">${t('aug.angle')}</label>
+            <input type="number" step="any" class="form-input input-normal" id="aug-angle" value="15">
+          </div>
+          <div id="aug-bright-group" style="margin-top:0.75rem;display:none;grid-template-columns:1fr 1fr;gap:0.75rem;">
+            <div class="form-group"><label class="form-label" for="aug-alpha">${t('aug.alpha')}</label><input type="number" step="any" class="form-input input-normal" id="aug-alpha" value="1.3"></div>
+            <div class="form-group"><label class="form-label" for="aug-beta">${t('aug.beta')}</label><input type="number" step="any" class="form-input input-normal" id="aug-beta" value="30"></div>
           </div>
           <p class="text-secondary" style="margin-top:0.75rem;font-size:12px;">${t('aug.preview_only')}</p>
           <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs.augmentation.run()">${t('aug.preview')}</button>
@@ -1287,15 +1515,46 @@ Tabs.augmentation = {
         </div>
       </div>`;
   },
+  // Show the relevant parameter inputs for the chosen augmentation type. The backend
+  // BatchAugmentRequest accepts angle (Rotate) and alpha/beta (Brightness).
+  _syncParams() {
+    const type = document.getElementById('aug-type')?.value || '';
+    const angleGroup = document.getElementById('aug-angle-group');
+    const brightGroup = document.getElementById('aug-bright-group');
+    if (angleGroup) angleGroup.style.display = type === 'Rotate' ? 'block' : 'none';
+    if (brightGroup) brightGroup.style.display = type === 'Brightness' ? 'grid' : 'none';
+  },
   async run() {
     const img_dir = document.getElementById('aug-img')?.value || G.imgDir;
     if (!img_dir) { App.setStatus(t('eval.select_images')); return; }
     App.setStatus(t('aug.generating'));
+    const num = (id, def) => { const v = parseFloat(document.getElementById(id)?.value); return isNaN(v) ? def : v; };
     try {
-      const r = await API.post('/api/batch/augmentation', { img_dir, aug_type: document.getElementById('aug-type').value });
+      // Send angle/alpha/beta so Rotate/Brightness are user-tunable (were hardcoded).
+      // label_dir enables YOLO box co-transform; backend draws boxes on both previews
+      // and returns labels/label_text/num_boxes with preview_only=false.
+      const r = await API.post('/api/batch/augmentation', {
+        img_dir,
+        label_dir: document.getElementById('aug-lbl')?.value || G.lblDir || '',
+        aug_type: document.getElementById('aug-type').value,
+        angle: num('aug-angle', 15),
+        alpha: num('aug-alpha', 1.3),
+        beta: num('aug-beta', 30)
+      });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
-      document.getElementById('aug-orig').innerHTML = `<div style="text-align:center;"><img src="data:image/jpeg;base64,${r.original}" style="max-width:100%;max-height:300px;"><div class="text-secondary" style="margin-top:0.25rem;">${r.file}</div></div>`;
-      document.getElementById('aug-result').innerHTML = `<img src="data:image/jpeg;base64,${r.augmented}" style="max-width:100%;max-height:300px;">`;
+      document.getElementById('aug-orig').innerHTML = `<div style="text-align:center;"><img src="data:image/jpeg;base64,${r.original}" style="max-width:100%;max-height:300px;"><div class="text-secondary" style="margin-top:0.25rem;">${escHtml(r.file)}</div></div>`;
+      // When labels were co-transformed (preview_only=false), show the box count and the
+      // transformed YOLO label text (monospace, escaped). Otherwise note image-only preview.
+      let resultHtml = `<img src="data:image/jpeg;base64,${r.augmented}" style="max-width:100%;max-height:300px;">`;
+      if (r.preview_only === false) {
+        resultHtml += `<div class="text-secondary" style="margin-top:0.5rem;font-size:12px;">${t('aug.labels_transformed')} · ${t('aug.num_boxes', {n: r.num_boxes || 0})}</div>`;
+        if (r.label_text) {
+          resultHtml += `<pre style="margin-top:0.5rem;max-height:140px;overflow:auto;background:var(--surface-02,#1e1e1e);padding:0.5rem;border-radius:6px;font-size:11px;white-space:pre;">${escHtml(r.label_text)}</pre>`;
+        }
+      } else {
+        resultHtml += `<div class="text-secondary" style="margin-top:0.5rem;font-size:12px;">${t('aug.preview_only_short')}</div>`;
+      }
+      document.getElementById('aug-result').innerHTML = resultHtml;
       App.setStatus(t('aug.ready'));
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   }
@@ -1306,18 +1565,25 @@ Tabs.augmentation = {
 Tabs['pose'] = {
   title: true,
   render() {
-    // SPEC-04: backend is single-image; expose a single-image picker (not a dir) so the
-    // selected file is actually what gets inferred (was silently using dir's first image).
+    // Single-image picker by default; an opt-in "directory mode" posts image_dir
+    // (+max_images) to the same /api/infer/pose endpoint and renders the per-image
+    // gallery (Wave-4 batch shape: results[]={file,image,num_persons,infer_ms,...}).
     return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('pose.title')}</h3>
         ${modelInput('pose-model')}
-        <div class="form-group" style="margin-top:0.75rem;">
+        <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.75rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="pose-use-dir" onchange="Tabs.pose._syncMode()"> ${t('spec.use_directory')}</label>
+        <div class="form-group" style="margin-top:0.75rem;" id="pose-img-group">
           <label class="form-label" for="pose-img">${t('cmt.test_image')}</label>
           <div style="display:flex;gap:0.5rem;">
             <input type="text" class="form-input input-normal" style="flex:1;" id="pose-img">
             <button class="btn btn-secondary btn-sm" onclick="pickFile('pose-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
           </div>
+        </div>
+        <div id="pose-dir-group" style="margin-top:0.75rem;display:none;">
+          ${imgDirInput('pose-img-dir')}
+          <div class="form-group" style="margin-top:0.75rem;max-width:200px;"><label class="form-label" for="pose-max-images">${t('spec.max_images')}</label>
+            <input type="number" class="form-input input-normal" id="pose-max-images" value="200" min="1" max="2000"></div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:0.75rem;">
           <div class="form-group"><label class="form-label">${t('pose.model_type')}</label>
@@ -1338,21 +1604,28 @@ Tabs['pose'] = {
       </div>
     </div>`;
   },
+  // Toggle between the single-image picker and the directory inputs.
+  _syncMode() {
+    const dir = document.getElementById('pose-use-dir')?.checked;
+    const imgGroup = document.getElementById('pose-img-group');
+    const dirGroup = document.getElementById('pose-dir-group');
+    if (imgGroup) imgGroup.style.display = dir ? 'none' : 'block';
+    if (dirGroup) dirGroup.style.display = dir ? 'block' : 'none';
+  },
   async run() {
     const model_path = document.getElementById('pose-model')?.value || G.model;
-    const image_path = document.getElementById('pose-img')?.value;
     if (!model_path) { App.setStatus(t('select_model')); return; }
-    if (!image_path) { App.setStatus(t('eval.select_images')); return; }
+    const useDir = document.getElementById('pose-use-dir')?.checked;
     // Keypoint visibility threshold (sent to backend AND used for the visible-count below).
     const kptConf = parseFloat(document.getElementById('pose-kpt-conf').value) || 0.5;
+    const conf = parseFloat(document.getElementById('pose-conf').value) || 0.25;
+    const model_type = document.getElementById('pose-model-type').value;
+    if (useDir) { this._runDir(model_path, model_type, conf, kptConf); return; }
+    const image_path = document.getElementById('pose-img')?.value;
+    if (!image_path) { App.setStatus(t('eval.select_images')); return; }
     App.setStatus(t('pose.running'));
     try {
-      const r = await API.post('/api/infer/pose', {
-        model_path, image_path,
-        conf: parseFloat(document.getElementById('pose-conf').value) || 0.25,
-        kpt_conf: kptConf,
-        model_type: document.getElementById('pose-model-type').value,
-      });
+      const r = await API.post('/api/infer/pose', { model_path, image_path, conf, kpt_conf: kptConf, model_type });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       let html = `<div style="text-align:center;"><img src="data:image/jpeg;base64,${r.image}" style="max-width:100%;max-height:500px;border-radius:8px;"></div>`;
       html += `<div style="margin-top:1rem;" class="text-secondary">${t('pose.persons')}: ${r.num_persons} | ${t('pose.infer_ms')}: ${r.infer_ms}ms</div>`;
@@ -1367,6 +1640,34 @@ Tabs['pose'] = {
       document.getElementById('pose-result').innerHTML = html;
       App.setStatus(t('pose.done'));
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  },
+  // Directory mode: post image_dir + max_images, render the per-image gallery
+  // (Wave-4 batch shape: {results:[{file,image,num_persons,infer_ms}], count, skipped, total_persons}).
+  async _runDir(model_path, model_type, conf, kptConf) {
+    const image_dir = document.getElementById('pose-img-dir')?.value || G.imgDir;
+    if (!image_dir) { App.setStatus(t('eval.select_images')); return; }
+    const max_images = +(document.getElementById('pose-max-images')?.value || 200);
+    App.setStatus(t('pose.running'));
+    try {
+      const r = await API.post('/api/infer/pose', { model_path, image_dir, max_images, conf, kpt_conf: kptConf, model_type });
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      const results = r.results || [];
+      let html = `<div class="text-secondary" style="margin-bottom:0.75rem;">${t('spec.processed', {n: r.count})} · ${t('pose.persons')}: ${r.total_persons}`
+        + (r.skipped ? ` · ${t('spec.skipped', {n: r.skipped})}` : '') + '</div>';
+      if (!results.length) {
+        html += `<span class="text-muted">${t('spec.no_results')}</span>`;
+      } else {
+        html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0.75rem;">';
+        for (const d of results) {
+          html += `<div style="text-align:center;"><img src="data:image/jpeg;base64,${d.image}" style="max-width:100%;border-radius:6px;">`
+            + `<div style="font-size:11px;margin-top:2px;">${escHtml(d.file)}</div>`
+            + `<div class="text-secondary" style="font-size:11px;">${t('pose.persons')}: ${d.num_persons} · ${d.infer_ms}ms</div></div>`;
+        }
+        html += '</div>';
+      }
+      document.getElementById('pose-result').innerHTML = html;
+      App.setStatus(t('pose.done'));
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
   }
 };
 
@@ -1374,16 +1675,24 @@ Tabs['pose'] = {
 Tabs['instance-seg'] = {
   title: true,
   render() {
+    // Single-image by default; opt-in directory mode posts image_dir (+max_images)
+    // and renders the Wave-4 batch gallery (results[]={file,image,num_instances,infer_ms}).
     return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('instseg.title')}</h3>
         ${modelInput('iseg-model')}
-        <div class="form-group" style="margin-top:0.75rem;">
+        <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.75rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="iseg-use-dir" onchange="Tabs['instance-seg']._syncMode()"> ${t('spec.use_directory')}</label>
+        <div class="form-group" style="margin-top:0.75rem;" id="iseg-img-group">
           <label class="form-label" for="iseg-img">${t('cmt.test_image')}</label>
           <div style="display:flex;gap:0.5rem;">
             <input type="text" class="form-input input-normal" style="flex:1;" id="iseg-img">
             <button class="btn btn-secondary btn-sm" onclick="pickFile('iseg-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
           </div>
+        </div>
+        <div id="iseg-dir-group" style="margin-top:0.75rem;display:none;">
+          ${imgDirInput('iseg-img-dir')}
+          <div class="form-group" style="margin-top:0.75rem;max-width:200px;"><label class="form-label" for="iseg-max-images">${t('spec.max_images')}</label>
+            <input type="number" class="form-input input-normal" id="iseg-max-images" value="200" min="1" max="2000"></div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:0.75rem;">
           <div class="form-group"><label class="form-label">${t('instseg.model_type')}</label>
@@ -1401,21 +1710,55 @@ Tabs['instance-seg'] = {
       </div>
     </div>`;
   },
+  _syncMode() {
+    const dir = document.getElementById('iseg-use-dir')?.checked;
+    const imgGroup = document.getElementById('iseg-img-group');
+    const dirGroup = document.getElementById('iseg-dir-group');
+    if (imgGroup) imgGroup.style.display = dir ? 'none' : 'block';
+    if (dirGroup) dirGroup.style.display = dir ? 'block' : 'none';
+  },
   async run() {
     const model_path = document.getElementById('iseg-model')?.value || G.model;
-    const image_path = document.getElementById('iseg-img')?.value;
     if (!model_path) { App.setStatus(t('select_model')); return; }
+    const useDir = document.getElementById('iseg-use-dir')?.checked;
+    const conf = parseFloat(document.getElementById('iseg-conf').value) || 0.25;
+    const model_type = document.getElementById('iseg-model-type').value;
+    if (useDir) { this._runDir(model_path, model_type, conf); return; }
+    const image_path = document.getElementById('iseg-img')?.value;
     if (!image_path) { App.setStatus(t('eval.select_images')); return; }
     App.setStatus(t('instseg.running'));
     try {
-      const r = await API.post('/api/infer/instance-seg', {
-        model_path, image_path,
-        conf: parseFloat(document.getElementById('iseg-conf').value) || 0.25,
-        model_type: document.getElementById('iseg-model-type').value,
-      });
+      const r = await API.post('/api/infer/instance-seg', { model_path, image_path, conf, model_type });
       if (r.error) { App.setStatus('Error: ' + r.error); return; }
       let html = `<div style="text-align:center;"><img src="data:image/jpeg;base64,${r.image}" style="max-width:100%;max-height:500px;border-radius:8px;"></div>`;
       html += `<div style="margin-top:1rem;" class="text-secondary">${t('instseg.instances')}: ${r.num_instances} | ${t('instseg.infer_ms')}: ${r.infer_ms}ms</div>`;
+      document.getElementById('iseg-result').innerHTML = html;
+      App.setStatus(t('instseg.done'));
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
+  },
+  // Directory mode: Wave-4 batch shape {results:[{file,image,num_instances,infer_ms}], count, skipped, total_instances}.
+  async _runDir(model_path, model_type, conf) {
+    const image_dir = document.getElementById('iseg-img-dir')?.value || G.imgDir;
+    if (!image_dir) { App.setStatus(t('eval.select_images')); return; }
+    const max_images = +(document.getElementById('iseg-max-images')?.value || 200);
+    App.setStatus(t('instseg.running'));
+    try {
+      const r = await API.post('/api/infer/instance-seg', { model_path, image_dir, max_images, conf, model_type });
+      if (r.error) { App.setStatus('Error: ' + r.error); return; }
+      const results = r.results || [];
+      let html = `<div class="text-secondary" style="margin-bottom:0.75rem;">${t('spec.processed', {n: r.count})} · ${t('instseg.instances')}: ${r.total_instances}`
+        + (r.skipped ? ` · ${t('spec.skipped', {n: r.skipped})}` : '') + '</div>';
+      if (!results.length) {
+        html += `<span class="text-muted">${t('spec.no_results')}</span>`;
+      } else {
+        html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0.75rem;">';
+        for (const d of results) {
+          html += `<div style="text-align:center;"><img src="data:image/jpeg;base64,${d.image}" style="max-width:100%;border-radius:6px;">`
+            + `<div style="font-size:11px;margin-top:2px;">${escHtml(d.file)}</div>`
+            + `<div class="text-secondary" style="font-size:11px;">${t('instseg.instances')}: ${d.num_instances} · ${d.infer_ms}ms</div></div>`;
+        }
+        html += '</div>';
+      }
       document.getElementById('iseg-result').innerHTML = html;
       App.setStatus(t('instseg.done'));
     } catch(e) { App.setStatus('Error: ' + e.message, e.stack); }
@@ -1426,36 +1769,172 @@ Tabs['instance-seg'] = {
 Tabs['tracking'] = {
   title: true,
   _trackerId: null,
+  _seqPolling: false,
   render() {
     return `<div style="display:flex;flex-direction:column;gap:1.5rem;">
       <div class="card" style="padding:1.5rem;">
         <h3 class="text-heading-h3" style="margin-bottom:1rem;">${t('tracking.title')}</h3>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;">
+        <div class="form-group">
+          <label class="form-label" for="track-mode">${t('tracking.source')}</label>
+          <select class="form-input input-normal" id="track-mode" style="width:auto;" onchange="Tabs.tracking._syncMode()">
+            <option value="sequence">${t('tracking.sequence')}</option>
+            <option value="interactive">${t('tracking.interactive')}</option>
+          </select>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:0.75rem;">
           <div class="form-group"><label class="form-label">${t('tracking.tracker_type')}</label>
             <select class="form-input input-normal" id="track-type">
               <option value="bytetrack">ByteTrack</option>
               <option value="sort">SORT</option>
             </select></div>
+          <div class="form-group"><label class="form-label" for="track-conf">${t('settings.conf')}</label>
+            <input type="number" class="form-input input-normal" id="track-conf" value="0.25" min="0.01" max="0.99" step="0.05"></div>
         </div>
-        <p class="text-secondary" style="margin-top:0.75rem;font-size:12px;">${t('tracking.desc')}</p>
         ${modelInput('track-model')}
-        <div class="form-group" style="margin-top:0.75rem;">
-          <label class="form-label" for="track-img">${t('cmt.test_image')}</label>
-          <div style="display:flex;gap:0.5rem;">
-            <input type="text" class="form-input input-normal" style="flex:1;" id="track-img">
-            <button class="btn btn-secondary btn-sm" onclick="pickFile('track-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
+
+        <!-- Sequence mode: a frame folder OR a video, run end-to-end as a background job. -->
+        <div id="track-seq-group" style="margin-top:0.75rem;">
+          <p class="text-secondary" style="margin-bottom:0.75rem;font-size:12px;">${t('tracking.seq_desc')}</p>
+          <div class="form-group">
+            <label class="form-label" for="track-seq-source">${t('tracking.source')}</label>
+            <select class="form-input input-normal" id="track-seq-source" style="width:auto;" onchange="Tabs.tracking._syncSeqSource()">
+              <option value="dir">${t('tracking.source_dir')}</option>
+              <option value="video">${t('tracking.source_video')}</option>
+            </select>
           </div>
+          <div id="track-seq-dir-group" style="margin-top:0.75rem;">
+            ${imgDirInput('track-seq-dir')}
+          </div>
+          <div id="track-seq-video-group" style="margin-top:0.75rem;display:none;">
+            <div class="form-group">
+              <label class="form-label" for="track-seq-video">${t('tracking.video_path')}</label>
+              <div style="display:flex;gap:0.5rem;">
+                <input type="text" class="form-input input-normal" style="flex:1;" id="track-seq-video">
+                <button class="btn btn-secondary btn-sm" onclick="pickFile('track-seq-video','Videos (*.mp4 *.avi *.mov *.mkv)')">${t('browse')}</button>
+              </div>
+            </div>
+          </div>
+          <div class="form-group" style="margin-top:0.75rem;max-width:200px;">
+            <label class="form-label" for="track-seq-max">${t('tracking.max_frames')}</label>
+            <input type="number" class="form-input input-normal" id="track-seq-max" value="300" min="1" max="1000">
+          </div>
+          <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+            <button class="btn btn-primary" onclick="Tabs.tracking.runSequence()">${t('tracking.run_seq')}</button>
+            <button class="btn btn-danger btn-sm" id="track-seq-stop" disabled onclick="API.post('/api/force-stop/tracking',{});Tabs.tracking._seqPolling=false">${t('stop')}</button>
+          </div>
+          <div style="margin-top:0.5rem;"><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="track-seq-prog" style="width:0%;height:100%;"></div><span id="track-seq-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
+            <span class="text-secondary" id="track-seq-msg" style="margin-top:0.25rem;display:block;">${t('ready')}</span></div>
         </div>
-        <div style="display:flex;gap:0.5rem;margin-top:1rem;">
-          <button class="btn btn-primary" onclick="Tabs.tracking.create()">${t('tracking.create')}</button>
-          <button class="btn btn-secondary" onclick="Tabs.tracking.update()">${t('tracking.step')}</button>
-          <button class="btn btn-secondary" onclick="Tabs.tracking.reset()">${t('tracking.reset')}</button>
+
+        <!-- Interactive mode: step one image at a time against a shared tracker. -->
+        <div id="track-interactive-group" style="margin-top:0.75rem;display:none;">
+          <p class="text-secondary" style="margin-bottom:0.75rem;font-size:12px;">${t('tracking.desc')}</p>
+          <div class="form-group">
+            <label class="form-label" for="track-img">${t('cmt.test_image')}</label>
+            <div style="display:flex;gap:0.5rem;">
+              <input type="text" class="form-input input-normal" style="flex:1;" id="track-img">
+              <button class="btn btn-secondary btn-sm" onclick="pickFile('track-img','Images (*.jpg *.jpeg *.png *.bmp)')">${t('browse')}</button>
+            </div>
+          </div>
+          <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+            <button class="btn btn-primary" onclick="Tabs.tracking.create()">${t('tracking.create')}</button>
+            <button class="btn btn-secondary" onclick="Tabs.tracking.update()">${t('tracking.step')}</button>
+            <button class="btn btn-secondary" onclick="Tabs.tracking.reset()">${t('tracking.reset')}</button>
+          </div>
         </div>
       </div>
       <div class="card" style="padding:1.5rem;" id="track-result">
-        <span class="text-secondary">${t('tracking.hint')}</span>
+        <span class="text-secondary">${t('tracking.seq_hint')}</span>
       </div>
     </div>`;
+  },
+  // Toggle between the sequence job UI and the interactive single-frame UI.
+  _syncMode() {
+    const mode = document.getElementById('track-mode')?.value || 'sequence';
+    const seq = document.getElementById('track-seq-group');
+    const inter = document.getElementById('track-interactive-group');
+    if (seq) seq.style.display = mode === 'sequence' ? 'block' : 'none';
+    if (inter) inter.style.display = mode === 'interactive' ? 'block' : 'none';
+    const res = document.getElementById('track-result');
+    if (res) res.innerHTML = `<span class="text-secondary">${mode === 'sequence' ? t('tracking.seq_hint') : t('tracking.hint')}</span>`;
+  },
+  // Sequence mode reads EITHER a frame folder OR a video path.
+  _syncSeqSource() {
+    const src = document.getElementById('track-seq-source')?.value || 'dir';
+    const dir = document.getElementById('track-seq-dir-group');
+    const vid = document.getElementById('track-seq-video-group');
+    if (dir) dir.style.display = src === 'dir' ? 'block' : 'none';
+    if (vid) vid.style.display = src === 'video' ? 'block' : 'none';
+  },
+  // Full-sequence runner: POST /api/tracking/run-sequence, then poll
+  // /api/tracking/sequence-status for {progress, frames, previews, summary}.
+  async runSequence() {
+    const model_path = document.getElementById('track-model')?.value || G.model;
+    if (!model_path) { App.setStatus(t('select_model')); return; }
+    const useVideo = document.getElementById('track-seq-source')?.value === 'video';
+    const body = {
+      model_path,
+      tracker: document.getElementById('track-type').value,
+      conf: parseFloat(document.getElementById('track-conf')?.value) || 0.25,
+      max_frames: +(document.getElementById('track-seq-max')?.value || 300),
+    };
+    if (useVideo) body.video_path = document.getElementById('track-seq-video')?.value || '';
+    else body.image_dir = document.getElementById('track-seq-dir')?.value || G.imgDir;
+    if (!body.image_dir && !body.video_path) { App.setStatus(t('tracking.need_source')); return; }
+    const stopBtn = document.getElementById('track-seq-stop'); if (stopBtn) stopBtn.disabled = false;
+    const prog = document.getElementById('track-seq-prog'); if (prog) prog.style.width = '0%';
+    try {
+      const r = await API.post('/api/tracking/run-sequence', body);
+      if (r.error) { App.setStatus('Error: ' + r.error); if (stopBtn) stopBtn.disabled = true; return; }
+      App.setStatus(t('tracking.seq_started'));
+      this._seqPolling = true; this._pollSequence();
+    } catch(e) { App.setStatus('Error: ' + e.message, e.stack); if (stopBtn) stopBtn.disabled = true; }
+  },
+  async _pollSequence() {
+    if (!this._seqPolling) return;
+    try {
+      const s = await API.get('/api/tracking/sequence-status');
+      const pct = s.total > 0 ? Math.round(s.progress / s.total * 100) : 0;
+      const p = document.getElementById('track-seq-prog'); if (p) p.style.width = pct + '%';
+      const pt = document.getElementById('track-seq-prog-text'); if (pt) pt.textContent = pct + '%';
+      const m = document.getElementById('track-seq-msg'); if (m) m.textContent = s.msg || '';
+      if (s.running) { setTimeout(() => this._pollSequence(), 600); return; }
+      this._seqPolling = false;
+      const stopBtn = document.getElementById('track-seq-stop'); if (stopBtn) stopBtn.disabled = true;
+      this._renderSequence(s);
+      const stopped = (s.msg || '').toLowerCase().indexOf('stop') !== -1;
+      App.setStatus(stopped ? t('tracking.seq_stopped') : t('tracking.seq_done'));
+    } catch(e) { setTimeout(() => this._pollSequence(), 1000); }
+  },
+  // Render the summary (unique IDs, frames) + an evenly-spaced overlay filmstrip.
+  _renderSequence(s) {
+    const el = document.getElementById('track-result');
+    if (!el) return;
+    const summary = s.summary || {};
+    const previews = s.previews || [];
+    let html = `<div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1rem;">
+      <div style="text-align:center;padding:0.75rem 1.25rem;background:var(--bg-02);border-radius:8px;">
+        <div style="font-size:1.5rem;font-weight:700;">${summary.num_unique_ids != null ? summary.num_unique_ids : '—'}</div>
+        <div class="text-secondary" style="font-size:12px;">${t('tracking.unique_ids')}</div></div>
+      <div style="text-align:center;padding:0.75rem 1.25rem;background:var(--bg-02);border-radius:8px;">
+        <div style="font-size:1.5rem;font-weight:700;">${summary.num_frames != null ? summary.num_frames : '—'}</div>
+        <div class="text-secondary" style="font-size:12px;">${t('tracking.frames')}</div></div>
+      <div style="text-align:center;padding:0.75rem 1.25rem;background:var(--bg-02);border-radius:8px;">
+        <div style="font-size:1.5rem;font-weight:700;text-transform:uppercase;">${escHtml(summary.tracker || '—')}</div>
+        <div class="text-secondary" style="font-size:12px;">${t('tracking.tracker_type')}</div></div>
+    </div>`;
+    if (previews.length) {
+      html += `<h4 style="margin:0.5rem 0;">${t('tracking.previews')}</h4>`;
+      html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0.75rem;">';
+      for (const pv of previews) {
+        html += `<div style="text-align:center;"><img src="data:image/jpeg;base64,${pv.image}" style="max-width:100%;border-radius:6px;">`
+          + `<div class="text-secondary" style="font-size:11px;margin-top:2px;">${t('tracking.frames')} #${escHtml(pv.frame_idx)}</div></div>`;
+      }
+      html += '</div>';
+    } else {
+      html += `<span class="text-muted">${t('spec.no_results')}</span>`;
+    }
+    el.innerHTML = html;
   },
   async create() {
     try {
@@ -1529,21 +2008,21 @@ Tabs['inspector'] = {
       html += `<div class="card-flat" style="padding:1rem;">
         <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.basic')}</div>
         <table style="width:100%;font-size:12px;">
-          <tr><td class="text-secondary">File</td><td>${r.file_name}</td></tr>
-          <tr><td class="text-secondary">Size</td><td>${r.file_size_mb} MB</td></tr>
-          <tr><td class="text-secondary">Opset</td><td>${r.opset_version}</td></tr>
-          <tr><td class="text-secondary">IR Version</td><td>${r.ir_version}</td></tr>
-          <tr><td class="text-secondary">Producer</td><td>${r.producer || '—'}</td></tr>
-          <tr><td class="text-secondary">Nodes</td><td>${r.num_nodes}</td></tr>
+          <tr><td class="text-secondary">File</td><td>${escHtml(r.file_name)}</td></tr>
+          <tr><td class="text-secondary">Size</td><td>${escHtml(r.file_size_mb)} MB</td></tr>
+          <tr><td class="text-secondary">Opset</td><td>${escHtml(r.opset_version)}</td></tr>
+          <tr><td class="text-secondary">IR Version</td><td>${escHtml(r.ir_version)}</td></tr>
+          <tr><td class="text-secondary">Producer</td><td>${r.producer ? escHtml(r.producer) : '—'}</td></tr>
+          <tr><td class="text-secondary">Nodes</td><td>${escHtml(r.num_nodes)}</td></tr>
           <tr><td class="text-secondary">Parameters</td><td>${r.num_parameters ? r.num_parameters.toLocaleString() : '—'}</td></tr>
         </table></div>`;
       // I/O
       html += `<div class="card-flat" style="padding:1rem;">
         <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.io')}</div>
         <div style="font-size:12px;"><strong>Inputs:</strong><ul style="margin:0.25rem 0;">`;
-      (r.inputs||[]).forEach(i => { html += `<li>${i.name}: [${i.shape.join(', ')}] (${i.dtype})</li>`; });
+      (r.inputs||[]).forEach(i => { html += `<li>${escHtml(i.name)}: [${escHtml((i.shape||[]).join(', '))}] (${escHtml(i.dtype)})</li>`; });
       html += `</ul><strong>Outputs:</strong><ul style="margin:0.25rem 0;">`;
-      (r.outputs||[]).forEach(o => { html += `<li>${o.name}: [${o.shape.join(', ')}] (${o.dtype})</li>`; });
+      (r.outputs||[]).forEach(o => { html += `<li>${escHtml(o.name)}: [${escHtml((o.shape||[]).join(', '))}] (${escHtml(o.dtype)})</li>`; });
       html += '</ul></div></div>';
       // EP compatibility — show per-EP op-support ratio. EPs not in the heuristic
       // table report known=false / supported_ratio=null → render 'unknown', not 100%.
@@ -1568,7 +2047,7 @@ Tabs['inspector'] = {
         <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.ops')}</div>
         <div style="font-size:12px;">`;
       const ops = Object.entries(r.node_op_counts||{}).sort((a,b)=>b[1]-a[1]).slice(0,10);
-      ops.forEach(([op, cnt]) => { html += `<div style="display:flex;justify-content:space-between;"><span>${op}</span><span>${cnt}</span></div>`; });
+      ops.forEach(([op, cnt]) => { html += `<div style="display:flex;justify-content:space-between;"><span>${escHtml(op)}</span><span>${escHtml(cnt)}</span></div>`; });
       html += '</div></div>';
       // Metadata
       if (r.metadata && Object.keys(r.metadata).length) {
@@ -1576,8 +2055,8 @@ Tabs['inspector'] = {
           <div class="text-label" style="margin-bottom:0.5rem;">${t('inspector.metadata')}</div>
           <div style="font-size:11px;max-height:200px;overflow-y:auto;word-break:break-all;">`;
         Object.entries(r.metadata).forEach(([k,v]) => {
-          const val = String(v).length > 200 ? String(v).substring(0,200) + '…' : v;
-          html += `<div><strong>${k}:</strong> ${val}</div>`;
+          const val = String(v).length > 200 ? String(v).substring(0,200) + '…' : String(v);
+          html += `<div><strong>${escHtml(k)}:</strong> ${escHtml(val)}</div>`;
         });
         html += '</div></div>';
       }
@@ -1790,6 +2269,15 @@ Tabs['calibration'] = {
           <div class="form-group" style="max-width:200px;"><label class="form-label">${t('calib.weight_type')}</label>
             <select class="form-input input-normal" id="calib-dyn-wt"><option value="uint8" selected>UINT8</option><option value="int8">INT8</option></select></div>
         </div>
+        <!-- Optional post-optimization accuracy validation (Wave 8). With a sample dir
+             the backend compares original vs optimized predictions and reports agreement. -->
+        <details style="margin-top:0.75rem;">
+          <summary style="cursor:pointer;color:var(--text-04);">${t('opt.validation')}</summary>
+          <div style="margin-top:0.5rem;">
+            ${imgDirInput('calib-val-dir')}
+            <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;color:var(--text-04);"><input type="checkbox" id="calib-do-validate"> ${t('opt.do_validate')}</label>
+          </div>
+        </details>
         <button class="btn btn-primary" style="margin-top:1rem;" onclick="Tabs['calibration'].run()">${t('calib.run')}</button>
       </div>
       <div><div class="progress-track" style="height:20px;position:relative;"><div class="progress-fill" id="calib-prog" style="width:0%;height:100%;"></div><span id="calib-prog-text" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:11px;line-height:20px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,0.8);">0%</span></div>
@@ -1940,13 +2428,44 @@ Tabs['calibration'] = {
   },
   // ── New optimization methods ──
   _pipeSteps: [],
+  // Read the optional validation inputs (Wave 8). sample_dir + do_validate map
+  // directly to OptimizeRequest fields; only sent when a sample dir is present
+  // so we never block an optimization on validation the user didn't ask for.
+  _validationBody() {
+    const sampleDir = document.getElementById('calib-val-dir')?.value || '';
+    if (!sampleDir) return {};
+    return { sample_dir: sampleDir, do_validate: !!document.getElementById('calib-do-validate')?.checked };
+  },
   async _runOpt(method, params) {
     const path = document.getElementById('calib-model')?.value || G.model;
     if (!path) { App.setStatus(t('select_model')); return; }
-    const r = await API.post('/api/optimize/run', { model_path: path, method, params });
+    const r = await API.post('/api/optimize/run', { model_path: path, method, params, ...this._validationBody() });
     if (r.error) { App.setStatus('Error: ' + r.error); return; }
     App.setStatus(`Running ${method}...`);
     this._pollOptimize();
+  },
+  // Render results.validation {validated, agreement, degraded, threshold, n_images,
+  // max_abs_diff, top1_agreement}. Prominent warning style when degraded===true.
+  _validationHtml(v) {
+    if (!v || v.validated === false) {
+      const why = v && v.error ? ` (${escHtml(v.error)})` : '';
+      return `<div style="margin-top:1rem;padding:0.75rem;background:var(--bg-02);border-radius:8px;font-size:12px;color:var(--text-03);">${t('opt.not_validated')}${why}</div>`;
+    }
+    const pct = (x) => (x != null ? (Number(x) * 100).toFixed(1) + '%' : '—');
+    const degraded = v.degraded === true;
+    const border = degraded ? '#ef4444' : '#22c55e';
+    const bg = degraded ? 'rgba(239,68,68,0.10)' : 'rgba(34,197,94,0.10)';
+    const banner = degraded ? t('opt.degraded_warn') : t('opt.validation_ok');
+    let html = `<div style="margin-top:1rem;padding:0.9rem;background:${bg};border-radius:8px;border-left:4px solid ${border};">
+      <div style="font-weight:700;color:${border};margin-bottom:0.5rem;">${escHtml(banner)}</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:0.75rem;font-size:12px;">
+        <div><span class="text-secondary">${t('opt.agreement')}</span><br><strong>${pct(v.agreement)}</strong></div>`;
+    if (v.top1_agreement != null) html += `<div><span class="text-secondary">${t('opt.top1_agreement')}</span><br><strong>${pct(v.top1_agreement)}</strong></div>`;
+    html += `<div><span class="text-secondary">${t('opt.threshold')}</span><br><strong>${pct(v.threshold)}</strong></div>`;
+    if (v.n_images != null) html += `<div><span class="text-secondary">${t('opt.n_images')}</span><br><strong>${escHtml(v.n_images)}</strong></div>`;
+    if (v.max_abs_diff != null) html += `<div><span class="text-secondary">${t('opt.max_abs_diff')}</span><br><strong>${escHtml(v.max_abs_diff)}</strong></div>`;
+    html += '</div></div>';
+    return html;
   },
   _pollOptimize() {
     if (this._timer) clearInterval(this._timer);
@@ -1985,6 +2504,8 @@ Tabs['calibration'] = {
             }
           }
           html += '</div>';
+          // Accuracy validation block (Wave 8) — warn prominently when degraded.
+          if (res.validation) html += this._validationHtml(res.validation);
           if (res.output_path || (res.steps && res.steps.length)) {
             const outPath = res.output_path || '';
             html += `<button class="btn btn-secondary" style="margin-top:1rem;" onclick="Tabs['calibration']._openInBenchmark('${outPath.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}')">${t('calib.compare_bench')}</button>`;
@@ -2026,7 +2547,7 @@ Tabs['calibration'] = {
     const path = document.getElementById('calib-model')?.value || G.model;
     if (!path) { App.setStatus(t('select_model')); return; }
     if (!this._pipeSteps.length) { App.setStatus('Add at least one step'); return; }
-    const r = await API.post('/api/optimize/run', { model_path: path, pipeline: this._pipeSteps });
+    const r = await API.post('/api/optimize/run', { model_path: path, pipeline: this._pipeSteps, ...this._validationBody() });
     if (r.error) { App.setStatus('Error: ' + r.error); return; }
     App.setStatus('Running pipeline...');
     this._pollOptimize();

@@ -4,10 +4,12 @@ EP 워커 서브프로세스 스크립트.
 stdin  : JSON 태스크 딕셔너리 (단일 블록)
 stdout : 줄 단위 JSON 이벤트 스트림
   {"type": "progress", "done": N, "total": M, "msg": "..."}
-  {"type": "result",   "data": {...}}   ← BenchmarkResult
+  {"type": "result",   "data": {...}}   ← BenchmarkResult / export result dict
   {"type": "report",   "data": {...}}   ← BottleneckReport
   {"type": "error",    "msg": "..."}
   {"type": "finished"}
+
+지원 task 타입: "benchmark", "bottleneck", "export".
 """
 import json
 import os
@@ -60,6 +62,29 @@ def _run_bottleneck(task: dict) -> None:
     )
 
 
+def _run_export(task: dict) -> None:
+    """Run one in-process export inside THIS venv and emit the result dict.
+
+    Used when the requested target's backend (e.g. openvino/coreml) isn't
+    importable in the main process but a matching EP venv has it. The config is
+    forwarded verbatim to run_export, so the in-venv export path is byte-for-byte
+    the same code the main process would run — only the interpreter differs.
+    """
+    from core.deployment.runner import run_export
+
+    config = dict(task.get("config", {}))
+    # The subprocess IS the EP-specific env; routing again from here would
+    # recurse/launch another worker. Pin to the in-process path explicitly.
+    config["_in_process"] = True
+
+    result = run_export(
+        config,
+        on_progress=lambda d, t, m: _emit({"type": "progress", "done": d, "total": t, "msg": m}),
+        is_stopped=lambda: False,
+    )
+    _emit({"type": "result", "data": result})
+
+
 def main() -> None:
     try:
         task = json.loads(sys.stdin.read())
@@ -75,6 +100,8 @@ def main() -> None:
             _run_benchmark(task)
         elif task_type == "bottleneck":
             _run_bottleneck(task)
+        elif task_type == "export":
+            _run_export(task)
         else:
             _emit({"type": "error", "msg": f"알 수 없는 태스크 타입: {task_type!r}"})
     except Exception as exc:

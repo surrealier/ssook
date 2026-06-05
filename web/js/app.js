@@ -2,7 +2,8 @@
 const App = {
   currentTab: 'viewer',
 
-  /* Sidebar definition: [section_i18n_key, [[tab_id, icon_fn, nav_i18n_key], ...]] */
+  /* Sidebar definition: [section_i18n_key, [[tab_id, icon_name], ...]] — the
+     nav label key is derived as 'nav.'+tab_id, and icon_name indexes Icons[]. */
   _nav: [
     ['sec.inference',  [['viewer','viewer'],['settings','settings']]],
     ['sec.evaluation', [['evaluation','evaluation'],['benchmark','benchmark']]],
@@ -11,6 +12,8 @@ const App = {
     ['sec.specialized',[['segmentation','segmentation'],['clip','clip'],['embedder','embedder'],['pose','pose'],['instance-seg','instanceSeg'],['tracking','tracking'],['vlm','vlm']]],
     ['sec.data',       [['explorer','explorer'],['splitter','splitter'],['converter','converter'],['remapper','remapper'],['merger','merger'],['sampler','sampler'],['augmentation','augmentation']]],
     ['sec.quality',    [['anomaly','anomaly'],['quality','quality'],['duplicate','duplicate'],['leaky','leaky'],['similarity','similarity']]],
+    ['sec.training',   [['training','train']]],
+    ['sec.deployment', [['deployment','rocket']]],
   ],
 
   init() {
