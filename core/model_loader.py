@@ -138,6 +138,11 @@ def _build_providers(cuda_options: "dict | None" = None, ep_key: str = "auto") -
         if prov and prov in available:
             if prov == "CPUExecutionProvider":
                 return ["CPUExecutionProvider"]
+            if prov == "TensorrtExecutionProvider":
+                # TRT EP는 nvinfer 런타임이 로더 경로에 없으면 조용히 CUDA로 fallback한다.
+                # 세션 생성 전에 tensorrt 런타임(tensorrt_libs)을 DLL 경로에 올려 실제로 붙게 한다.
+                from core.ep_selector import ensure_tensorrt_runtime
+                ensure_tensorrt_runtime()
             chain = [_provider_with_opts(prov, cuda_options)]
             # TensorRT는 미지원 노드를 CUDA로, 그 외는 CPU로 떨어지게 체인 구성.
             if prov == "TensorrtExecutionProvider" and "CUDAExecutionProvider" in available:

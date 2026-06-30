@@ -328,3 +328,31 @@ def test_detect_precision():
     qdq = [helper.make_node("QuantizeLinear", ["X", "sc", "zp"], ["q"]),
            helper.make_node("DequantizeLinear", ["q", "sc", "zp"], ["Y"])]
     assert _detect_precision(_save(qdq, [sc, zp], [Xf], [Yf], "int8")) == "int8"
+
+
+# ── TensorRT runtime enablement + honest EP fallback reporting ──
+def test_ensure_tensorrt_runtime_is_safe_and_cached():
+    # Best-effort: returns a bool (True only if the tensorrt pkg is importable),
+    # never raises, and is idempotent/cached so repeated calls are cheap no-ops.
+    from core.ep_selector import ensure_tensorrt_runtime
+    a = ensure_tensorrt_runtime()
+    b = ensure_tensorrt_runtime()
+    assert isinstance(a, bool) and a == b
+
+
+def test_csv_surfaces_requested_ep_for_silent_fallback():
+    # When TensorRT was requested but the session ran on CUDA (TRT libs missing →
+    # ORT silently fell back), the CSV must show ep_requested != provider so the
+    # user sees why int8/fp16 wasn't accelerated.
+    from server import benchmark_routes
+    bench_state = _reset_bench_state()
+    bench_state["results"] = [{
+        "name": "m.onnx", "codec": "Raw", "status": "ok", "precision": "int8",
+        "input_dtype": "float", "provider": "CUDAExecutionProvider",
+        "ep_requested": "tensorrt", "ep_fallback": True, "fps": 50, "avg": 20,
+    }]
+    resp = asyncio.run(benchmark_routes.benchmark_export_csv())
+    row = list(csv.DictReader(io.StringIO(resp.body.decode("utf-8-sig"))))[0]
+    assert row["ep_requested"] == "tensorrt"
+    assert row["provider"] == "CUDAExecutionProvider"  # the actual (fallback) EP
+    _reset_bench_state()

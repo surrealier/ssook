@@ -240,3 +240,38 @@ def get_ep_status() -> dict:
     except Exception:
         ep_result["available_eps"] = []
     return ep_result
+
+
+_trt_runtime_ready: "bool | None" = None
+
+
+def ensure_tensorrt_runtime() -> bool:
+    """Make onnxruntime's TensorrtExecutionProvider actually loadable.
+
+    onnxruntime-gpu lists 'TensorrtExecutionProvider' in get_available_providers()
+    even when the TensorRT runtime libs (nvinfer*) aren't on the loader path — and
+    then SILENTLY falls back to CUDA at session creation (no acceleration). The
+    `tensorrt` pip package bundles those libs in the sibling `tensorrt_libs`
+    package; adding that dir to the DLL search path + importing tensorrt lets ORT
+    find nvinfer so the TRT EP initializes and actually runs (measured ~2.6x over
+    CUDA on fp32). Best-effort + cached: a no-op when `tensorrt` isn't installed
+    (ORT keeps its current fallback). Safe to call before each TRT session.
+    """
+    global _trt_runtime_ready
+    if _trt_runtime_ready is not None:
+        return _trt_runtime_ready
+    _trt_runtime_ready = False
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("tensorrt_libs")
+        lib_dir = spec.submodule_search_locations[0] if (spec and spec.submodule_search_locations) else None
+        if lib_dir and os.path.isdir(lib_dir):
+            if hasattr(os, "add_dll_directory"):  # Windows
+                os.add_dll_directory(lib_dir)
+            else:  # Linux: nvinfer .so must be discoverable
+                os.environ["LD_LIBRARY_PATH"] = lib_dir + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")
+        import tensorrt  # noqa: F401  — also registers its libs/plugins on most builds
+        _trt_runtime_ready = True
+    except Exception:
+        _trt_runtime_ready = False
+    return _trt_runtime_ready

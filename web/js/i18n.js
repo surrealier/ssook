@@ -179,6 +179,8 @@ const I18n = {
     'bench.ep_hint':   { en: 'Pick TensorRT to actually accelerate int8/fp16 — the CUDA EP does not accelerate QDQ-int8/fp16.', ko: 'int8/fp16을 실제로 가속하려면 TensorRT를 선택하세요 — CUDA EP는 QDQ-int8/fp16을 가속하지 못합니다.' },
     'bench.precision': { en: 'Precision',      ko: '정밀도' },
     'bench.dtype':     { en: 'In dtype',       ko: '입력 dtype' },
+    'bench.ep_fallback_tip': { en: 'Requested EP was unavailable (e.g. TensorRT libs not loaded) — ran on this EP instead.', ko: '요청한 EP를 쓸 수 없어(예: TensorRT 런타임 미로딩) 이 EP로 실행됨.' },
+    'bench.dec_tip':   { en: 'Decode time — measured only when a codec (JPEG/PNG/H264…) is selected; blank for Raw.', ko: '디코드 시간 — 코덱(JPEG/PNG/H264…) 선택 시에만 측정. Raw면 빈칸.' },
     'bench.run':       { en: 'Run Benchmark', ko: '벤치마크 실행' },
     'bench.running':   { en: 'Benchmark running...', ko: '벤치마크 실행 중...' },
     'bench.complete':  { en: 'Benchmark complete',   ko: '벤치마크 완료' },

@@ -152,7 +152,9 @@ class BenchmarkConfig:
 class BenchmarkResult:
     model_name: str
     model_type: str
-    provider: str
+    provider: str            # 실제로 첫 번째로 쓰인 EP (session.get_providers()[0])
+    ep_requested: str        # 사용자가 요청한 EP (auto/cuda/tensorrt/...)
+    ep_fallback: bool        # 요청 EP가 실제 세션에 없어 다른 EP로 조용히 떨어졌는지
     src_size: tuple          # 원본 프레임 해상도 (H, W)
     model_size: tuple        # 모델 입력 크기 (H, W)
     batch_size: int
@@ -261,7 +263,11 @@ def run_benchmark_core(
             model_info = load_model(cfg.model_path, cfg.model_type,
                                      cuda_options=cuda_opts, ep_key=cfg.ep_key)
         except Exception as e:
-            on_error(cfg_idx, f"[{model_name}] 로드 실패: {e}")
+            msg = f"[{model_name}] 로드 실패: {e}"
+            if cfg.ep_key == "tensorrt" and "engine" in str(e).lower():
+                msg += (" (TensorRT가 이 모델의 engine을 빌드하지 못함 — int8 QDQ 등은 종종 "
+                        "TRT 빌드에 실패합니다. fp16/fp32를 쓰거나 TRT-호환 int8 export가 필요합니다.)")
+            on_error(cfg_idx, msg)
             done += cfg.warmup + cfg.iterations
             on_progress(done, total_steps, f"[{model_name}] 로드 실패 — 건너뜀")
             continue
@@ -298,6 +304,11 @@ def run_benchmark_core(
 
         providers = model_info.session.get_providers()
         provider = providers[0] if providers else "Unknown"
+        # 요청한 EP가 실제 세션에 없으면(예: TensorRT가 nvinfer 미로딩으로 CUDA로 fallback)
+        # 사용자에게 정직하게 알리기 위해 플래그를 세운다.
+        from core.model_loader import _EP_KEY_PROVIDER
+        _req_prov = _EP_KEY_PROVIDER.get(cfg.ep_key)
+        ep_fallback = bool(_req_prov and _req_prov not in providers)
         layout = model_info.output_layout
         input_name = model_info.input_name
         is_darknet = model_info.model_type == "darknet"
@@ -417,6 +428,8 @@ def run_benchmark_core(
             model_name=model_name,
             model_type=cfg.model_type,
             provider=provider,
+            ep_requested=cfg.ep_key,
+            ep_fallback=ep_fallback,
             src_size=(src_h, src_w),
             model_size=(model_h, model_w),
             batch_size=batch,

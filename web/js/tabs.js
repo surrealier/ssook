@@ -1066,7 +1066,7 @@ Tabs.benchmark = {
               <button class="btn btn-ghost btn-sm" onclick="document.getElementById('bench-results').innerHTML='<tr><td colspan=17 class=text-secondary style=text-align:center;padding:2rem>${t('bench.run_hint')}</td></tr>'">${t('reset')}</button>
             </div>
           </div>
-          <div class="table-container"><table><thead><tr><th>Model</th><th>Codec</th><th>${t('bench.precision')}</th><th>${t('bench.dtype')}</th><th>Provider</th><th>FPS</th><th>Avg(ms)</th><th>Dec(ms)</th><th>Pre(ms)</th><th>Infer(ms)</th><th>Post(ms)</th><th title="${t('bench.p50_tip')}">P50(ms)</th><th title="${t('bench.p95_tip')}">P95(ms)</th><th title="${t('bench.p99_tip')}">P99(ms)</th><th>CPU%</th><th>RAM(MB)</th><th>GPU%</th></tr></thead>
+          <div class="table-container"><table><thead><tr><th>Model</th><th>Codec</th><th>${t('bench.precision')}</th><th>${t('bench.dtype')}</th><th>Provider</th><th>FPS</th><th>Avg(ms)</th><th title="${t('bench.dec_tip')}">Dec(ms)</th><th>Pre(ms)</th><th>Infer(ms)</th><th>Post(ms)</th><th title="${t('bench.p50_tip')}">P50(ms)</th><th title="${t('bench.p95_tip')}">P95(ms)</th><th title="${t('bench.p99_tip')}">P99(ms)</th><th>CPU%</th><th>RAM(MB)</th><th>GPU%</th></tr></thead>
           <tbody id="bench-results"><tr><td colspan="17" class="text-secondary" style="text-align:center;padding:2rem;">${t('bench.run_hint')}</td></tr></tbody></table></div>
         </div>
       </div>`;
@@ -1136,7 +1136,7 @@ Tabs.benchmark = {
           if (x.error) return `<tr><td>${escHtml(x.name)||'—'}</td><td colspan="16" style="color:var(--action-danger-05);">${escHtml(x.error)}</td></tr>`;
           const hl = i === 0 ? ' style="background:var(--status-success-01);font-weight:600;"' : '';
           const gpu = x.gpu_pct != null ? `${x.gpu_pct}%` : 'N/A';
-          return `<tr${hl}><td>${escHtml(x.name)||'—'}</td><td>${escHtml(x.codec)||'—'}</td><td>${escHtml(x.precision)||'—'}</td><td>${escHtml(x.input_dtype)||'—'}</td><td>${escHtml(x.provider)||'—'}</td><td>${x.fps||'—'}</td><td>${x.avg||'—'}</td><td>${x.decode_ms||'—'}</td><td>${x.pre_ms||'—'}</td><td>${x.infer_ms||'—'}</td><td>${x.post_ms||'—'}</td><td>${x.p50||'—'}</td><td>${x.p95||'—'}</td><td>${x.p99||'—'}</td><td>${x.cpu_pct||'—'}</td><td>${x.ram_mb||'—'}</td><td>${gpu}</td></tr>`;
+          return `<tr${hl}><td>${escHtml(x.name)||'—'}</td><td>${escHtml(x.codec)||'—'}</td><td>${escHtml(x.precision)||'—'}</td><td>${escHtml(x.input_dtype)||'—'}</td><td${x.ep_fallback?` style="color:var(--status-warning-05);" title="${t('bench.ep_fallback_tip')}"`:''}>${escHtml(x.provider)||'—'}${x.ep_fallback?' ⚠':''}</td><td>${x.fps||'—'}</td><td>${x.avg||'—'}</td><td>${x.decode_ms||'—'}</td><td>${x.pre_ms||'—'}</td><td>${x.infer_ms||'—'}</td><td>${x.post_ms||'—'}</td><td>${x.p50||'—'}</td><td>${x.p95||'—'}</td><td>${x.p99||'—'}</td><td>${x.cpu_pct||'—'}</td><td>${x.ram_mb||'—'}</td><td>${gpu}</td></tr>`;
         }).join('');
       }
       if (s.running) {

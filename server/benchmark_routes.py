@@ -169,7 +169,9 @@ async def run_benchmark(req: BenchmarkRequest):
                 "status": "ok",
                 "precision": r.precision,       # 모델 가중치 정밀도 (fp32/fp16/int8)
                 "input_dtype": r.input_dtype,   # 세션이 받는 입력 dtype
-                "provider": r.provider,
+                "provider": r.provider,         # 실제로 쓰인 EP
+                "ep_requested": r.ep_requested, # 요청한 EP (provider와 다르면 fallback)
+                "ep_fallback": r.ep_fallback,
                 "fps": fps_with_decode if decode_ms > 0 else round(r.fps, 1),
                 "avg": total_with_decode if decode_ms > 0 else round(r.mean_total_ms, 2),
                 # decode 미측정(codec=Raw)은 None — UI는 '—'로 표시(`x.decode_ms||'—'`),
@@ -262,7 +264,8 @@ async def benchmark_export_csv():
     # status=failed + error 사유로 포함(조용히 누락하지 않음). latency_ms_p*는 FPS가
     # 아니라 p50/p95/p99 지연(ms). precision=가중치 정밀도, input_dtype=세션 입력 dtype.
     fieldnames = [
-        "model_name", "status", "precision", "input_dtype", "codec", "provider",
+        "model_name", "status", "precision", "input_dtype", "codec",
+        "provider", "ep_requested",
         "fps_mean", "latency_ms_mean", "decode_ms", "preprocess_ms", "inference_ms",
         "postprocess_ms", "latency_ms_p50", "latency_ms_p95", "latency_ms_p99",
         "min_ms", "max_ms", "std_ms", "cpu_pct", "ram_mb",
@@ -280,6 +283,7 @@ async def benchmark_export_csv():
             "input_dtype": _cell(r.get("input_dtype")),
             "codec": r.get("codec", ""),
             "provider": _cell(r.get("provider")),
+            "ep_requested": _cell(r.get("ep_requested")),
             "fps_mean": _cell(r.get("fps")),
             "latency_ms_mean": _cell(r.get("avg")),
             "decode_ms": _cell(r.get("decode_ms")),
