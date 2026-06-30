@@ -87,14 +87,65 @@ MODEL_TYPES = {
 }
 
 
-def _build_providers(cuda_options: "dict | None" = None) -> list:
-    """사용 가능한 ONNX Runtime provider 선택 (GPU 우선).
+# ep_key (UI/벤치 선택값) -> onnxruntime provider 이름.
+_EP_KEY_PROVIDER = {
+    "cpu": "CPUExecutionProvider",
+    "cuda": "CUDAExecutionProvider",
+    "tensorrt": "TensorrtExecutionProvider",
+    "directml": "DmlExecutionProvider",
+    "openvino": "OpenVINOExecutionProvider",
+    "coreml": "CoreMLExecutionProvider",
+}
 
-    cuda_options: CUDAExecutionProvider에 전달할 provider 옵션(예: gpu_mem_limit,
-    cudnn_conv_algo_search). 지정 시 CUDA EP를 (이름, 옵션) 튜플로 구성한다.
-    벤치마크가 OOM을 무한 hang이 아니라 예외로 받도록 메모리 상한을 주는 용도.
+
+def _provider_with_opts(prov: str, cuda_options: "dict | None"):
+    """단일 provider를 (이름, 옵션) 형태로 — 옵션이 필요한 EP만 튜플로 구성."""
+    if prov == "CUDAExecutionProvider" and cuda_options:
+        return ("CUDAExecutionProvider", cuda_options)
+    if prov == "TensorrtExecutionProvider":
+        # TensorRT는 첫 실행에 엔진을 빌드(수십초~분)하므로 캐시를 켜 재실행 시
+        # 재빌드를 피한다. 측정은 warmup(빌드 흡수) 이후 iteration에서 이뤄진다.
+        try:
+            from core.paths import cache_dir
+            return ("TensorrtExecutionProvider", {
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": str(cache_dir("trt")),
+                "trt_timing_cache_enable": True,
+            })
+        except Exception:
+            return "TensorrtExecutionProvider"
+    if prov == "OpenVINOExecutionProvider":
+        return ("OpenVINOExecutionProvider", {"device_type": "GPU"})
+    return prov
+
+
+def _build_providers(cuda_options: "dict | None" = None, ep_key: str = "auto") -> list:
+    """ONNX Runtime provider 리스트 구성.
+
+    ep_key="auto"(기본): 사용 가능한 EP를 우선순위로 자동 선택(GPU 우선) — 기존 동작.
+    ep_key=명시값(cuda/tensorrt/directml/openvino/coreml/cpu): 해당 EP를 강제하고
+      CUDA/CPU로 fallback. (벤치마크가 precision별 적절한 EP로 측정하도록 — 예: int8/
+      fp16 가속은 TensorRT EP 필요. CUDA EP는 QDQ-int8/fp16을 가속하지 못한다.)
+    요청한 EP가 이 프로세스에 없으면 auto로 graceful fallback.
+
+    cuda_options: CUDA EP provider 옵션(gpu_mem_limit 등 — 벤치 OOM을 예외로 만드는 용도).
     """
     available = ort.get_available_providers()
+
+    # 명시 EP 요청 — 가용하면 그 EP를 강제(+ CUDA/CPU fallback).
+    if ep_key and ep_key != "auto":
+        prov = _EP_KEY_PROVIDER.get(ep_key)
+        if prov and prov in available:
+            if prov == "CPUExecutionProvider":
+                return ["CPUExecutionProvider"]
+            chain = [_provider_with_opts(prov, cuda_options)]
+            # TensorRT는 미지원 노드를 CUDA로, 그 외는 CPU로 떨어지게 체인 구성.
+            if prov == "TensorrtExecutionProvider" and "CUDAExecutionProvider" in available:
+                chain.append(_provider_with_opts("CUDAExecutionProvider", cuda_options))
+            chain.append("CPUExecutionProvider")
+            return chain
+        # 요청 EP가 이 프로세스에 없음 — auto로 진행(provider 컬럼에 실제 EP가 드러남).
+
     for prov in [
         "CUDAExecutionProvider",
         "TensorrtExecutionProvider",
@@ -118,8 +169,8 @@ def _build_providers(cuda_options: "dict | None" = None) -> list:
     return ["CPUExecutionProvider"]
 
 
-def _create_session(path: str, session_options=None, cuda_options=None) -> ort.InferenceSession:
-    providers = _build_providers(cuda_options)
+def _create_session(path: str, session_options=None, cuda_options=None, ep_key: str = "auto") -> ort.InferenceSession:
+    providers = _build_providers(cuda_options, ep_key)
     if session_options is None:
         import os
         session_options = ort.SessionOptions()
@@ -239,17 +290,18 @@ def _get_input_size(session: ort.InferenceSession) -> tuple:
 
 
 def load_model(path: str, model_type: str = "yolo", pt_convert_callback=None,
-               session_options=None, cuda_options=None) -> ModelInfo:
+               session_options=None, cuda_options=None, ep_key: str = "auto") -> ModelInfo:
     """
     path: .onnx 또는 .pt 파일 경로
     pt_convert_callback: PT 파일 시 ONNX 변환 여부 묻는 콜백 함수.
                          콜백이 ONNX 경로를 반환하면 그것으로 로드.
     cuda_options: CUDAExecutionProvider provider 옵션 (벤치마크의 OOM 상한 등).
+    ep_key: "auto"면 자동 EP 선택, 명시값이면 그 EP를 강제(벤치마크 precision별 EP 측정용).
     """
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".onnx":
-        return _load_onnx(path, model_type, session_options, cuda_options)
+        return _load_onnx(path, model_type, session_options, cuda_options, ep_key)
 
     elif ext == ".pt":
         names = _get_names_from_pt(path)
@@ -281,8 +333,8 @@ def load_model(path: str, model_type: str = "yolo", pt_convert_callback=None,
         raise ValueError(f"지원하지 않는 모델 형식: {ext}")
 
 
-def _load_onnx(path: str, model_type: str = "yolo", session_options=None, cuda_options=None) -> ModelInfo:
-    session = _create_session(path, session_options, cuda_options)
+def _load_onnx(path: str, model_type: str = "yolo", session_options=None, cuda_options=None, ep_key: str = "auto") -> ModelInfo:
+    session = _create_session(path, session_options, cuda_options, ep_key)
     names = _get_names_from_onnx(session)
     if model_type == "darknet" and all(v.startswith("class_") for v in names.values()):
         names = _DARKNET_DEFAULT_NAMES

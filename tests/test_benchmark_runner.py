@@ -206,3 +206,125 @@ def test_status_survives_concurrent_appends_no_torn_read():
 
     assert errors == [], f"status read raised under concurrent append: {errors}"
     _reset_bench_state()
+
+
+# ── A: failed models surfaced in CSV; decode never an em-dash; new columns ──
+def test_csv_includes_failed_models_with_status():
+    from server import benchmark_routes
+    bench_state = _reset_bench_state()
+    bench_state["results"] = [
+        {"name": "ok.onnx", "codec": "Raw", "status": "ok", "precision": "fp16",
+         "input_dtype": "float", "provider": "CUDAExecutionProvider",
+         "fps": 60.0, "avg": 16.6, "decode_ms": None,
+         "pre_ms": 5.0, "infer_ms": 10.0, "post_ms": 1.6,
+         "min": 15.0, "max": 20.0, "std": 1.0, "p50": 16.0, "p95": 19.0, "p99": 20.0,
+         "cpu_pct": 30.0, "ram_mb": 900, "gpu_pct": 70, "gpu_pct_peak": 88, "gpu_mem_used": 1234},
+        {"name": "broken_fp16.onnx", "codec": "Raw", "status": "failed",
+         "error": "[broken_fp16.onnx] load failed: Type Error ... float16"},
+    ]
+    resp = asyncio.run(benchmark_routes.benchmark_export_csv())
+    text = resp.body.decode("utf-8-sig")
+    rows = list(csv.DictReader(io.StringIO(text)))
+    by_name = {r["model_name"]: r for r in rows}
+    # failed model is NOT silently dropped — it carries status=failed + the reason
+    assert "broken_fp16.onnx" in by_name
+    assert by_name["broken_fp16.onnx"]["status"] == "failed"
+    assert "float16" in by_name["broken_fp16.onnx"]["error"]
+    # ok model carries the new precision/input_dtype/gpu columns
+    ok = by_name["ok.onnx"]
+    assert ok["status"] == "ok" and ok["precision"] == "fp16" and ok["input_dtype"] == "float"
+    assert ok["gpu_pct"] == "70" and ok["gpu_mem_used_mb"] == "1234"
+    # every row materializes the full header (no column shift)
+    ncols = len(rows[0])
+    assert all(len(r) == ncols for r in rows)
+    _reset_bench_state()
+
+
+def test_csv_decode_is_blank_never_emdash():
+    from server import benchmark_routes
+    bench_state = _reset_bench_state()
+    bench_state["results"] = [
+        {"name": "a.onnx", "codec": "Raw", "decode_ms": None, "fps": 1, "avg": 1},
+        {"name": "b.onnx", "codec": "Raw", "decode_ms": "—", "fps": 1, "avg": 1},  # legacy glyph
+        {"name": "c.onnx", "codec": "JPEG", "decode_ms": 3.2, "fps": 1, "avg": 1},
+    ]
+    resp = asyncio.run(benchmark_routes.benchmark_export_csv())
+    text = resp.body.decode("utf-8-sig")
+    assert "—" not in text  # the em-dash glyph must never reach the CSV
+    rows = {r["model_name"]: r for r in csv.DictReader(io.StringIO(text))}
+    assert rows["a.onnx"]["decode_ms"] == ""      # not measured -> blank
+    assert rows["b.onnx"]["decode_ms"] == ""      # legacy '—' coerced to blank
+    assert rows["c.onnx"]["decode_ms"] == "3.2"   # measured -> numeric
+    _reset_bench_state()
+
+
+# ── B: _build_providers honors the requested EP (TensorRT) ──
+def test_build_providers_honors_ep_key_tensorrt():
+    import core.model_loader as ml
+    orig = ml.ort.get_available_providers
+    ml.ort.get_available_providers = lambda: [
+        "TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+    try:
+        provs = _build_providers(ep_key="tensorrt")
+        flat = [p[0] if isinstance(p, tuple) else p for p in provs]
+        # TensorRT first, then CUDA + CPU fallback (unsupported nodes degrade gracefully).
+        assert flat[0] == "TensorrtExecutionProvider"
+        assert "CUDAExecutionProvider" in flat and "CPUExecutionProvider" in flat
+        assert _build_providers(ep_key="cpu") == ["CPUExecutionProvider"]
+        # an EP not available in this process -> graceful auto fallback (CUDA first here)
+        auto = _build_providers(ep_key="directml")
+        assert (auto[0][0] if isinstance(auto[0], tuple) else auto[0]) == "CUDAExecutionProvider"
+        # auto stays identical to the no-arg call
+        assert _build_providers(ep_key="auto") == _build_providers()
+    finally:
+        ml.ort.get_available_providers = orig
+
+
+def test_build_providers_cpu_only_env_graceful():
+    import core.model_loader as ml
+    orig = ml.ort.get_available_providers
+    ml.ort.get_available_providers = lambda: ["CPUExecutionProvider"]
+    try:
+        # requesting tensorrt on a CPU-only build falls back to CPU, never crashes
+        assert _build_providers(ep_key="tensorrt") == ["CPUExecutionProvider"]
+        assert _build_providers(ep_key="auto") == ["CPUExecutionProvider"]
+    finally:
+        ml.ort.get_available_providers = orig
+
+
+# ── precision detection from the ONNX graph (not the fp32 I/O dtype) ──
+def test_detect_precision():
+    import os
+    import tempfile
+    import numpy as np
+    import onnx
+    from onnx import helper, TensorProto, numpy_helper
+    from core.benchmark_runner import _detect_precision
+    d = tempfile.mkdtemp(prefix="prec_")
+
+    def _save(nodes, inits, inputs, outputs, name):
+        g = helper.make_graph(nodes, name, inputs, outputs, inits)
+        m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 13)])
+        m.ir_version = 8
+        p = os.path.join(d, name + ".onnx")
+        onnx.save(m, p)
+        return p
+
+    Xf = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])
+    Yf = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])
+    # fp32: float32 weights only
+    w32 = numpy_helper.from_array(np.ones((1, 4), np.float32), "w")
+    assert _detect_precision(
+        _save([helper.make_node("Add", ["X", "w"], ["Y"])], [w32], [Xf], [Yf], "fp32")) == "fp32"
+    # fp16: a float16 initializer present
+    Xh = helper.make_tensor_value_info("X", TensorProto.FLOAT16, [1, 4])
+    Yh = helper.make_tensor_value_info("Y", TensorProto.FLOAT16, [1, 4])
+    w16 = numpy_helper.from_array(np.ones((1, 4), np.float16), "w16")
+    assert _detect_precision(
+        _save([helper.make_node("Add", ["X", "w16"], ["Y"])], [w16], [Xh], [Yh], "fp16")) == "fp16"
+    # int8: a QuantizeLinear/DequantizeLinear (QDQ) pair — keeps float32 I/O
+    sc = numpy_helper.from_array(np.array(0.1, np.float32), "sc")
+    zp = numpy_helper.from_array(np.array(0, np.int8), "zp")
+    qdq = [helper.make_node("QuantizeLinear", ["X", "sc", "zp"], ["q"]),
+           helper.make_node("DequantizeLinear", ["q", "sc", "zp"], ["Y"])]
+    assert _detect_precision(_save(qdq, [sc, zp], [Xf], [Yf], "int8")) == "int8"

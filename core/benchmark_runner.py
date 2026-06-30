@@ -156,7 +156,8 @@ class BenchmarkResult:
     src_size: tuple          # 원본 프레임 해상도 (H, W)
     model_size: tuple        # 모델 입력 크기 (H, W)
     batch_size: int
-    input_dtype: str
+    input_dtype: str         # 세션이 받는 입력 dtype (keep-io fp16/QDQ-int8은 float32)
+    precision: str           # 모델 가중치 정밀도 (fp32/fp16/int8) — I/O dtype와 다를 수 있음
     warmup_count: int
     iter_count: int
     # 단계별 평균 시간
@@ -178,6 +179,25 @@ class BenchmarkResult:
     gpu_pct_peak: "int | None"   # 측정 구간 피크 GPU 사용률
     gpu_mem_used: "int | None"   # 측정 구간 피크 GPU 메모리 사용량
     gpu_mem_total: "int | None"
+
+
+def _detect_precision(model_path: str) -> str:
+    """모델 가중치 정밀도 추정 (fp32/fp16/int8). I/O dtype로는 구분 불가 —
+    keep-io fp16과 QDQ-int8 모두 float32 입력을 갖기 때문. 그래프를 가볍게 읽어
+    (가중치 외부데이터는 로드하지 않음) 양자화 노드/half 가중치로 판별한다."""
+    try:
+        import onnx
+        from onnx import TensorProto
+        m = onnx.load(model_path, load_external_data=False)
+        ops = {n.op_type for n in m.graph.node}
+        if {"QuantizeLinear", "DequantizeLinear", "QLinearConv",
+            "ConvInteger", "MatMulInteger", "QLinearMatMul"} & ops:
+            return "int8"
+        if any(init.data_type == TensorProto.FLOAT16 for init in m.graph.initializer):
+            return "fp16"
+        return "fp32"
+    except Exception:
+        return "unknown"
 
 
 def run_benchmark_core(
@@ -238,7 +258,8 @@ def run_benchmark_core(
         model_name = os.path.basename(cfg.model_path)
 
         try:
-            model_info = load_model(cfg.model_path, cfg.model_type, cuda_options=cuda_opts)
+            model_info = load_model(cfg.model_path, cfg.model_type,
+                                     cuda_options=cuda_opts, ep_key=cfg.ep_key)
         except Exception as e:
             on_error(cfg_idx, f"[{model_name}] 로드 실패: {e}")
             done += cfg.warmup + cfg.iterations
@@ -400,6 +421,7 @@ def run_benchmark_core(
             model_size=(model_h, model_w),
             batch_size=batch,
             input_dtype=dtype_label,
+            precision=_detect_precision(cfg.model_path),
             warmup_count=cfg.warmup,
             iter_count=len(infer_times),
             mean_pre_ms=float(np.mean(pre_arr)),
