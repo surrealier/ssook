@@ -36,7 +36,7 @@ import yaml
 
 log = logging.getLogger("ssook.runrecord")
 
-_SSOOK_VERSION = "1.5.3"  # kept in sync with server/__init__.py FastAPI title
+_SSOOK_VERSION = "2.1.0"  # kept in sync with server/__init__.py FastAPI title
 
 
 def _utc() -> str:

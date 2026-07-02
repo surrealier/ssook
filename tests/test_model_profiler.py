@@ -145,11 +145,13 @@ class TestProfileModelOnnx:
         d = profile_to_dict(profile_model(fixed_batch_model, num_runs=3, warmup=1))
         assert d["batch_size"] == 4
         naive_fps = 1000.0 / d["latency_per_batch_ms"]
-        # throughput_fps ≈ 4 * (1000/avg_infer_ms), NOT the naive single-sample FPS.
-        # throughput uses the raw mean while naive_fps uses the 3-decimal-rounded
-        # latency field, so allow 1% (rounding is ~0.2% at sub-ms; a naive/buggy
-        # impl would be off by 4x, which 1% still catches).
-        assert d["throughput_fps"] == pytest.approx(4 * naive_fps, rel=1e-2)
+        # The invariant under test: throughput scales by batch (4x the naive
+        # single-sample FPS), NOT that the two rounded fields agree precisely.
+        # On a fast machine the tiny model runs in ~0.01-0.02 ms/batch, where the
+        # 3-decimal rounding of latency_per_batch_ms alone is a several-percent
+        # relative error — so assert the RATIO is ~4 instead of a tight approx
+        # (a buggy per-sample impl would be off by 4x and land near 1.0).
+        assert 3.5 < d["throughput_fps"] / naive_fps < 4.5
         # Both values are independently rounded to 3 decimals; at sub-millisecond
         # scale that rounding (±0.0005 each) swamps a tight relative tolerance, so
         # compare with an absolute tolerance that covers the combined rounding gap.
