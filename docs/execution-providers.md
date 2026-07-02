@@ -134,6 +134,32 @@ On Windows, DLL search directories are also registered for CUDA/TensorRT/DirectM
 
 ---
 
+## Benchmarking on a specific EP (incl. TensorRT)
+
+The Benchmark tab has an **Execution Provider** dropdown (Auto / TensorRT / CUDA / DirectML / OpenVINO / CPU,
+filtered to what's available). `Auto` keeps the historical behavior (CUDA first when present).
+
+**Why pick TensorRT?** The CUDA EP does **not** accelerate QDQ-int8 models — they often run *slower* than fp32
+because of the extra Quantize/Dequantize nodes. fp16 likewise sees little speedup on CUDA for small models.
+**TensorRT** builds a precision-specific engine (int8/fp16/fp32) and is where real speedups appear
+(measured ~1.4–2.6× over CUDA on fp32 YOLO here).
+
+**TensorRT runtime gotcha (handled automatically):** onnxruntime-gpu lists `TensorrtExecutionProvider` even when
+the TensorRT runtime libs (`nvinfer*`) aren't on the loader path, and then **silently falls back to CUDA**. ssook
+now calls `core.ep_selector.ensure_tensorrt_runtime()` before creating a TRT session — it imports the `tensorrt`
+pip package and adds its bundled `tensorrt_libs` dir to the DLL search path so the TRT EP actually initializes. If
+`tensorrt` isn't installed, it's a no-op and the benchmark **reports the fallback** (the result's requested-EP ≠
+actual provider, shown with a ⚠ in the table and an `ep_requested` column in the CSV) instead of silently misleading.
+
+**INT8 caveat:** a QDQ int8 model can still fail to build a TensorRT engine (`failed to create engine …`). That's a
+property of the exported model, not ssook — use fp16/fp32, or export an int8 model that TensorRT can build (proper
+QDQ, or a TRT-built engine with a calibration cache). The benchmark surfaces this as a clear failed-row reason.
+
+**Decode column:** `Dec(ms)` is blank unless you select a codec (JPEG/PNG/H.264…) — with `None (raw)` there is no
+decode step to measure.
+
+---
+
 ## Installation
 
 ### Automatic (recommended)

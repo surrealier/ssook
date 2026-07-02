@@ -1030,11 +1030,13 @@ Tabs.benchmark = {
         </div>
         <div class="card" style="padding:1.5rem;">
           <h3 class="text-heading-h3" style="margin-bottom:1rem;display:flex;align-items:center;">${t('bench.config')}</h3>
-          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;">
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;">
             <div class="form-group"><label class="form-label">${t('bench.iters')}</label><input type="number" class="form-input input-normal" value="500" min="10" max="5000" step="100" id="bench-iters"></div>
             <div class="form-group"><label class="form-label">${t('bench.input_size')}</label><select class="form-input input-normal" id="bench-size"><option>640</option><option>320</option><option>960</option><option>1280</option></select></div>
+            <div class="form-group"><label class="form-label">${t('bench.ep')}</label><select class="form-input input-normal" id="bench-ep"><option value="auto">${t('bench.ep_auto')}</option></select></div>
             <div class="form-group"><label class="form-label">${t('bench.warmup')}</label><span class="form-input" style="background:var(--background-neutral-02);color:var(--text-03);">${t('bench.fixed')}</span></div>
           </div>
+          <div class="text-secondary" id="bench-ep-hint" style="font-size:10px;margin-top:0.35rem;">${t('bench.ep_hint')}</div>
           <div style="margin-top:0.75rem;">
             <label class="form-label" style="margin-bottom:0.35rem;">Codec Test</label>
             <div style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center;">
@@ -1061,13 +1063,37 @@ Tabs.benchmark = {
             <h3 class="text-heading-h3">${t('bench.results')}</h3>
             <div style="display:flex;gap:0.5rem;">
               <button class="btn btn-secondary btn-sm" onclick="Tabs.benchmark.exportResults()">${t('export')}</button>
-              <button class="btn btn-ghost btn-sm" onclick="document.getElementById('bench-results').innerHTML='<tr><td colspan=15 class=text-secondary style=text-align:center;padding:2rem>${t('bench.run_hint')}</td></tr>'">${t('reset')}</button>
+              <button class="btn btn-ghost btn-sm" onclick="document.getElementById('bench-results').innerHTML='<tr><td colspan=17 class=text-secondary style=text-align:center;padding:2rem>${t('bench.run_hint')}</td></tr>'">${t('reset')}</button>
             </div>
           </div>
-          <div class="table-container"><table><thead><tr><th>Model</th><th>Codec</th><th>Provider</th><th>FPS</th><th>Avg(ms)</th><th>Dec(ms)</th><th>Pre(ms)</th><th>Infer(ms)</th><th>Post(ms)</th><th title="${t('bench.p50_tip')}">P50(ms)</th><th title="${t('bench.p95_tip')}">P95(ms)</th><th title="${t('bench.p99_tip')}">P99(ms)</th><th>CPU%</th><th>RAM(MB)</th><th>GPU%</th></tr></thead>
-          <tbody id="bench-results"><tr><td colspan="15" class="text-secondary" style="text-align:center;padding:2rem;">${t('bench.run_hint')}</td></tr></tbody></table></div>
+          <div class="table-container"><table><thead><tr><th>Model</th><th>Codec</th><th>${t('bench.precision')}</th><th>${t('bench.dtype')}</th><th>Provider</th><th>FPS</th><th>Avg(ms)</th><th title="${t('bench.dec_tip')}">Dec(ms)</th><th>Pre(ms)</th><th>Infer(ms)</th><th>Post(ms)</th><th title="${t('bench.p50_tip')}">P50(ms)</th><th title="${t('bench.p95_tip')}">P95(ms)</th><th title="${t('bench.p99_tip')}">P99(ms)</th><th>CPU%</th><th>RAM(MB)</th><th>GPU%</th></tr></thead>
+          <tbody id="bench-results"><tr><td colspan="17" class="text-secondary" style="text-align:center;padding:2rem;">${t('bench.run_hint')}</td></tr></tbody></table></div>
         </div>
       </div>`;
+  },
+  async init() {
+    // EP 드롭다운을 이 프로세스에서 가용한 provider로 채운다(없으면 Auto만).
+    // TensorRT EP를 골라야 int8/fp16이 실제 가속된다(CUDA EP는 QDQ를 가속 못 함).
+    try {
+      const s = await API.get('/api/system/ep');
+      const provs = (s && s.available_eps) || [];
+      const map = [
+        ['TensorrtExecutionProvider', 'tensorrt', 'TensorRT'],
+        ['CUDAExecutionProvider', 'cuda', 'CUDA'],
+        ['DmlExecutionProvider', 'directml', 'DirectML'],
+        ['OpenVINOExecutionProvider', 'openvino', 'OpenVINO'],
+        ['CoreMLExecutionProvider', 'coreml', 'CoreML'],
+        ['CPUExecutionProvider', 'cpu', 'CPU'],
+      ];
+      const sel = document.getElementById('bench-ep');
+      if (sel) {
+        const opts = [`<option value="auto">${t('bench.ep_auto')}</option>`];
+        for (const [prov, key, label] of map) {
+          if (provs.includes(prov)) opts.push(`<option value="${key}">${escHtml(label)}</option>`);
+        }
+        sel.innerHTML = opts.join('');
+      }
+    } catch (e) { /* EP 목록을 못 받으면 Auto만 유지 */ }
   },
   async run() {
     const models = getSlotModels('bench-slots');
@@ -1083,6 +1109,7 @@ Tabs.benchmark = {
       const r = await API.post('/api/benchmark/run', {
         models, iterations: +document.getElementById('bench-iters').value,
         input_size: +document.getElementById('bench-size').value,
+        ep_key: document.getElementById('bench-ep')?.value || 'auto',
         codecs: [
           ...(document.getElementById('bench-codec-none')?.checked ? ['none'] : []),
           ...[...document.querySelectorAll('.bench-codec:checked')].map(c => c.value)
@@ -1106,10 +1133,10 @@ Tabs.benchmark = {
       if (s.results && s.results.length) {
         const tb = document.getElementById('bench-results');
         tb.innerHTML = s.results.map((x, i) => {
-          if (x.error) return `<tr><td colspan="15" style="color:var(--action-danger-05);">${escHtml(x.error)}</td></tr>`;
+          if (x.error) return `<tr><td>${escHtml(x.name)||'—'}</td><td colspan="16" style="color:var(--action-danger-05);">${escHtml(x.error)}</td></tr>`;
           const hl = i === 0 ? ' style="background:var(--status-success-01);font-weight:600;"' : '';
           const gpu = x.gpu_pct != null ? `${x.gpu_pct}%` : 'N/A';
-          return `<tr${hl}><td>${escHtml(x.name)||'—'}</td><td>${escHtml(x.codec)||'—'}</td><td>${escHtml(x.provider)||'—'}</td><td>${x.fps||'—'}</td><td>${x.avg||'—'}</td><td>${x.decode_ms||'—'}</td><td>${x.pre_ms||'—'}</td><td>${x.infer_ms||'—'}</td><td>${x.post_ms||'—'}</td><td>${x.p50||'—'}</td><td>${x.p95||'—'}</td><td>${x.p99||'—'}</td><td>${x.cpu_pct||'—'}</td><td>${x.ram_mb||'—'}</td><td>${gpu}</td></tr>`;
+          return `<tr${hl}><td>${escHtml(x.name)||'—'}</td><td>${escHtml(x.codec)||'—'}</td><td>${escHtml(x.precision)||'—'}</td><td>${escHtml(x.input_dtype)||'—'}</td><td${x.ep_fallback?` style="color:var(--status-warning-05);" title="${t('bench.ep_fallback_tip')}"`:''}>${escHtml(x.provider)||'—'}${x.ep_fallback?' ⚠':''}</td><td>${x.fps||'—'}</td><td>${x.avg||'—'}</td><td>${x.decode_ms||'—'}</td><td>${x.pre_ms||'—'}</td><td>${x.infer_ms||'—'}</td><td>${x.post_ms||'—'}</td><td>${x.p50||'—'}</td><td>${x.p95||'—'}</td><td>${x.p99||'—'}</td><td>${x.cpu_pct||'—'}</td><td>${x.ram_mb||'—'}</td><td>${gpu}</td></tr>`;
         }).join('');
       }
       if (s.running) {
@@ -1125,7 +1152,7 @@ Tabs.benchmark = {
         // (results stays empty) so the user does not stare at a blank table.
         if (!s.results || !s.results.length) {
           const tb = document.getElementById('bench-results');
-          if (tb) tb.innerHTML = `<tr><td colspan="15" style="text-align:center;color:var(--text-02);padding:1rem;">${t('bench.no_results')}</td></tr>`;
+          if (tb) tb.innerHTML = `<tr><td colspan="17" style="text-align:center;color:var(--text-02);padding:1rem;">${t('bench.no_results')}</td></tr>`;
         }
         App.setStatus(t('bench.complete'));
       }

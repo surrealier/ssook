@@ -22,6 +22,7 @@ class BenchmarkRequest(BaseModel):
     iterations: int = 100
     input_size: int = 640
     codecs: list[str] = ["none"]
+    ep_key: str = "auto"  # auto | cuda | tensorrt | directml | openvino | coreml | cpu
 
 
 @router.post("/api/benchmark/run")
@@ -84,6 +85,7 @@ async def run_benchmark(req: BenchmarkRequest):
                     model_path=path, iterations=req.iterations,
                     warmup=300, src_hw=(1080, 1920),
                     model_type=mt, input_size=req.input_size,
+                    ep_key=req.ep_key,
                 ))
                 codec_map[idx] = codec
                 idx += 1
@@ -164,10 +166,17 @@ async def run_benchmark(req: BenchmarkRequest):
 
             results.append({
                 "name": r.model_name, "codec": codec.upper() if codec != "none" else "Raw",
-                "provider": r.provider,
+                "status": "ok",
+                "precision": r.precision,       # 모델 가중치 정밀도 (fp32/fp16/int8)
+                "input_dtype": r.input_dtype,   # 세션이 받는 입력 dtype
+                "provider": r.provider,         # 실제로 쓰인 EP
+                "ep_requested": r.ep_requested, # 요청한 EP (provider와 다르면 fallback)
+                "ep_fallback": r.ep_fallback,
                 "fps": fps_with_decode if decode_ms > 0 else round(r.fps, 1),
                 "avg": total_with_decode if decode_ms > 0 else round(r.mean_total_ms, 2),
-                "decode_ms": decode_ms if decode_ms > 0 else "—",
+                # decode 미측정(codec=Raw)은 None — UI는 '—'로 표시(`x.decode_ms||'—'`),
+                # CSV는 빈칸이 되어 숫자 열에 글리프가 섞이지 않는다.
+                "decode_ms": decode_ms if decode_ms > 0 else None,
                 "pre_ms": round(r.mean_pre_ms, 2),
                 "infer_ms": round(r.mean_infer_ms, 2),
                 "post_ms": round(r.mean_post_ms, 2),
@@ -196,6 +205,7 @@ async def run_benchmark(req: BenchmarkRequest):
             results.append({
                 "name": name,
                 "codec": codec.upper() if codec != "none" else "Raw",
+                "status": "failed",
                 "error": msg,
             })
             publish_results()
@@ -244,41 +254,60 @@ async def benchmark_status():
 async def benchmark_export_csv():
     # Read via snapshot so we iterate a copied list, not the live one the worker appends to.
     results = bench_state.snapshot().get("results", [])
-    # latency_ms_p* (not fps_p*): the written values are p50/p95/p99 latency in ms
-    # (BenchmarkResult.p*_ms), not FPS. fps_mean is the only true FPS column.
-    fieldnames = ["model_name", "codec", "provider", "fps_mean", "latency_ms_mean",
-                  "decode_ms", "preprocess_ms", "inference_ms", "postprocess_ms",
-                  "latency_ms_p50", "latency_ms_p95", "latency_ms_p99",
-                  "min_ms", "max_ms", "std_ms", "cpu_pct", "ram_mb"]
+
+    def _cell(v):
+        # None/em-dash -> 빈칸. decode 미측정·CPU 런의 GPU 컬럼 등이 숫자 열에 글리프('—')
+        # 없이 비워진다('—'는 화면 표시 전용이며 CSV에는 절대 들어가지 않는다).
+        return "" if v is None or v == "—" else v
+
+    # 모든 행을 헤더와 동일한 키로 기록 → 열 정합 보장(밀림 불가). 실패 모델도
+    # status=failed + error 사유로 포함(조용히 누락하지 않음). latency_ms_p*는 FPS가
+    # 아니라 p50/p95/p99 지연(ms). precision=가중치 정밀도, input_dtype=세션 입력 dtype.
+    fieldnames = [
+        "model_name", "status", "precision", "input_dtype", "codec",
+        "provider", "ep_requested",
+        "fps_mean", "latency_ms_mean", "decode_ms", "preprocess_ms", "inference_ms",
+        "postprocess_ms", "latency_ms_p50", "latency_ms_p95", "latency_ms_p99",
+        "min_ms", "max_ms", "std_ms", "cpu_pct", "ram_mb",
+        "gpu_pct", "gpu_pct_peak", "gpu_mem_used_mb", "error",
+    ]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     for r in results:
-        if "error" in r:
-            continue
+        failed = r.get("status") == "failed" or "error" in r
         writer.writerow({
             "model_name": r.get("name", ""),
+            "status": r.get("status", "failed" if failed else "ok"),
+            "precision": _cell(r.get("precision")),
+            "input_dtype": _cell(r.get("input_dtype")),
             "codec": r.get("codec", ""),
-            "provider": r.get("provider", ""),
-            "fps_mean": r.get("fps", ""),
-            "latency_ms_mean": r.get("avg", ""),
-            "decode_ms": r.get("decode_ms", ""),
-            "preprocess_ms": r.get("pre_ms", ""),
-            "inference_ms": r.get("infer_ms", ""),
-            "postprocess_ms": r.get("post_ms", ""),
-            "latency_ms_p50": r.get("p50", ""),
-            "latency_ms_p95": r.get("p95", ""),
-            "latency_ms_p99": r.get("p99", ""),
-            "min_ms": r.get("min", ""),
-            "max_ms": r.get("max", ""),
-            "std_ms": r.get("std", ""),
-            "cpu_pct": r.get("cpu_pct", ""),
-            "ram_mb": r.get("ram_mb", ""),
+            "provider": _cell(r.get("provider")),
+            "ep_requested": _cell(r.get("ep_requested")),
+            "fps_mean": _cell(r.get("fps")),
+            "latency_ms_mean": _cell(r.get("avg")),
+            "decode_ms": _cell(r.get("decode_ms")),
+            "preprocess_ms": _cell(r.get("pre_ms")),
+            "inference_ms": _cell(r.get("infer_ms")),
+            "postprocess_ms": _cell(r.get("post_ms")),
+            "latency_ms_p50": _cell(r.get("p50")),
+            "latency_ms_p95": _cell(r.get("p95")),
+            "latency_ms_p99": _cell(r.get("p99")),
+            "min_ms": _cell(r.get("min")),
+            "max_ms": _cell(r.get("max")),
+            "std_ms": _cell(r.get("std")),
+            "cpu_pct": _cell(r.get("cpu_pct")),
+            "ram_mb": _cell(r.get("ram_mb")),
+            "gpu_pct": _cell(r.get("gpu_pct")),
+            "gpu_pct_peak": _cell(r.get("gpu_pct_peak")),
+            "gpu_mem_used_mb": _cell(r.get("gpu_mem_used")),
+            "error": r.get("error", ""),
         })
-    content = buf.getvalue()
+    # Excel이 UTF-8을 자동 인식하도록 utf-8-sig(BOM)로 인코딩.
+    content = buf.getvalue().encode("utf-8-sig")
     return Response(
         content=content,
-        media_type="text/csv",
+        media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=benchmark_results.csv"},
     )
 
