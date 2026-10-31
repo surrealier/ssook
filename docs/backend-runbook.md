@@ -103,6 +103,6 @@ clear()
 
 ## 빌드 산출물
 
-- 소스: `D:\bongkj\Projects\Visualizer\`
-- PyInstaller 출력: `D:\bongkj\Projects\ssook\_internal\` (런타임 실행 시 사용)
+- 소스: `<source-folder>\`
+- PyInstaller 출력: `<install-folder>\_internal\` (런타임 실행 시 사용)
 - 새 모듈 추가 시 PyInstaller `spec` 파일에 hidden imports 갱신 필요 (`core/vlm_inference.py`, `core/hashing.py`, `core/env.py`, `core/paths.py`, `core/model_cache.py`, `core/exports.py`, `core/logging_setup.py`, `server/path_safety.py`, `server/middleware.py`, `server/errors.py`)
